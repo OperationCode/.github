@@ -34,7 +34,7 @@ Out of scope for v1: auto-fix, a verifier pass that drops false positives, revie
 | Threat | Guardrail |
 |---|---|
 | PR code runs in CI with secrets (the classic `pull_request_target` mistake) | No PR code is ever checked out or executed. The workflow reads PR content through the GitHub REST API only. |
-| A PR edits the review workflow or prompts | `pull_request_target` and ruleset-required workflows run the workflow file from the central repo, at a pinned ref. The `.github` repo itself is excluded from the ruleset and protected by CODEOWNERS plus 2 approvals. |
+| A PR edits the review workflow or prompts | `pull_request_target` and ruleset-required workflows run the workflow file from the central repo, at a pinned ref. The `.github` repo itself is excluded from the ruleset and protected by CODEOWNERS plus 2 approvals. Only org admins may bypass, and only through a pull request. |
 | Injection tells Claude to run commands, push code, approve or merge | Claude has no tools and no GitHub token. The job that calls Claude has `contents: read` only. The job that writes to GitHub runs no LLM. The bot never submits `APPROVE` or `REQUEST_CHANGES`. |
 | Injection steals the Anthropic credential | Claude cannot read the environment (no tools). Preferred auth is workload identity federation, so there is no long-lived key to steal. |
 | Injection exfiltrates data through the review comment | The only output channel is schema-checked JSON. The publisher strips @mentions, links and images, and caps length. There is nothing secret in Claude's context to leak. |
@@ -331,7 +331,7 @@ Findings in category `bug` are advisory. They never block.
 ## Admin checklist (Irving)
 
 - [ ] Create the public repo `OperationCode/.github` and push this local repo.
-- [ ] Protect `.github` main: CODEOWNERS, 2 approvals, no force push, admins included.
+- [ ] Protect `.github` main: CODEOWNERS review, 2 approvals, no force push, no deletion. Org admins may bypass through a pull request only, because a solo code owner cannot approve their own PR.
 - [ ] Anthropic Console: dedicated workspace with a hard monthly spend limit, service account, federation rule (or an API key as fallback).
 - [ ] Org Actions setting: default `GITHUB_TOKEN` permissions read-only.
 - [ ] Org setting: require 2FA for all members. A stolen maintainer account bypasses everything in this design.
