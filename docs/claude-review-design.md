@@ -331,7 +331,7 @@ Findings in category `bug` are advisory. They never block.
 ## Admin checklist (Irving)
 
 - [ ] Create the public repo `OperationCode/.github` and push this local repo.
-- [ ] Protect `.github` main: CODEOWNERS review, 2 approvals, no force push, no deletion. Org admins may bypass through a pull request only, because a solo code owner cannot approve their own PR.
+- [ ] Protect `.github` main: CODEOWNERS review, 2 approvals, no force push, no deletion. CODEOWNERS is the Contributors team, which needs write access to the repo. Org admins may bypass through a pull request only.
 - [ ] Anthropic Console: dedicated workspace with a hard monthly spend limit, service account, federation rule (or an API key as fallback).
 - [ ] Org Actions setting: default `GITHUB_TOKEN` permissions read-only.
 - [ ] Org setting: require 2FA for all members. A stolen maintainer account bypasses everything in this design.
