@@ -604,6 +604,13 @@ def test_lookup_converts_an_offset_to_utc():
     assert info.published == datetime(2020, 1, 1, 0, 0, tzinfo=UTC)
 
 
+@pytest.mark.parametrize("stamp", ["0001-01-01T00:00:00+01:00", "9999-12-31T23:00:00-01:00"])
+def test_lookup_time_out_of_utc_range_is_incomplete(stamp):
+    doc = {"name": "a", "time": {"1.0.0": stamp}, "versions": {"1.0.0": {}}}
+    with pytest.raises(RegistryError, match="out of range"):
+        deps.lookup_npm("a", "1.0.0", FakeFetch(ok(doc, "https://registry.npmjs.org/a")))
+
+
 def test_lookup_never_fetches_for_a_bad_name():
     fetch = FakeFetch(ok({}, "x"))
     with pytest.raises(RegistryError):

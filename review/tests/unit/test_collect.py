@@ -6,6 +6,8 @@ import base64
 import json
 import random
 import re
+import subprocess
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -1033,9 +1035,10 @@ def test_lookup_budget_fails_every_remaining_key():
     registry, failed = c.lookup_registry(
         _keys("a", "b", "c", "d", "e"), fetch=fetch, sleep=_no_sleep, clock=clock, concurrency=1
     )
-    # a: 0 -> 115, b: 115 -> 230, c starts with 10 s left; d and e start after the deadline.
-    assert sorted(k[1] for k in registry) == ["a", "b", "c"]
-    assert failed == {k: c.LOOKUP_BUDGET_EXCEEDED for k in _keys("d", "e")}
+    # a: 0 -> 115, b: 115 -> 230, c starts with 10 s left but completes at
+    # 345, after the deadline, so its result is not taken; d and e never start.
+    assert sorted(k[1] for k in registry) == ["a", "b"]
+    assert failed == {k: c.LOOKUP_BUDGET_EXCEEDED for k in _keys("c", "d", "e")}
     assert fetch.calls == [
         ("https://registry.npmjs.org/a", 20.0),
         ("https://registry.npmjs.org/b", 20.0),
@@ -1175,3 +1178,144 @@ def test_lookup_budget_hit_is_a_hard_block_and_the_bundle_is_written(tmp_path):
     path = c.write_bundle(col, tmp_path)
     assert path.read_bytes() == col.data
     envelope.validate_envelope(envelope.parse_json(path.read_bytes()))
+
+
+def _assert_bundle(col: c.Collected, tmp_path: Path) -> None:
+    assert col.envelope["status"] == "ok"
+    path = c.write_bundle(col, tmp_path)
+    assert path.read_bytes() == col.data
+    envelope.validate_envelope(envelope.parse_json(path.read_bytes()))
+
+
+def test_lookup_result_completed_at_the_deadline_is_not_taken():
+    clock = FakeClock()
+    fetch = CountingFetch(clock, step=120.0)
+    registry, failed = c.lookup_registry(_keys("a", "b"), fetch=fetch, sleep=_no_sleep, clock=clock, concurrency=1)
+    # b completes at exactly 240 s, the deadline.
+    assert list(registry) == _keys("a")
+    assert failed == {("npm", "b", "1.0.0"): c.LOOKUP_BUDGET_EXCEEDED}
+
+
+def test_cached_response_processed_past_the_deadline_is_a_hard_block(monkeypatch, tmp_path):
+    # Two versions of one package: the second is served from the packument
+    # cache, with no fetch, but its processing ends past the deadline.
+    lock = json.dumps({
+        "name": "x", "lockfileVersion": 3, "requires": True,
+        "packages": {
+            "": {"name": "x"},
+            "node_modules/a": {"version": "1.0.0", "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz"},
+            "node_modules/b/node_modules/a": {
+                "version": "2.0.0", "resolved": "https://registry.npmjs.org/a/-/a-2.0.0.tgz",
+            },
+        },
+    })
+    doc = {
+        "name": "a",
+        "time": {"1.0.0": "2018-01-01T00:00:00.000Z", "2.0.0": "2018-02-01T00:00:00.000Z"},
+        "versions": {"1.0.0": {"name": "a"}, "2.0.0": {"name": "a"}},
+    }
+    fx = _snapshot({}, {"package-lock.json": ("100644", lock)})
+    fx["registry"] = {"https://registry.npmjs.org/a": {"status": 200, "json": doc}}
+    clock = FakeClock()
+    real_lookup = deps.lookup_npm
+
+    def slow_lookup(*args, **kwargs):
+        info = real_lookup(*args, **kwargs)
+        clock.now += 130.0  # 1.0.0 completes at 130 s, 2.0.0 at 260 s
+        return info
+
+    monkeypatch.setattr(deps, "lookup_npm", slow_lookup)
+    col, _, registry = run(fx, registry_clock=clock)
+    assert registry.urls == ["https://registry.npmjs.org/a"]
+    found = {ch["new_version"]: ch["registry"] is not None for ch in col.envelope["payload"]["dependency_delta"]["changes"]}
+    assert found == {"1.0.0": True, "2.0.0": False}
+    assert col.envelope["payload"]["dependency_delta"]["failures"] == [
+        {"path": "package-lock.json", "reason": c.LOOKUP_BUDGET_EXCEEDED}
+    ]
+    assert ("package-lock.json", f"dependency data incomplete: {c.LOOKUP_BUDGET_EXCEEDED}") in _dep_blocks(col)
+    _assert_bundle(col, tmp_path)
+
+
+def test_unexpected_lookup_error_fails_that_key_only():
+    calls: list[str] = []
+
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        calls.append(url)
+        if url.endswith("/b"):
+            raise RuntimeError("bug in a fetcher")
+        return CountingFetch()(url, max_bytes, timeout)
+
+    registry, failed = c.lookup_registry(
+        _keys("a", "b", "c"), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=1
+    )
+    assert sorted(registry) == _keys("a", "c")
+    assert failed == {("npm", "b", "1.0.0"): c.LOOKUP_FAILED}
+    assert len(calls) == 3
+
+
+def test_unexpected_lookup_error_is_a_hard_block_and_the_bundle_is_written(monkeypatch, tmp_path):
+    real_lookup = deps.lookup_npm
+
+    def lookup(name, *args, **kwargs):
+        if name == "is-odd":
+            raise ZeroDivisionError("unexpected")
+        return real_lookup(name, *args, **kwargs)
+
+    monkeypatch.setattr(deps, "lookup_npm", lookup)
+    col, _, _ = run(_migration())
+    assert col.envelope["payload"]["dependency_delta"]["failures"] == [
+        {"path": "package-lock.json", "reason": c.LOOKUP_FAILED}
+    ]
+    assert ("package-lock.json", f"dependency data incomplete: {c.LOOKUP_FAILED}") in _dep_blocks(col)
+    _assert_bundle(col, tmp_path)
+
+
+@pytest.mark.parametrize("stamp", ["0001-01-01T00:00:00+01:00", "9999-12-31T23:00:00-01:00"])
+def test_publish_time_out_of_utc_range_is_a_hard_block_and_the_bundle_is_written(stamp, tmp_path):
+    registry = dict(OLD_PACKUMENTS)
+    registry["https://registry.npmjs.org/is-odd"] = _packument("is-odd", "3.0.1", stamp)
+    col, _, _ = run(_migration(registry=registry))
+    assert col.envelope["payload"]["dependency_delta"]["failures"] == [
+        {"path": "package-lock.json", "reason": c.LOOKUP_FAILED}
+    ]
+    assert ("package-lock.json", f"dependency data incomplete: {c.LOOKUP_FAILED}") in _dep_blocks(col)
+    _assert_bundle(col, tmp_path)
+
+
+# Runs collect in a fresh interpreter with a registry fetch that never
+# returns. The process must write the bundle and exit on its own.
+_HUNG_LOOKUP_SCRIPT = """
+import json, sys, threading
+from datetime import datetime
+sys.path[:0] = [sys.argv[1] + "/src", sys.argv[1]]
+from oc_review import collect as c, deps
+from tests.unit import test_collect as t
+
+clock = t.FakeClock()
+
+def fetch(url, max_bytes, timeout):
+    clock.now = c.REGISTRY_LOOKUP_BUDGET_SECONDS + 1
+    threading.Event().wait()  # never returns
+
+fx = t._migration()
+client = c.GitHubClient("test-token", t.Replay(fx["github"]), sleep=lambda s: None)
+col = c.collect(
+    client, c.EventContext.from_event(fx["event"]), run_id=100, run_attempt=1,
+    now=datetime.fromisoformat(fx["now"]), registry_fetch=fetch,
+    registry_sleep=lambda s: None, registry_clock=clock,
+)
+c.write_bundle(col, sys.argv[2])
+print(json.dumps(col.envelope["payload"]["dependency_delta"]["failures"]))
+"""
+
+
+def test_hung_lookup_does_not_hold_the_process_open(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    proc = subprocess.run(
+        [sys.executable, "-c", _HUNG_LOOKUP_SCRIPT, str(root), str(tmp_path)],
+        capture_output=True, text=True, timeout=60, cwd=tmp_path,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [{"path": "package-lock.json", "reason": c.LOOKUP_BUDGET_EXCEEDED}]
+    data = (tmp_path / c.BUNDLE_FILE_NAME).read_bytes()
+    envelope.validate_envelope(envelope.parse_json(data))

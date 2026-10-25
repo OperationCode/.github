@@ -42,7 +42,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -648,6 +647,9 @@ class _BudgetSpent(deps.RegistryError):
     """No time is left in the run's lookup budget for a fetch or a retry."""
 
 
+_LOOKUP_WAIT_SLICE_SECONDS = 0.05
+
+
 def lookup_registry(
     keys: Iterable[RegistryKey],
     *,
@@ -666,8 +668,13 @@ def lookup_registry(
     order on one worker, so its packument is fetched once; at most
     `concurrency` packages run at once. Every lookup must finish within
     `budget_seconds` of the start: a fetch never gets more time than is left,
-    no fetch or retry starts after the deadline, and a key with no result at
-    the deadline fails. Collect does not wait for a lookup past the deadline.
+    no lookup, fetch or retry starts after the deadline, and a result that
+    completes at or after the deadline is not taken. A key with no result at
+    the deadline fails. Any error in a lookup fails that key only.
+
+    Collect does not wait for a lookup past the deadline. The workers are
+    daemon threads, so a hung lookup also does not hold the process open
+    after collect writes the bundle.
     """
     unique = sorted(set(keys))
     failed = {key: LOOKUP_COUNT_CAP for key in unique[max_lookups:]}
@@ -675,8 +682,12 @@ def lookup_registry(
     for key in unique[:max_lookups]:
         groups.setdefault(key[:2], []).append(key)
     deadline = clock() + budget_seconds
-    lock = threading.Lock()
+    queue = list(groups.values())
+    queue.reverse()  # workers pop from the end, so groups start in key order
+    state = threading.Condition()
     results: dict[RegistryKey, deps.RegistryInfo | str] = {}
+    finished = 0  # groups whose worker is done with them
+    closed = False  # set at the deadline or when all groups finish
 
     def remaining() -> float:
         return deadline - clock()
@@ -692,9 +703,23 @@ def lookup_registry(
             raise _BudgetSpent("lookup time budget exceeded")
         sleep(seconds)
 
+    def commit(key: RegistryKey, result: deps.RegistryInfo | str) -> bool:
+        """Records a result that completed before the deadline; False when
+        the lookups are over."""
+        with state:
+            if closed:
+                return False
+            if remaining() <= 0:
+                results[key] = LOOKUP_BUDGET_EXCEEDED
+                return False
+            results[key] = result
+            return True
+
     def run_group(group: list[RegistryKey]) -> None:
         cached = _LastUrlCache(bounded_fetch)
         for key in group:
+            if remaining() <= 0:
+                return  # the key has no result at the deadline
             ecosystem, name, version = key
             lookup = deps.lookup_npm if ecosystem == "npm" else deps.lookup_pypi
             result: deps.RegistryInfo | str
@@ -702,32 +727,45 @@ def lookup_registry(
                 result = lookup(name, version, cached, sleep=bounded_sleep)
             except _BudgetSpent:
                 result = LOOKUP_BUDGET_EXCEEDED
-            except deps.DepsError:
-                result = LOOKUP_BUDGET_EXCEEDED if remaining() <= 0 else LOOKUP_FAILED
-            with lock:
-                results[key] = result
+            except Exception:  # noqa: BLE001 - any error is a failed lookup, never a lost bundle
+                result = LOOKUP_FAILED
+            if not commit(key, result):
+                return
 
-    pool = ThreadPoolExecutor(max_workers=max(1, concurrency), thread_name_prefix="registry-lookup")
-    try:
-        pending = {pool.submit(run_group, group) for group in groups.values()}
-        while pending and (left := remaining()) > 0:
-            done, pending = wait(pending, timeout=left, return_when=FIRST_COMPLETED)
-            for future in done:
-                future.result()  # an unexpected error fails collect, as before
-    finally:
-        # Queued groups never start; running ones stop at their next fetch or
-        # retry, because the budget is spent.
-        pool.shutdown(wait=False, cancel_futures=True)
-        with lock:
-            final = dict(results)
+    def worker() -> None:
+        nonlocal finished
+        while True:
+            with state:
+                if closed or not queue or remaining() <= 0:
+                    return
+                group = queue.pop()
+            try:
+                run_group(group)
+            finally:
+                with state:
+                    finished += 1
+                    state.notify_all()
+
+    for i in range(min(max(1, concurrency), len(groups))):
+        threading.Thread(target=worker, name=f"registry-lookup-{i}", daemon=True).start()
+    with state:
+        # A short wait slice, so a clock that is not wall time (tests) still
+        # ends the wait at its deadline.
+        while finished < len(groups) and (left := remaining()) > 0:
+            state.wait(min(left, _LOOKUP_WAIT_SLICE_SECONDS))
+        closed = True
+        expired = remaining() <= 0
+        final = dict(results)
     registry: dict[RegistryKey, deps.RegistryInfo] = {}
     for group in groups.values():
         for key in group:
             found = final.get(key)
             if isinstance(found, deps.RegistryInfo):
                 registry[key] = found
+            elif found is not None:
+                failed[key] = found
             else:
-                failed[key] = found if found is not None else LOOKUP_BUDGET_EXCEEDED
+                failed[key] = LOOKUP_BUDGET_EXCEEDED if expired else LOOKUP_FAILED
     return registry, failed
 
 
