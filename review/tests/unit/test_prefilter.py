@@ -676,6 +676,17 @@ class TestIncompleteDependencyData:
         [c] = checks(r, pf.INCOMPLETE_DEP_DATA)
         assert c.level == pf.HARD_BLOCK and c.file == "yarn.lock"
 
+    def test_base_failure_is_only_a_signal(self):
+        facts = pf.DependencyFacts(
+            parsed_paths=frozenset({"package-lock.json"}),
+            base_failures=[pf.DepFailure("package-lock.json", "unknown lockfile version at the merge base")],
+        )
+        r = run(dependencies=facts)
+        assert not r.hard_blocks
+        [c] = checks(r, pf.BASE_DEP_UNPARSED)
+        assert c.level == pf.SIGNAL and c.file == "package-lock.json"
+        assert c.detail == "base side counts as empty: unknown lockfile version at the merge base"
+
     def test_changed_supported_file_not_parsed_blocks(self):
         r = run(change("package.json", "{}\n"), dependencies=pf.DependencyFacts())
         assert pf.INCOMPLETE_DEP_DATA in hard(r)

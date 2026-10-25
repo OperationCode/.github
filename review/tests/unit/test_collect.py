@@ -835,26 +835,128 @@ def _dep_blocks(col: c.Collected) -> set[tuple[str, str]]:
     return {(h["file"], h["detail"]) for h in hard if h["id"] == "incomplete-dependency-data"}
 
 
+def _signals(col: c.Collected, check: str) -> set[tuple[str, str]]:
+    sig = col.envelope["payload"]["prefilter"]["signals"]
+    return {(s["file"], s["detail"]) for s in sig if s["id"] == check}
+
+
+V1_LOCK = json.dumps({
+    "name": "x", "lockfileVersion": 1, "requires": True,
+    "dependencies": {"left-pad": {"version": "1.1.0", "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.1.0.tgz"}},
+})
+
+
+def _v3_lock(*pkgs: tuple[str, str]) -> str:
+    packages: dict = {"": {"name": "x"}}
+    for name, version in pkgs:
+        packages[f"node_modules/{name}"] = {
+            "version": version, "resolved": f"https://registry.npmjs.org/{name}/-/{name}-{version}.tgz",
+        }
+    return json.dumps({"name": "x", "lockfileVersion": 3, "requires": True, "packages": packages})
+
+
+def _packument(name: str, version: str, published: str) -> dict:
+    doc = {"name": name, "time": {version: published}, "versions": {version: {"name": name, "version": version}}}
+    return {"status": 200, "json": doc}
+
+
+MIGRATED = _v3_lock(("left-pad", "1.3.0"), ("is-odd", "3.0.1"))
+OLD_PACKUMENTS = {
+    "https://registry.npmjs.org/left-pad": _packument("left-pad", "1.3.0", "2018-04-09T01:51:42.000Z"),
+    "https://registry.npmjs.org/is-odd": _packument("is-odd", "3.0.1", "2018-03-01T00:00:00.000Z"),
+}
+
+
+def _migration(head: str = MIGRATED, base: str = V1_LOCK, registry: dict | None = None) -> dict:
+    fx = _snapshot({"package-lock.json": ("100644", base)}, {"package-lock.json": ("100644", head)})
+    fx["registry"] = OLD_PACKUMENTS if registry is None else registry
+    return fx
+
+
 @pytest.mark.parametrize(
     "base,reason",
     [
-        ("{not json", "does not parse at the merge base"),
+        (V1_LOCK, "unknown lockfile version at the merge base"),
         (UNKNOWN_LOCK, "unknown lockfile version at the merge base"),
+        ("{not json", "does not parse at the merge base"),
     ],
 )
-def test_base_lockfile_that_does_not_parse_is_a_hard_block(base, reason):
-    col, _, _ = run(_snapshot({"package-lock.json": ("100644", base)}, {"package-lock.json": ("100644", EMPTY_LOCK)}))
+def test_lockfile_migration_checks_every_head_entry_without_a_block(base, reason):
+    col, _, registry = run(_migration(base=base))
+    payload = col.envelope["payload"]
+    assert payload["prefilter"]["hard_blocks"] == []
+    assert payload["dependency_delta"]["failures"] == []
+    assert _signals(col, prefilter.BASE_DEP_UNPARSED) == {
+        ("package-lock.json", f"base side counts as empty: {reason}")
+    }
+    # The base counts as empty: every head entry is added and looked up.
+    changes = {(ch["name"], tuple(ch["old_versions"]), ch["new_version"]) for ch in payload["dependency_delta"]["changes"]}
+    assert changes == {("left-pad", (), "1.3.0"), ("is-odd", (), "3.0.1")}
+    assert sorted(registry.urls) == ["https://registry.npmjs.org/is-odd", "https://registry.npmjs.org/left-pad"]
+    assert all(ch["registry"] is not None for ch in payload["dependency_delta"]["changes"])
+
+
+def test_lockfile_migration_gets_every_check():
+    # A fresh publish and a foreign source in the migrated lockfile still block.
+    head = json.loads(MIGRATED)
+    head["packages"]["node_modules/evil"] = {"version": "1.0.0", "resolved": "https://evil.example/evil-1.0.0.tgz"}
+    registry = dict(OLD_PACKUMENTS)
+    registry["https://registry.npmjs.org/is-odd"] = _packument("is-odd", "3.0.1", "2026-10-25T00:00:00.000Z")
+    col, _, _ = run(_migration(head=json.dumps(head), registry=registry))
+    hard = col.envelope["payload"]["prefilter"]["hard_blocks"]
+    assert {(h["id"], h["file"]) for h in hard} == {
+        ("fresh-publish", "package-lock.json"), ("foreign-source", "package-lock.json"),
+    }
+    assert _signals(col, prefilter.BASE_DEP_UNPARSED)
+
+
+def test_lockfile_migration_over_a_lookup_cap_is_a_hard_block(monkeypatch):
+    big = dict(OLD_PACKUMENTS)
+    big["https://registry.npmjs.org/is-odd"] = {
+        "status": 200, "text": json.dumps({"name": "is-odd", "pad": "x" * 4096}),
+    }
+    monkeypatch.setattr(deps, "NPM_MAX_RESPONSE_BYTES", 2048)
+    col, _, _ = run(_migration(registry=big))
+    assert _dep_blocks(col) == {
+        ("package-lock.json", "dependency data incomplete: registry lookup failed"),
+        ("package-lock.json", "no registry data for a new version"),
+    }
+    assert col.envelope["payload"]["dependency_delta"]["failures"] == [
+        {"path": "package-lock.json", "reason": "registry lookup failed"}
+    ]
+
+
+def test_lockfile_migration_with_a_missing_lookup_is_a_hard_block():
+    registry = {k: v for k, v in OLD_PACKUMENTS.items() if "is-odd" not in k}
+    col, _, _ = run(_migration(registry=registry))
+    assert _dep_blocks(col) == {
+        ("package-lock.json", "dependency data incomplete: registry lookup failed"),
+        ("package-lock.json", "no registry data for a new version"),
+    }
+
+
+@pytest.mark.parametrize(
+    "head,reason",
+    [("{not json", "does not parse"), (UNKNOWN_LOCK, "unknown lockfile version")],
+)
+def test_head_that_does_not_parse_is_one_hard_block(head, reason):
+    # Both sides fail: one failure entry for the file, not two.
+    col, _, _ = run(_migration(head=head))
     assert _dep_blocks(col) == {("package-lock.json", f"dependency data incomplete: {reason}")}
-    delta = col.envelope["payload"]["dependency_delta"]
-    assert delta["failures"] == [{"path": "package-lock.json", "reason": reason}]
-    assert col.envelope["payload"]["coverage"]["complete"] is True
+    assert col.envelope["payload"]["dependency_delta"]["failures"] == [{"path": "package-lock.json", "reason": reason}]
+    # A valid base with the same bad head blocks the same way.
+    col, _, _ = run(_migration(head=head, base=EMPTY_LOCK))
+    assert _dep_blocks(col) == {("package-lock.json", f"dependency data incomplete: {reason}")}
 
 
-def test_deleted_lockfile_is_parsed_at_the_merge_base():
-    col, _, _ = run(_snapshot({"package-lock.json": ("100644", "{not json")}, {}))
-    assert _dep_blocks(col) == {("package-lock.json", "dependency data incomplete: does not parse at the merge base")}
-    col, _, _ = run(_snapshot({"package-lock.json": ("100644", EMPTY_LOCK)}, {}))
+@pytest.mark.parametrize("base", ["{not json", V1_LOCK, EMPTY_LOCK])
+def test_deleted_lockfile_with_any_base_does_not_block(base):
+    col, _, registry = run(_snapshot({"package-lock.json": ("100644", base)}, {}))
     assert _dep_blocks(col) == set()
+    assert col.envelope["payload"]["dependency_delta"]["changes"] == []
+    assert registry.urls == []
+    expect_signal = base != EMPTY_LOCK
+    assert bool(_signals(col, prefilter.BASE_DEP_UNPARSED)) is expect_signal
 
 
 def test_base_symlink_or_gitlink_lockfile_counts_as_absent():

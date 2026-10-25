@@ -73,6 +73,7 @@ FOREIGN_SOURCE = "foreign-source"
 FRESH_PUBLISH = "fresh-publish"
 INCOMPLETE_COVERAGE = "incomplete-coverage"
 INCOMPLETE_DEP_DATA = "incomplete-dependency-data"
+BASE_DEP_UNPARSED = "base-dependency-file-unparsed"
 ZERO_WIDTH = "zero-width"
 INVISIBLE_CHAR = "invisible-character"
 AI_DIRECTED_TEXT = "ai-directed-text"
@@ -271,6 +272,11 @@ class DependencyFacts:
     - `registry`: the deps.lookup_npm / deps.lookup_pypi result, keyed by
       `registry_key(change)`, for every change that has a key. The prefilter
       reads the publish time, npm install scripts and PyPI `has_wheel` from it.
+    - `failures`: the hard block "incomplete dependency data", at most one
+      per file.
+    - `base_failures`: changed supported files whose merge-base side does not
+      parse or has an unknown version. That side counts as empty, so every
+      head entry is in `changes`. A signal only (ruling R-BASEDEPS).
     """
 
     parsed_paths: frozenset[str] = frozenset()
@@ -278,6 +284,7 @@ class DependencyFacts:
     new_global_sources: Sequence[deps.SourceIssue] = ()
     registry: Mapping[tuple[str, str, str], deps.RegistryInfo] = field(default_factory=dict)
     failures: Sequence[DepFailure] = ()
+    base_failures: Sequence[DepFailure] = ()
 
 
 @dataclass(frozen=True)
@@ -911,6 +918,8 @@ def _check_deps(
     for f in sorted(facts.failures, key=lambda f: (f.path, f.reason)):
         out.add(INCOMPLETE_DEP_DATA, HARD_BLOCK, f"dependency data incomplete: {f.reason}", file=f.path)
     failed = {f.path for f in facts.failures}
+    for f in sorted(facts.base_failures, key=lambda f: (f.path, f.reason)):
+        out.add(BASE_DEP_UNPARSED, SIGNAL, f"base side counts as empty: {f.reason}", file=f.path)
     for c in changed:
         # A gitlink head has no file to parse; a file head does, whatever the base was.
         if c.head_sha is None or c.head_mode == MODE_SUBMODULE or deps.family_for_path(c.path) is None:

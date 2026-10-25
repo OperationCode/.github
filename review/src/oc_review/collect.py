@@ -630,26 +630,31 @@ def dependency_facts(
     """Parse each changed supported file at the merge base and the head, and
     look up every new exact registry version (`prefilter.registry_key`).
 
-    A side that does not parse, at the head or at the merge base (a deleted
-    file too), is a `DepFailure`: the hard block "incomplete dependency data".
-    A base side that does not parse also counts as absent, so every head entry
-    is new. A base symlink or gitlink holds no dependency data, so it counts
-    as absent without a failure.
+    A head side that does not parse is a `DepFailure`: the hard block
+    "incomplete dependency data". A base side that does not parse or has an
+    unknown version (ruling R-BASEDEPS, K-10), a deleted file too, counts as
+    empty: every head entry is new and gets every check, and the base failure
+    is only a signal (`base_failures`). A base blob that was not read is still
+    a `DepFailure`. A file gets at most one `DepFailure`. A base symlink or
+    gitlink holds no dependency data, so it counts as absent with no failure.
     """
     parsed: set[str] = set()
     changes: list[deps.PackageChange] = []
     new_sources: list[deps.SourceIssue] = []
     failures: list[prefilter.DepFailure] = []
+    base_failures: list[prefilter.DepFailure] = []
     for c in diff.files:
         family = deps.family_for_path(c.path)
         base_path = c.old_path or c.path
         base_family = deps.family_for_path(base_path)
         new: deps.ParsedDeps | None = None
+        head_failed = False
         if family is not None and c.head_sha is not None and c.head_mode != MODE_SUBMODULE:
             try:
                 new = _parse_side(c.path, c.head_mode, blobs.get(c.head_sha))
             except deps.DepsError as exc:
                 failures.append(prefilter.DepFailure(c.path, _failure_reason(exc)))
+                head_failed = True
             else:
                 parsed.add(c.path)
         old: deps.ParsedDeps | None = None
@@ -657,7 +662,11 @@ def dependency_facts(
             try:
                 old = _parse_side(base_path, c.base_mode, blobs.get(c.base_sha))
             except deps.DepsError as exc:
-                failures.append(prefilter.DepFailure(c.path, f"{_failure_reason(exc)} at the merge base"))
+                failure = prefilter.DepFailure(c.path, f"{_failure_reason(exc)} at the merge base")
+                if str(exc) != "blob not available":
+                    base_failures.append(failure)
+                elif not head_failed:
+                    failures.append(failure)
         if new is None:
             continue
         if base_family != family:
@@ -689,6 +698,7 @@ def dependency_facts(
         new_global_sources=tuple(new_sources),
         registry=registry,
         failures=tuple(failures),
+        base_failures=tuple(base_failures),
     )
 
 
