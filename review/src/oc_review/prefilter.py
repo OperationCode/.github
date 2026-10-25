@@ -1010,8 +1010,9 @@ def run_prefilter(
         if all(s.reason not in ("unreadable", "sha-mismatch") for s in (base, head) if s is not None):
             collected += 1
         cov = _file_coverage(change, base, head)
-        # Ruling R-KEYBLOCK: redaction of a private key block with no END is
-        # cut off, so Claude would not see the whole side. Fail closed.
+        # Ruling R-KEYBLOCK: a private key block with no END, or one that
+        # holds text that is not key material, can hide code from Claude.
+        # Fail closed.
         if cov.coverage != "unavailable" and any(
             s is not None and s.kind == "full" and render.unterminated_private_keys(s.text) for s in (base, head)
         ):

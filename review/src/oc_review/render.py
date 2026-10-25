@@ -301,8 +301,13 @@ def _replace_spans(text: str, spans: list[tuple[str, int, int]]) -> str:
 # file `unavailable` (`unterminated_private_keys`). Key data that has lost its
 # header is still redacted: the lines before an END with no open block, and
 # runs of full-width base64 lines (`KEY_BODY_WIDTHS`). A PuTTY `Private-Lines`
-# count is held to the same cap, and a block that is not complete (over the
-# cap, cut short, or with a line that is not key data) is unterminated too.
+# count is held to the same cap, and a block over the cap or cut short is
+# unterminated too.
+#
+# A key block (PEM, OpenSSH, SSH2, PuTTY, the text of a base64-encoded PEM key,
+# and the key data before an END with no BEGIN) must hold key material only,
+# or the file's coverage is `unavailable` too (`_KeyBody`): a block with an
+# END line must not hide code either.
 #
 # Headers: PEM, OpenSSH and PGP (five dashes), and SSH2 (RFC 4716 form, four
 # dashes and spaces).
@@ -314,12 +319,38 @@ _PK_END = re.compile(r"-----END[A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----|---- E
 # Any other PEM header (certificate, public key): the base64 under it is public.
 _PEM_PUBLIC_BEGIN = re.compile(r"-----BEGIN (?![A-Z0-9 ]*PRIVATE)[A-Z0-9 ]{1,40}-----")
 PK_UNTERMINATED_MAX_LINES = 100
+# Armor header lines a key block may hold before its base64: RFC 1421 and
+# OpenPGP under five dashes, RFC 4716 under four. Free text has no brackets,
+# operators, backticks or `$`, so a header line cannot call code either.
+_HEADER_TEXT = r"[^()\[\]{}<>;=`$|&\\]*"
+_PEM_HEADER = re.compile(
+    r"Proc-Type: \d+,[A-Z-]+|DEK-Info: [A-Za-z0-9-]+(?:,[0-9A-Fa-f]+)?"
+    rf"|(?:Version|Comment|Hash|Charset|MessageID): {_HEADER_TEXT}"
+)
+_SSH2_HEADER = re.compile(rf"(?i:Subject|Comment|x-[a-z0-9-]+): {_HEADER_TEXT}")
 # Key data: base64 (with `\n` escapes of a one-line key) inside optional quotes
 # and concatenation of a key in code, or an armor header line.
 _PK_DATA = re.compile(
     r"[\s\"'`+(,]*+(?:[A-Za-z0-9+/=]|\\[nr])*+[\s\"'`+),;]*+"
-    r"|(?:Proc-Type|DEK-Info|Version|Comment|Hash|Charset): .*"
+    rf"|{_PEM_HEADER.pattern}|{_SSH2_HEADER.pattern}"
 )
+# One line of a key block: base64 with `\n` escapes, in optional quotes, with
+# the concatenation of a key in code around it. A `+` before the data is
+# concatenation only before a quote; elsewhere it is base64.
+_KEY_LINE = re.compile(
+    r"\s*+(?:[+,(]\s*+(?=[\"'`]))?[\"'`]?((?:[A-Za-z0-9+/=]|\\[nr])*+)[\"'`]?\s*+(?:[+,);]\s*+)*+"
+)
+_ESCAPED_EOL = re.compile(r"\\r\\n|\\n|\\r")
+_B64_LINE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
+_PGP_CHECKSUM = re.compile(r"=[A-Za-z0-9+/]{4}")
+# Key material: every base64 line but the last has one of these widths (PEM
+# and PGP 64, OpenSSH 70, RFC 4716 at most 72, MIME 76; PuTTY always 64), the
+# last may be shorter, and all of it is padded base64 of at least
+# `KEY_BLOCK_MIN_CHARS` characters (the smallest private key part, a PuTTY
+# Ed25519 or ECDSA blob, has 44 or more).
+KEY_BLOCK_WIDTHS = frozenset({64, 70, 72, 76})
+PUTTY_KEY_WIDTHS = frozenset({64})
+KEY_BLOCK_MIN_CHARS = 44
 # A key body that lost its header: at least `KEY_BODY_MIN_LINES` lines of
 # base64 of one of these widths (PEM and PGP 64, OpenSSH 70, MIME 76), and an
 # optional shorter last line.
@@ -349,18 +380,82 @@ def _is_key_data(line: str) -> bool:
     return bool(body) and any(c.isalnum() for c in body) and _PK_DATA.fullmatch(body) is not None
 
 
+class _KeyBody:
+    """Whether the text of one key block is key material only.
+
+    Key material: the header lines the format allows, then base64 lines of one
+    full width (the last may be shorter), padded and at least
+    `KEY_BLOCK_MIN_CHARS` long, then for OpenPGP one `=XXXX` checksum line.
+    Blank lines are allowed. A real key has nothing else, so any other line
+    means the block can hide code (ruling R-KEYBLOCK).
+    """
+
+    def __init__(self, headers: re.Pattern[str] | None, widths: frozenset[int], pgp: bool = False) -> None:
+        self.headers, self.widths, self.pgp = headers, widths, pgp
+        self.width = self.chars = 0
+        self.last = self.checksum = False
+        self.ok = True
+
+    @classmethod
+    def for_header(cls, header: str) -> _KeyBody:
+        """For the block of a BEGIN or END line: five dashes or SSH2."""
+        if header.startswith("-----"):
+            return cls(_PEM_HEADER, KEY_BLOCK_WIDTHS, pgp="PGP" in header)
+        return cls(_SSH2_HEADER, KEY_BLOCK_WIDTHS)
+
+    def feed(self, segment: str) -> None:
+        s = segment.strip()
+        if not s or not self.ok:
+            return
+        if self.headers is not None and not self.chars and self.headers.fullmatch(s):
+            return
+        m = _KEY_LINE.fullmatch(s)
+        if m is None:
+            self.ok = False
+            return
+        for piece in _ESCAPED_EOL.split(m.group(1)):
+            if piece:
+                self._line(piece)
+
+    def _line(self, piece: str) -> None:
+        if self.pgp and self.chars and not self.checksum and _PGP_CHECKSUM.fullmatch(piece):
+            self.checksum = True
+            return
+        n = len(piece)
+        if (
+            self.checksum
+            or self.last
+            or not _B64_LINE.fullmatch(piece)
+            or n > (self.width or max(self.widths))
+        ):
+            self.ok = False
+            return
+        if not self.width and n in self.widths:
+            self.width = n
+        if n != self.width or piece.endswith("="):
+            self.last = True
+        self.chars += n
+
+    def complete(self) -> bool:
+        return self.ok and (not self.chars or (self.chars >= KEY_BLOCK_MIN_CHARS and self.chars % 4 == 0))
+
+
 @dataclass
 class _KeyScan:
     lines: list[str]  # redacted lines, trailing CR kept
     found: list[tuple[str, int, int]]  # (kind, start, end) in the input text
     unterminated: list[int]  # 1-based lines of BEGIN headers with no END
+    not_key_material: list[int]  # 1-based header lines of blocks that hold other text
 
 
-def _scan_private_keys(text: str) -> _KeyScan:
+def _scan_private_keys(text: str, cap: int | None = PK_UNTERMINATED_MAX_LINES) -> _KeyScan:
+    """Redact private key blocks. `cap`: the most lines a block with no END
+    redacts; None runs it to the end of the text (for decoded base64)."""
     raw = text.split("\n")
     lines = list(raw)
     found: list[tuple[str, int, int]] = []
     unterminated: list[int] = []
+    not_key_material: list[int] = []
     has_pem = "PRIVATE KEY" in text
     has_putty = _PUTTY_HEADER.search(text) is not None
     starts = [0]
@@ -369,6 +464,8 @@ def _scan_private_keys(text: str) -> _KeyScan:
 
     end_tag: str | None = None
     left: int | None = None  # lines left in an unterminated block; None: until END
+    key = _KeyBody(None, KEY_BLOCK_WIDTHS)  # the text of the open block
+    key_line = 0  # 1-based line of its BEGIN header
     putty_left = 0
     if has_pem or has_putty:
         for i, line in enumerate(raw):
@@ -379,6 +476,8 @@ def _scan_private_keys(text: str) -> _KeyScan:
                 continue
             if end_tag is not None and left is not None:
                 if left == 0:
+                    if not key.ok:
+                        not_key_material.append(key_line)
                     end_tag = left = None
                 else:
                     left -= 1
@@ -388,9 +487,13 @@ def _scan_private_keys(text: str) -> _KeyScan:
                 while True:
                     if end_tag is not None:
                         stop = body.find(end_tag, pos)
-                        out.append(_pk_payload(body[pos : len(body) if stop < 0 else stop]))
+                        segment = body[pos : len(body) if stop < 0 else stop]
+                        key.feed(segment)
+                        out.append(_pk_payload(segment))
                         if stop < 0:
                             break
+                        if not key.complete():
+                            not_key_material.append(key_line)
                         out.append(end_tag)
                         pos, end_tag, left = stop + len(end_tag), None, None
                         continue
@@ -400,11 +503,18 @@ def _scan_private_keys(text: str) -> _KeyScan:
                         # An END with no open block: its BEGIN line was removed.
                         # Redact the key data before it.
                         prefix = body[pos : orphan.start()]
-                        out.append(_pk_payload(prefix) if _is_key_data(prefix) else prefix)
+                        orphan_key = _KeyBody.for_header(orphan.group())
+                        if pos == 0:
+                            for j in range(_redact_orphan_body(raw, lines, i), i):
+                                orphan_key.feed(raw[j].rstrip("\r"))
+                        if _is_key_data(prefix):
+                            orphan_key.feed(prefix)
+                            prefix = _pk_payload(prefix)
+                        if not orphan_key.complete():
+                            not_key_material.append(i + 1)
+                        out.append(prefix)
                         out.append(orphan.group())
                         found.append(("private-key", starts[i] + orphan.start(), starts[i] + orphan.end()))
-                        if pos == 0:
-                            _redact_orphan_body(raw, lines, i)
                         pos = orphan.end()
                         continue
                     if begin is None:
@@ -418,42 +528,49 @@ def _scan_private_keys(text: str) -> _KeyScan:
                     found.append(("private-key", starts[i] + begin.start(), starts[i] + begin.end()))
                     if text.find(tag, starts[i] + begin.end()) < 0:
                         unterminated.append(i + 1)
-                        left = PK_UNTERMINATED_MAX_LINES
+                        left = cap
                     else:
                         left = None
                     pos, end_tag = begin.end(), tag
+                    key, key_line = _KeyBody.for_header(begin.group()), i + 1
                 body = "".join(out)
                 lines[i] = body + cr
             if has_putty and end_tag is None:
                 m = _PUTTY_PRIVATE_LINES.fullmatch(body)
                 if m:
                     # PuTTY has no END header; the count is the only bound, so
-                    # the same 100-line cap applies. A block over the cap, cut
-                    # short, or with a line that is not key data is incomplete.
+                    # the same 100-line cap applies. A block over the cap or
+                    # cut short is unterminated; one with a line that is not
+                    # key material does not hold a key.
                     count = int(m.group(1))
-                    putty_left = min(count, PK_UNTERMINATED_MAX_LINES)
+                    putty_left = count if cap is None else min(count, cap)
                     block = raw[i + 1 : i + 1 + putty_left]
-                    if (
-                        count > PK_UNTERMINATED_MAX_LINES
-                        or len(block) < count
-                        or not all(_is_key_data(b.rstrip("\r")) for b in block)
-                    ):
+                    if (cap is not None and count > cap) or len(block) < count:
                         unterminated.append(i + 1)
+                    putty_key = _KeyBody(None, PUTTY_KEY_WIDTHS)
+                    for b in block:
+                        putty_key.feed(b.rstrip("\r"))
+                    if not (putty_key.complete() if len(block) == count else putty_key.ok):
+                        not_key_material.append(i + 1)
             if has_putty:
                 m = _PUTTY_HEADER.search(body)
                 if m:
                     found.append(("private-key", starts[i] + m.start(), starts[i] + m.end()))
+    if end_tag is not None and not key.ok:
+        not_key_material.append(key_line)
     found.extend(_redact_key_body_runs(raw, lines, starts))
-    return _KeyScan(lines, found, unterminated)
+    return _KeyScan(lines, found, unterminated, not_key_material)
 
 
-def _redact_orphan_body(raw: list[str], lines: list[str], end_line: int) -> None:
-    """Redact the key data lines just before an END line with no BEGIN."""
+def _redact_orphan_body(raw: list[str], lines: list[str], end_line: int) -> int:
+    """Redact the key data lines just before an END line with no BEGIN.
+    Returns the index of the first redacted line (`end_line` if none)."""
     for j in range(end_line - 1, max(-1, end_line - 1 - PK_UNTERMINATED_MAX_LINES), -1):
         if lines[j] != raw[j] or not _is_key_data(raw[j].rstrip("\r")):
-            return
+            return j + 1
         cr = "\r" if raw[j].endswith("\r") else ""
         lines[j] = _pk_payload(raw[j][: len(raw[j]) - len(cr)]) + cr
+    return max(0, end_line - PK_UNTERMINATED_MAX_LINES)
 
 
 def _key_body_width(line: str) -> int:
@@ -492,19 +609,30 @@ def _redact_private_keys(text: str) -> str:
 
 
 def unterminated_private_keys(text: str) -> list[int]:
-    """1-based lines of private key headers with no END header after them,
-    and of PuTTY `Private-Lines` lines whose block is not complete.
+    """1-based lines of key blocks whose redaction does not show all code:
+    private key headers with no END header after them, PuTTY `Private-Lines`
+    lines whose block is cut off, and blocks (headers, PuTTY counts, END lines
+    with no BEGIN, base64-encoded PEM keys) that hold text that is not key
+    material.
 
-    Ruling R-KEYBLOCK: the redaction of such a block is cut off, so the
+    Ruling R-KEYBLOCK: such a block can hide code from Claude, so the
     prefilter marks the file's coverage `unavailable`.
     """
-    if "PRIVATE KEY" not in text and _PUTTY_HEADER.search(text) is None:
+    b64 = _b64_pem_keys(text)
+    if "PRIVATE KEY" not in text and _PUTTY_HEADER.search(text) is None and not b64:
         return []
-    return _scan_private_keys(text).unterminated
+    scan = _scan_private_keys(text)
+    lines = {*scan.unterminated, *scan.not_key_material}
+    for start, _, decoded in b64:
+        # The token is redacted whole. A block cut off at the end of the
+        # token is one line of a wrapped encoding, so only other text counts.
+        if _scan_private_keys(decoded.decode("latin-1"), cap=None).not_key_material:
+            lines.add(text.count("\n", 0, start) + 1)
+    return sorted(lines)
 
 
-def _b64_pem_spans(text: str) -> list[tuple[str, int, int]]:
-    """Base64 tokens that decode to a PEM private key."""
+def _b64_pem_keys(text: str) -> list[tuple[int, int, bytes]]:
+    """Base64 tokens that decode to a PEM private key: (start, end, decoded)."""
     if not any(sig in text for sig in _B64_BEGIN_SIGNATURES):
         return []
     found = []
@@ -513,16 +641,22 @@ def _b64_pem_spans(text: str) -> list[tuple[str, int, int]]:
         if not any(sig in token for sig in _B64_BEGIN_SIGNATURES):
             continue
         for off in range(4):
+            # Decode up to the last byte, so the text of the key is whole.
             chunk = token[off:].rstrip("=")
-            chunk = chunk[: len(chunk) - len(chunk) % 4]
+            chunk = chunk[: len(chunk) - 1] if len(chunk) % 4 == 1 else chunk
+            chunk += "=" * (-len(chunk) % 4)
             try:
                 decoded = base64.b64decode(chunk)
             except (ValueError, binascii.Error):
                 continue
             if b"PRIVATE KEY" in decoded:
-                found.append(("private-key-base64", m.start(), m.end()))
+                found.append((m.start(), m.end(), decoded))
                 break
     return found
+
+
+def _b64_pem_spans(text: str) -> list[tuple[str, int, int]]:
+    return [("private-key-base64", start, end) for start, end, _ in _b64_pem_keys(text)]
 
 
 def find_credentials(text: str) -> list[tuple[str, int, int]]:

