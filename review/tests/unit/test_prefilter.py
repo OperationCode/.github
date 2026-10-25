@@ -1177,3 +1177,30 @@ def test_signals_never_hard_block_and_vice_versa():
     assert all(c.level == pf.HARD_BLOCK for c in r.hard_blocks)
     assert all(c.level == pf.SIGNAL for c in r.signals)
     assert {pf.BIDI_CONTROL, pf.INCOMPLETE_COVERAGE} <= set(hard(r))
+
+
+# ---------------------------------------------------------------------------
+# Ruling R-KEYBLOCK: an unterminated private key block makes coverage unavailable
+# ---------------------------------------------------------------------------
+
+
+class TestUnterminatedKeyBlock:
+    BEGIN = "-----BEGIN " + "RSA PRIVATE KEY-----"
+    END = "-----END " + "RSA PRIVATE KEY-----"
+
+    def test_head_without_end_is_unavailable(self):
+        r = run(change("a.py", f"x = 1\n{self.BEGIN}\nprint(1)\n", "x = 1\n"))
+        assert r.coverage.files[0] == pf.FileCoverage("a.py", "unavailable", "unterminated-private-key")
+        assert pf.INCOMPLETE_COVERAGE in hard(r)
+        # The text was still scanned: the credential signal names the header line.
+        [c] = [c for c in checks(r, pf.CREDENTIAL) if c.detail.startswith("private-key")]
+        assert c.lines == (2,)
+
+    def test_base_without_end_is_unavailable(self):
+        r = run(change("a.py", "x = 2\n", f"x = 1\n{self.BEGIN}\nprint(1)\n"))
+        assert r.coverage.files[0].reason == "unterminated-private-key"
+
+    def test_terminated_block_is_full(self):
+        r = run(change("a.py", f"{self.BEGIN}\nQUJD\n{self.END}\n"))
+        assert r.coverage.files[0].coverage == "full" and r.coverage.complete
+        assert pf.INCOMPLETE_COVERAGE not in hard(r)

@@ -31,7 +31,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
-from oc_review import deps
+from oc_review import deps, render
 from oc_review.snapshot import MODE_SUBMODULE, MODE_SYMLINK, ChangedFile, TreeDiff
 
 # Hard cap on the bytes of one blob that the prefilter scans. Matches the cap
@@ -1020,7 +1020,14 @@ def run_prefilter(
             )
         if all(s.reason not in ("unreadable", "sha-mismatch") for s in (base, head) if s is not None):
             collected += 1
-        file_cov.append(_file_coverage(change, base, head))
+        cov = _file_coverage(change, base, head)
+        # Ruling R-KEYBLOCK: redaction of a private key block with no END is
+        # cut off, so Claude would not see the whole side. Fail closed.
+        if cov.coverage != "unavailable" and any(
+            s is not None and s.kind == "full" and render.unterminated_private_keys(s.text) for s in (base, head)
+        ):
+            cov = FileCoverage(change.path, "unavailable", "unterminated-private-key")
+        file_cov.append(cov)
         _check_file(out, change, base, head)
 
     coverage = Coverage(

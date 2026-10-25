@@ -283,22 +283,48 @@ def _replace_spans(text: str, spans: list[tuple[str, int, int]]) -> str:
 
 # Private keys. After a BEGIN header, all text up to the END header with the
 # same label is key payload, whatever it looks like: no entropy or length
-# test decides. A header with no END redacts the rest of the text (fail
-# closed). Each payload line becomes one marker (indent kept), so the line
-# count does not change (ruling R-LINES). A payload line that cannot be key
-# data (it holds characters outside base64, armor headers and the quotes and
-# escapes of a key in code) gets its own kind, so Claude can see that a key
-# block hides text. The kind says only that; it shows no part of the line.
-_PK_BEGIN = re.compile(r"-----BEGIN([A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?)-----")
+# test decides. Each payload line becomes one marker (indent kept), so the
+# line count does not change (ruling R-LINES). A payload line that cannot be
+# key data (it holds characters outside base64, armor headers and the quotes
+# and escapes of a key in code) gets its own kind, so Claude can see that a
+# key block hides text. The kind says only that; it shows no part of the line.
+#
+# Ruling R-KEYBLOCK: a header with no END anywhere after it redacts at most
+# `PK_UNTERMINATED_MAX_LINES` lines after the header line, so a fake header
+# cannot hide the rest of the file. The prefilter makes the coverage of such a
+# file `unavailable` (`unterminated_private_keys`). Key data that has lost its
+# header is still redacted: the lines before an END with no open block, and
+# runs of full-width base64 lines (`KEY_BODY_WIDTHS`).
+#
+# Headers: PEM, OpenSSH and PGP (five dashes), and SSH2 (RFC 4716 form, four
+# dashes and spaces).
+_PK_BEGIN = re.compile(
+    r"-----BEGIN(?P<pem>[A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?)-----"
+    r"|---- BEGIN(?P<ssh2>[A-Z0-9 ]{0,40}PRIVATE KEY) ----"
+)
+_PK_END = re.compile(r"-----END[A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----|---- END[A-Z0-9 ]{0,40}PRIVATE KEY ----")
+# Any other PEM header (certificate, public key): the base64 under it is public.
+_PEM_PUBLIC_BEGIN = re.compile(r"-----BEGIN (?![A-Z0-9 ]*PRIVATE)[A-Z0-9 ]{1,40}-----")
+PK_UNTERMINATED_MAX_LINES = 100
 # Key data: base64 (with `\n` escapes of a one-line key) inside optional quotes
 # and concatenation of a key in code, or an armor header line.
 _PK_DATA = re.compile(
     r"[\s\"'`+(,]*+(?:[A-Za-z0-9+/=]|\\[nr])*+[\s\"'`+),;]*+"
     r"|(?:Proc-Type|DEK-Info|Version|Comment|Hash|Charset): .*"
 )
+# A key body that lost its header: at least `KEY_BODY_MIN_LINES` lines of
+# base64 of one of these widths (PEM and PGP 64, OpenSSH 70, MIME 76), and an
+# optional shorter last line.
+KEY_BODY_WIDTHS = frozenset({64, 70, 76})
+KEY_BODY_MIN_LINES = 3
+_KEY_BODY_LINE = re.compile(r"[\s\"'`]*+([A-Za-z0-9+/]++={0,2})(?:\\n)?[\"'`]?[\s,;+]*+")
 # PuTTY key files: `Private-Lines: N`, then N lines of key data.
 _PUTTY_HEADER = re.compile(r"PuTTY-User-Key-File-\d+:")
 _PUTTY_PRIVATE_LINES = re.compile(r"\s*Private-Lines:\s*(\d{1,6})\s*")
+# A whole PEM file encoded as base64 (a Kubernetes secret, for example). These
+# are the parts of base64("-----BEGIN") that do not depend on the byte offset.
+_B64_BEGIN_SIGNATURES = ("LS0tLS1CRUdJT", "0tLS0tQkVHSU", "tLS0tLUJFR0lO")
+_B64_TOKEN = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{20,}+={0,2}")
 
 
 def _pk_payload(segment: str) -> str:
@@ -309,64 +335,189 @@ def _pk_payload(segment: str) -> str:
     return segment[: len(segment) - len(segment.lstrip())] + REDACTED.format(kind=kind)
 
 
-def _pk_line(line: str, end_tag: str | None) -> tuple[str, str | None]:
-    """Redact one line. `end_tag` is the END header awaited, or None."""
-    out: list[str] = []
-    pos = 0
-    while True:
-        if end_tag is not None:
-            stop = line.find(end_tag, pos)
-            out.append(_pk_payload(line[pos : len(line) if stop < 0 else stop]))
-            if stop < 0:
-                return "".join(out), end_tag
-            out.append(end_tag)
-            pos, end_tag = stop + len(end_tag), None
-        else:
-            begin = _PK_BEGIN.search(line, pos)
-            if begin is None:
-                out.append(line[pos:])
-                return "".join(out), None
-            out.append(line[pos : begin.end()])
-            pos, end_tag = begin.end(), f"-----END{begin.group(1)}-----"
+def _is_key_data(line: str) -> bool:
+    body = line.strip()
+    return bool(body) and any(c.isalnum() for c in body) and _PK_DATA.fullmatch(body) is not None
+
+
+@dataclass
+class _KeyScan:
+    lines: list[str]  # redacted lines, trailing CR kept
+    found: list[tuple[str, int, int]]  # (kind, start, end) in the input text
+    unterminated: list[int]  # 1-based lines of BEGIN headers with no END
+
+
+def _scan_private_keys(text: str) -> _KeyScan:
+    raw = text.split("\n")
+    lines = list(raw)
+    found: list[tuple[str, int, int]] = []
+    unterminated: list[int] = []
+    has_pem = "PRIVATE KEY" in text
+    has_putty = _PUTTY_HEADER.search(text) is not None
+    starts = [0]
+    for line in raw[:-1]:
+        starts.append(starts[-1] + len(line) + 1)
+
+    end_tag: str | None = None
+    left: int | None = None  # lines left in an unterminated block; None: until END
+    putty_left = 0
+    if has_pem or has_putty:
+        for i, line in enumerate(raw):
+            cr = "\r" if line.endswith("\r") else ""
+            body = line[: len(line) - len(cr)]
+            if putty_left > 0:
+                lines[i], putty_left = _pk_payload(body) + cr, putty_left - 1
+                continue
+            if end_tag is not None and left is not None:
+                if left == 0:
+                    end_tag = left = None
+                else:
+                    left -= 1
+            if has_pem:
+                out: list[str] = []
+                pos = 0
+                while True:
+                    if end_tag is not None:
+                        stop = body.find(end_tag, pos)
+                        out.append(_pk_payload(body[pos : len(body) if stop < 0 else stop]))
+                        if stop < 0:
+                            break
+                        out.append(end_tag)
+                        pos, end_tag, left = stop + len(end_tag), None, None
+                        continue
+                    begin = _PK_BEGIN.search(body, pos)
+                    orphan = _PK_END.search(body, pos)
+                    if orphan is not None and (begin is None or orphan.start() < begin.start()):
+                        # An END with no open block: its BEGIN line was removed.
+                        # Redact the key data before it.
+                        prefix = body[pos : orphan.start()]
+                        out.append(_pk_payload(prefix) if _is_key_data(prefix) else prefix)
+                        out.append(orphan.group())
+                        found.append(("private-key", starts[i] + orphan.start(), starts[i] + orphan.end()))
+                        if pos == 0:
+                            _redact_orphan_body(raw, lines, i)
+                        pos = orphan.end()
+                        continue
+                    if begin is None:
+                        out.append(body[pos:])
+                        break
+                    out.append(body[pos : begin.end()])
+                    if begin.group("pem") is not None:
+                        tag = f"-----END{begin.group('pem')}-----"
+                    else:
+                        tag = f"---- END{begin.group('ssh2')} ----"
+                    found.append(("private-key", starts[i] + begin.start(), starts[i] + begin.end()))
+                    if text.find(tag, starts[i] + begin.end()) < 0:
+                        unterminated.append(i + 1)
+                        left = PK_UNTERMINATED_MAX_LINES
+                    else:
+                        left = None
+                    pos, end_tag = begin.end(), tag
+                body = "".join(out)
+                lines[i] = body + cr
+            if has_putty and end_tag is None:
+                m = _PUTTY_PRIVATE_LINES.fullmatch(body)
+                if m:
+                    putty_left = int(m.group(1))
+            if has_putty:
+                m = _PUTTY_HEADER.search(body)
+                if m:
+                    found.append(("private-key", starts[i] + m.start(), starts[i] + m.end()))
+    found.extend(_redact_key_body_runs(raw, lines, starts))
+    return _KeyScan(lines, found, unterminated)
+
+
+def _redact_orphan_body(raw: list[str], lines: list[str], end_line: int) -> None:
+    """Redact the key data lines just before an END line with no BEGIN."""
+    for j in range(end_line - 1, max(-1, end_line - 1 - PK_UNTERMINATED_MAX_LINES), -1):
+        if lines[j] != raw[j] or not _is_key_data(raw[j].rstrip("\r")):
+            return
+        cr = "\r" if raw[j].endswith("\r") else ""
+        lines[j] = _pk_payload(raw[j][: len(raw[j]) - len(cr)]) + cr
+
+
+def _key_body_width(line: str) -> int:
+    m = _KEY_BODY_LINE.fullmatch(line)
+    return len(m.group(1)) if m else 0
+
+
+def _redact_key_body_runs(raw: list[str], lines: list[str], starts: list[int]) -> list[tuple[str, int, int]]:
+    """Redact runs of full-width base64 lines that no header explains."""
+    found = []
+    i, n = 0, len(raw)
+    while i < n:
+        width = _key_body_width(raw[i]) if lines[i] == raw[i] else 0
+        if width not in KEY_BODY_WIDTHS:
+            i += 1
+            continue
+        j = i
+        while j < n and lines[j] == raw[j] and _key_body_width(raw[j]) == width:
+            j += 1
+        full = j - i
+        if j < n and lines[j] == raw[j] and 0 < _key_body_width(raw[j]) < width:
+            j += 1  # the shorter last line
+        public = i > 0 and _PEM_PUBLIC_BEGIN.search(raw[i - 1]) is not None
+        if full >= KEY_BODY_MIN_LINES and not public:
+            for k in range(i, j):
+                cr = "\r" if raw[k].endswith("\r") else ""
+                body = raw[k][: len(raw[k]) - len(cr)]
+                lines[k] = body[: len(body) - len(body.lstrip())] + REDACTED.format(kind="key-body") + cr
+            found.append(("key-body", starts[i], starts[i] + len(raw[i])))
+        i = j
+    return found
 
 
 def _redact_private_keys(text: str) -> str:
-    has_pem = "PRIVATE KEY" in text
-    has_putty = _PUTTY_HEADER.search(text) is not None
-    if not (has_pem or has_putty):
-        return text
-    lines = text.split("\n")
-    end_tag: str | None = None
-    putty_left = 0
-    for i, line in enumerate(lines):
-        cr = "\r" if line.endswith("\r") else ""
-        body = line[: len(line) - len(cr)]
-        if putty_left > 0:
-            lines[i], putty_left = _pk_payload(body) + cr, putty_left - 1
+    return "\n".join(_scan_private_keys(text).lines)
+
+
+def unterminated_private_keys(text: str) -> list[int]:
+    """1-based lines of private key headers with no END header after them.
+
+    Ruling R-KEYBLOCK: the redaction of such a block is cut off, so the
+    prefilter marks the file's coverage `unavailable`.
+    """
+    if "PRIVATE KEY" not in text:
+        return []
+    return _scan_private_keys(text).unterminated
+
+
+def _b64_pem_spans(text: str) -> list[tuple[str, int, int]]:
+    """Base64 tokens that decode to a PEM private key."""
+    if not any(sig in text for sig in _B64_BEGIN_SIGNATURES):
+        return []
+    found = []
+    for m in _B64_TOKEN.finditer(text):
+        token = m.group()
+        if not any(sig in token for sig in _B64_BEGIN_SIGNATURES):
             continue
-        if has_pem:
-            body, end_tag = _pk_line(body, end_tag)
-            lines[i] = body + cr
-        if has_putty and end_tag is None:
-            m = _PUTTY_PRIVATE_LINES.fullmatch(body)
-            if m:
-                putty_left = int(m.group(1))
-    return "\n".join(lines)
+        for off in range(4):
+            chunk = token[off:].rstrip("=")
+            chunk = chunk[: len(chunk) - len(chunk) % 4]
+            try:
+                decoded = base64.b64decode(chunk)
+            except (ValueError, binascii.Error):
+                continue
+            if b"PRIVATE KEY" in decoded:
+                found.append(("private-key-base64", m.start(), m.end()))
+                break
+    return found
 
 
 def find_credentials(text: str) -> list[tuple[str, int, int]]:
     """Locations of credential-like strings: (kind, start, end), by start.
 
-    Private keys are reported by their header only. For the prefilter signal,
-    which shows the location and never the value.
+    Private keys are reported by their header (or END line, or the first line
+    of a key body with no header) only. Used by the prefilter signal, which
+    shows the location and never the value, so the signal and the redaction
+    agree.
     """
-    found: list[tuple[str, int, int]] = []
+    found: list[tuple[str, int, int]] = list(_scan_private_keys(text).found)
+    found.extend(_b64_pem_spans(text))
     for kind, pattern in _TOKEN_PATTERNS:
         found.extend((kind, m.start(), m.end()) for m in pattern.finditer(text))
     found.extend(("jwt", m.start(), m.end()) for m in _JWT_CANDIDATE.finditer(text) if _is_jwt(m))
     found.extend(("url-credentials", m.start(), m.end()) for m in _URL_CREDENTIALS.finditer(text))
-    found.extend(("private-key", m.start(), m.end()) for m in _PK_BEGIN.finditer(text))
-    found.extend(("private-key", m.start(), m.end()) for m in _PUTTY_HEADER.finditer(text))
     found.extend(_value_spans(text))
     return sorted(found, key=lambda f: (f[1], f[2]))
 
@@ -378,13 +529,14 @@ def redact_text(text: str) -> str:
     (before Claude sees the bundle) and by publish (before anything is posted).
     Idempotent: a marker is never redacted again.
 
-    Order: private keys (they need the lines around them), token prefixes,
-    JWTs, URL credentials, then values after credential names (last, so a
+    Order: private keys (they need the lines around them), base64-encoded PEM
+    keys, token prefixes, JWTs, URL credentials, then values after credential names (last, so a
     value with a known prefix keeps its own kind).
     """
     if not isinstance(text, str):
         raise TypeError("redact_text takes a str")
     text = _redact_private_keys(text)
+    text = _replace_spans(text, _b64_pem_spans(text))
     for kind, pattern in _TOKEN_PATTERNS:
         text = pattern.sub(REDACTED.format(kind=kind), text)
     text = _JWT_CANDIDATE.sub(lambda m: REDACTED.format(kind="jwt") if _is_jwt(m) else m.group(), text)

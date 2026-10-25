@@ -1189,3 +1189,153 @@ def test_ascii_control_chars_inside_name(forge):
 
 def test_confusables_table_has_no_ascii():
     assert all(not k.isascii() and len(v) == 1 and v in "untrsedp" for k, v in r._CONFUSABLES.items())
+
+
+# Ruling R-KEYBLOCK: an unterminated key block hides at most 100 lines, and key
+# data that lost its header is still redacted. Also SSH2 headers and
+# base64-encoded PEM keys.
+
+
+def test_unterminated_key_redacts_at_most_100_lines():
+    code = [f"line_{i} = compute({i})" for i in range(150)]
+    text = "x = 1\n-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(code) + "\n"
+    out = r.redact_text(text).split("\n")
+    assert out[:2] == ["x = 1", "-----BEGIN RSA PRIVATE KEY-----"]
+    limit = r.PK_UNTERMINATED_MAX_LINES
+    assert limit == 100
+    assert out[2 : 2 + limit] == ["[REDACTED:text-in-private-key-block]"] * limit
+    assert out[2 + limit : -1] == code[limit:]
+    assert len(out) == len(text.split("\n"))
+    assert r.unterminated_private_keys(text) == [2]
+
+
+def test_terminated_key_is_not_unterminated():
+    assert r.unterminated_private_keys(f"a\n{PRIVATE_KEY}\n") == []
+    assert r.unterminated_private_keys("no key here\n") == []
+
+
+def test_key_after_unterminated_block_is_still_redacted():
+    filler = [f"f{i} = {i}" for i in range(120)]
+    text = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(filler) + f"\n{PRIVATE_KEY}\n"
+    out = r.redact_text(text)
+    assert_key_gone(out, KEY_BODY)
+    assert "f119 = 119" in out
+    assert r.unterminated_private_keys(text) == [1]
+
+
+def test_end_without_begin_redacts_the_body_before_it():
+    # The PR deleted only the BEGIN line.
+    body = pem_body(300, 64, seed=21)
+    text = "a = 1\n" + "\n".join(body) + "\n-----END RSA PRIVATE KEY-----\nb = 2\n"
+    out = r.redact_text(text)
+    assert_key_gone(out, body)
+    lines = out.split("\n")
+    assert lines[0] == "a = 1" and lines[-2] == "b = 2"
+    assert lines[1 : 1 + len(body)] == ["[REDACTED:private-key]"] * len(body)
+    assert out.count("\n") == text.count("\n")
+    assert any(k == "private-key" for k, _, _ in r.find_credentials(text))
+
+
+def test_end_without_begin_short_body_in_code():
+    body = pem_body(24, 16, seed=22)  # 2 lines: below the key-body run rule
+    text = 'KEY = (\n' + "".join(f'    "{b}\\n"\n' for b in body) + '    "-----END PRIVATE KEY-----"\n)\n'
+    out = r.redact_text(text)
+    assert_key_gone(out, body)
+    assert out.split("\n")[0] == "KEY = ("
+
+
+def test_patch_deleted_begin_line_keeps_body_redacted():
+    body = pem_body(96, 16, seed=23)
+    base = key_blob(body)
+    head = base.replace("-----BEGIN PRIVATE KEY-----\n", "")
+    for n in (0, 3):
+        inner = render_patch_file(base, head, n)
+        assert_key_gone(inner, body)
+        assert_patch_matches_model_text(inner, base, head)
+    assert_key_gone(r.model_text(head), body)
+
+
+@pytest.mark.parametrize("width", [64, 70, 76])
+def test_key_body_run_without_headers_is_redacted(width):
+    body = pem_body(width * 3 + 10, width, seed=24)  # 4 full lines and a short one
+    assert len(body) >= 4 and len(body[-1]) < width
+    text = "x = 1\n" + "\n".join(body) + "\ny = 2\n"
+    out = r.redact_text(text)
+    assert_key_gone(out, body)
+    assert out.split("\n")[1 : 1 + len(body)] == ["[REDACTED:key-body]"] * len(body)
+    assert out.count("\n") == text.count("\n")
+    assert ("key-body", 6, 6 + width) in r.find_credentials(text)
+
+
+def test_key_body_run_in_quotes_keeps_indent():
+    body = pem_body(64 * 3, 64, seed=25)[:3]
+    text = "K = (\n" + "".join(f'  "{b}"\n' for b in body) + ")\n"
+    assert r.redact_text(text).split("\n")[1:4] == ["  [REDACTED:key-body]"] * 3
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        pem_body(64 * 2, 64, seed=26)[:2],  # only 2 full lines
+        pem_body(60 * 4, 60, seed=27),  # width not a key width
+        [pem_body(64, 64, seed=28)[0], pem_body(76, 76, seed=29)[0], pem_body(64, 64, seed=30)[0]],  # mixed
+    ],
+)
+def test_key_body_run_negatives(lines):
+    text = "\n".join(lines) + "\n"
+    assert r.redact_text(text) == text
+
+
+def test_key_body_run_under_public_pem_header_is_kept():
+    body = pem_body(64 * 4, 64, seed=31)
+    text = "-----BEGIN CERTIFICATE-----\n" + "\n".join(body) + "\n-----END CERTIFICATE-----\n"
+    assert r.redact_text(text) == text
+
+
+def test_ssh2_private_key_is_redacted():
+    body = pem_body(70 * 3, 70, seed=32)
+    text = (
+        "---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----\n"
+        'Comment: "rsa-key-20261025"\n' + "\n".join(body) + "\n---- END SSH2 ENCRYPTED PRIVATE KEY ----\nz = 1\n"
+    )
+    out = r.redact_text(text)
+    assert_key_gone(out, body)
+    lines = out.split("\n")
+    assert lines[0] == "---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----"
+    assert lines[1 : 2 + len(body)] == ["[REDACTED:private-key]"] * (1 + len(body))
+    assert lines[-3:] == ["---- END SSH2 ENCRYPTED PRIVATE KEY ----", "z = 1", ""]
+    assert r.unterminated_private_keys(text) == []
+    assert ("private-key", 0, len(lines[0])) in r.find_credentials(text)
+
+
+def test_ssh2_public_key_header_is_not_a_private_key():
+    text = "---- BEGIN SSH2 PUBLIC KEY ----\nAAAAB3NzaC1yc2E\n---- END SSH2 PUBLIC KEY ----\n"
+    assert r.redact_text(text) == text
+    assert r.find_credentials(text) == []
+
+
+@pytest.mark.parametrize("prefix", [b"", b"x", b"xy", b"xyz"])
+def test_base64_encoded_pem_key_is_redacted(prefix):
+    pem = (PRIVATE_KEY + "\n").encode()
+    token = base64.b64encode(prefix + pem).decode()
+    text = f"data:\n  tls.key: {token}\n  other: 1\n"
+    out = r.redact_text(text)
+    assert token not in out and KEY_BODY[0][:20] not in out
+    assert "  tls.key: [REDACTED:private-key-base64]" in out
+    assert "  other: 1" in out
+    assert ("private-key-base64", text.index(token), text.index(token) + len(token)) in r.find_credentials(text)
+
+
+def test_base64_encoded_wrapped_pem_key_is_redacted():
+    token = base64.b64encode((PRIVATE_KEY + "\n").encode()).decode()
+    wrapped = [token[i : i + 76] for i in range(0, len(token), 76)]
+    text = "\n".join(wrapped) + "\n"
+    out = r.redact_text(text)
+    for line in wrapped:
+        assert line not in out
+
+
+def test_base64_encoded_public_pem_is_kept():
+    token = base64.b64encode(b"-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE\n-----END PUBLIC KEY-----\n").decode()
+    text = f"pub: {token}\n"
+    assert r.redact_text(text) == text
