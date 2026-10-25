@@ -8,7 +8,7 @@ Last updated: 2026-10-25
 
 Every pull request in every active OperationCode repo gets an automatic review from Claude. The review has three passes: general code review, security review, and a malicious-contribution (supply chain) review.
 
-One org ruleset enforces the review. Its rule "Require workflows to pass before merging" requires the central review workflow, pinned to a commit SHA, on every supported repo. The rule binds to the workflow file, not to a check name. In tests, a same-name job from a PR's own workflow did not stand in for it; those tests used one scratch repo as both workflow source and target, and V8, V22 and V23 test the production setup. A repo admin cannot remove the rule. "Org-wide enforcement" says what each role can still do. A pilot first pins an advisory release, which reports the real result but never blocks; promotion moves the pin to an enforcing release (see "Advisory and enforcing").
+One org ruleset enforces the review. Its rule "Require workflows to pass before merging" requires the central review workflow, pinned to a commit SHA, on every supported repo. The rule binds to the workflow file, not to a check name. In tests, a same-name job from a PR's own workflow did not stand in for it; those tests used one scratch repo as both workflow source and target, and V8, V22 and V23 test the production setup. A repo admin cannot remove the rule. "Org-wide enforcement" says what each role can still do. A pilot first pins an advisory release, which reports the real result but never blocks on a policy result; promotion moves the pin to an enforcing release (see "Advisory and enforcing").
 
 The design treats the PR purely as data. Claude gets no checkout, no shell, no tools and no GitHub token. A script with no LLM collects the PR content through the GitHub API and sends it to the Claude Messages API in one call per pass. Claude can only return JSON. Code (again, no LLM) validates the JSON, checks every citation against the real diff, computes the gate result, and posts the comments. The gate is the result of the required workflow run: the run succeeds only when every job succeeds, and the gate job exits 0 only on a pass.
 
@@ -139,8 +139,8 @@ Facts about ruleset-required workflows ([troubleshooting rules](https://docs.git
  | permissions: contents:read,   |   | base-ref: merge base, head-ref: head SHA   |
  |   pull-requests:read,         |   | fail-on-severity: high                     |
  |   id-token:write              |   | permissions: contents:read                 |
- | stale check, then 3 Messages  |   +--------------------------------------------+
- | API calls, no tools:          |                      |
+ | stale check, then 3 Messages  |   | output: the step outcome                   |
+ | API calls, no tools:          |   +--------------------------------------------+
  |   review | security |         |                      |
  |   supply-chain                |                      |
  | output: exactly 3 pass        |                      |
@@ -154,6 +154,7 @@ Facts about ruleset-required workflows ([troubleshooting rules](https://docs.git
  |   permissions: pull-requests:write, issues:write, actions:read                     |
  |   NO Anthropic credential, NO id-token, NO LLM, NO Checks API writes               |
  |   - map every needs.<job>.result; anything but success -> fail                     |
+ |   - dependency-review step outcome (job output); anything but success -> fail      |
  |   - download artifacts by exact id, check digest and envelope                      |
  |   - validate findings schema and citations                                         |
  |   - re-validate the snapshot; stale -> fail, write nothing more                    |
@@ -237,7 +238,7 @@ The review covers one immutable comparison pair: the merge base commit and the h
 - **Re-validate.** Analyze checks the head SHA and base ref before the first Claude call. The publisher, before it computes the gate, reads the PR again and recomputes the merge base from the current base tip. The snapshot is current only when the head SHA, base repository, base ref and merge base all still match. Otherwise the run is `stale`.
 - A stale run never passes, never updates the sticky comment and never removes anything. Its gate job exits non-zero with reason `stale`.
 - **Base moves on the same branch.** The ruleset blocks force pushes to the base branch, except for org admins on the bypass list. It does not cover the head branch. Without a force push, a new merge base can only move forward along the head's history, which makes the diff smaller, never larger. The stored result stays conservative. An override bound to the old merge base no longer matches.
-- **Retarget.** The ruleset targets only the default branch, so a PR into another branch starts no required run. v1 has no review of non-default branches. A retarget to the default branch is an `edited` event, which starts no run. With no run on the head SHA, the merge blocks until a push or a reopen starts a review against the new base. If a run on the same head SHA already passed against the default branch (for example from another PR), that pass may count (V11 records it). The gate also fails with the not-waivable reason "base is not the default branch" when a run sees another base at publish time, which covers a retarget during a run. Content on another branch counts as unreviewed until a review against the default branch covers it.
+- **Retarget.** The ruleset targets only the default branch, so a PR into another branch starts no required run. v1 has no review of non-default branches. A retarget to the default branch is expected to be an `edited` event that starts no run; no source or test confirms this, and V11 (a) records it. If no run starts, the merge blocks until a push or a reopen starts a review against the new base. If the retarget starts a required run, that run reviews against the new base. Both cases are safe. If a run on the same head SHA already passed against the default branch (for example from another PR), that pass may count (V11 records it). The gate also fails with the not-waivable reason "base is not the default branch" when a run sees another base at publish time, which covers a retarget during a run. Content on another branch counts as unreviewed until a review against the default branch covers it.
 - GitHub's own PR view may use an older merge base and show a different file list. If the PR's `changed_files` differs from the reviewed comparison, the summary shows a signal. The review result still uses the fresh comparison, which matches what a merge adds to the base.
 
 ### Coverage limits
@@ -284,7 +285,7 @@ Claude cannot clear these, and an override cannot waive a hard block. A hard blo
 | Lines longer than 500 characters, or base64 or hex blobs longer than 200 characters, in changed lines | signal |
 | PR author has `author_association` of `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER` or `NONE` | signal (context only) |
 
-`actions/dependency-review-action` runs as a separate job with `fail-on-severity: high`. It covers known vulnerable versions. It does not prove that every new package was resolved or scanned, which is why the delta above has its own failure rules.
+`actions/dependency-review-action` runs as a separate job with `fail-on-severity: high`. In both releases the job exports the step `outcome` as a job output, and the gate checks it apart from the job result (see "Advisory and enforcing"). It covers known vulnerable versions. It does not prove that every new package was resolved or scanned, which is why the delta above has its own failure rules.
 
 ## Claude passes
 
@@ -404,13 +405,13 @@ The gate job (`oc-claude-review`, the publisher) computes one gate result for it
 | superseded: a newer run of the central workflow exists on the head SHA at the final check | no |
 | base ref is not the repo's default branch | no |
 | any prefilter hard block (includes incomplete coverage and incomplete dependency data) | no |
-| dependency-review job failed | no |
+| dependency-review job failed, or its exported step `outcome` is missing or not `success` (checked apart from the job result) | no |
 | size gate tripped (`skipped-size`): all content was collected and the prefilter ran, but Claude did not review it | yes |
 | any finding with category `security`, `supply-chain`, `malicious` or `prompt-injection` at severity `high` or `critical`, verified or not | yes |
 
 The gate is `pass` only when no reason applies, or every reason that applies is waivable and a valid override exists. Findings in category `bug` are advisory. They never block.
 
-Not-waivable reasons clear in one of two ways: code finds no cause on a later run (for example, the package is now older than 72 hours, or the API is back), or an admin uses the ruleset bypass, which GitHub logs. This keeps every code-raised block out of reach of a label or a comment, and it means no job needs `continue-on-error`.
+Not-waivable reasons clear in one of two ways: code finds no cause on a later run (for example, the package is now older than 72 hours, or the API is back), or an admin uses the ruleset bypass, which GitHub logs. This keeps every code-raised block out of reach of a label or a comment, and it means no job needs `continue-on-error` in the enforcing release.
 
 ### Override
 
@@ -467,7 +468,7 @@ The gate record is a run of the central workflow on the PR head SHA. GitHub crea
 
 - **Exact residual.** Invalidating an override (revoke, or the grant author's role removal) takes effect only when a newer run on that head exists. If nobody starts one, it never takes effect. The same holds for an H to B to H return pushed with a `GITHUB_TOKEN`, a branch restore that starts no run, and a deleted newer run if V6 (f) shows the older pass decides. Between a reopen and the creation of its run, the old pass can also count (V6 a records the gap). This is a reduction of the gate guarantee. The owner accepts it in writing before the enforcing release is enabled (rollout step 6). Strict invalidation needs another gate design: a completed run cannot react to an event that starts no run.
 - The ruleset blocks force pushes on the base branch only, not on the head branch, so H to B to H is possible.
-- In each case the code that can merge is code that an earlier run passed. Human approval is a separate control. The push of B dismissed every earlier approval ("dismiss stale approvals on push"), so a merge needs a fresh approval. Role removal on an unchanged head is not a push and dismisses nothing. A new approval does not re-check the old override.
+- In each case the code that can merge is code that an earlier run passed under an enforcing release. An advisory `success` is not a pass; V22 (c) tests that it cannot satisfy the enforcing pin, also after a newer enforcing run is deleted. Human approval is a separate control. The push of B dismissed every earlier approval ("dismiss stale approvals on push"), so a merge needs a fresh approval. Role removal on an unchanged head is not a push and dismisses nothing. A new approval does not re-check the old override.
 - A second PR to the default branch with head H can see a run from the first PR (V6 g). An override covers the code pair (head and merge base), not one PR.
 - For an immediate stop, a maintainer closes the PR. Reopen then starts a new run; it is not an atomic swap of the old result.
 
@@ -482,11 +483,13 @@ The mode is fixed in the pinned central code, never in a variable. A repo variab
    mode constant: advisory                          mode constant: enforcing
    gate job: writes the real result, exits 0        gate job: exits 0 only on pass
    dependency-review step: continue-on-error        dependency-review step: fails the job
+   step outcome exported, shown in summary          step outcome exported, gate fails on it
    summary: "Advisory: does not block"              summary: "The merge box result counts"
 ```
 
 - **Advisory release.** Used only for the pilot. The gate job computes the full gate result and writes it, with every reason, to the summary, then exits 0. The dependency-review step sets `continue-on-error: true` and its job exports the step `outcome`, so the summary shows a vulnerable dependency without failing the run. A failed collect or analyze job (an infrastructure error) still fails the run; the ruleset bypass covers it. During the pilot the review does not enforce anything on the pilot repo: this is an intended absence of enforcement, chosen by an org owner through the pin, not an exception a repo writer can make. Human approval still applies.
-- **Enforcing release.** Every release after the pilot. All gate rules in this spec apply. An override waives false positives, and the ruleset bypass covers outages.
+- **Enforcing release.** Every release after the pilot. All gate rules in this spec apply. An override waives false positives, and the ruleset bypass covers outages. The dependency-review step has no `continue-on-error`. The gate does not rely on that alone: the job exports the step `outcome` here too, and the gate fails, not waivable, when it is missing or not `success`, even if `needs.dependency-review.result` is `success`. So a `continue-on-error` left on the step by a copy, revert or merge error still blocks. A unit test checks that the workflow file agrees with the mode constant (see "Testing").
+- **Mode check before a pin moves.** At promotion and at each later release, before the pin moves, an org owner confirms that the mode constant at the new SHA is `enforcing`. Both kinds of release are commits on main, so CODEOWNERS review is otherwise the only control on the mode. After promotion, `test.yml` on `.github` main also fails if the mode constant is not `enforcing`.
 - **Promotion** moves the pin from the advisory release SHA to an enforcing release SHA. An advisory `success` must not satisfy the enforcing pin. V22 (c) tests this before promotion. After the move, an org owner starts a fresh run on each open PR (close and reopen). If V22 (c) shows that an advisory success still satisfies the rule, the enforcing release uses a new workflow path, so no advisory run can match; the federation rule and the pin follow that path.
 - Only org owners can change the pin. A repo variable or a PR cannot change the mode.
 
@@ -560,8 +563,8 @@ condition (CEL):
 
 ## Testing
 
-- **Unit tests (CI on every PR to this repo, no API calls):** prefilter checks, coverage rules, lockfile parsing per supported version, citation check (head and base side, inline eligibility, empty quotes), gate reasons, override checks, envelope checks, sanitizer and escaping, redaction, nonce handling, "every prompt has `<grounding_rules>`", schema validation of good and bad fixtures.
-- **Gate matrix (unit):** every row of the reasons table on its own and in combination, plus: missing pass record, duplicate pass record, extra file, wrong `run_attempt`, digest mismatch, envelope for another PR, each `needs.<job>.result` value (`failure`, `cancelled`, `skipped`), stale head, override with a wrong SHA, edited override, override by the PR author, override by a user with `read`, override against a non-waivable reason, override older than the push epoch, unreadable timeline, several valid overrides, spoofed sticky marker from another author, base ref not the default branch, merge base changed, a newer run at the final check (`superseded`), a grant deleted before the final check, and the exit code for every gate result in each mode (enforcing: 0 only for `pass`; advisory: always 0, with the real result in the summary).
+- **Unit tests (CI on every PR to this repo, no API calls):** prefilter checks, coverage rules, lockfile parsing per supported version, citation check (head and base side, inline eligibility, empty quotes), gate reasons, override checks, envelope checks, sanitizer and escaping, redaction, nonce handling, "every prompt has `<grounding_rules>`", schema validation of good and bad fixtures, and a workflow file check: it parses the central workflow and fails unless `continue-on-error` on the dependency-review step agrees with the mode constant (absent in `enforcing`, present only in `advisory`) and the dependency-review job exports the step `outcome` in both modes.
+- **Gate matrix (unit):** every row of the reasons table on its own and in combination, plus: missing pass record, duplicate pass record, extra file, wrong `run_attempt`, digest mismatch, envelope for another PR, each `needs.<job>.result` value (`failure`, `cancelled`, `skipped`), stale head, override with a wrong SHA, edited override, override by the PR author, override by a user with `read`, override against a non-waivable reason, override older than the push epoch, unreadable timeline, several valid overrides, spoofed sticky marker from another author, base ref not the default branch, merge base changed, a newer run at the final check (`superseded`), a grant deleted before the final check, a dependency-review step `outcome` that is `failure` or missing while `needs.dependency-review.result` is `success` (enforcing: not-waivable fail), and the exit code for every gate result in each mode (enforcing: 0 only for `pass`; advisory: always 0, with the real result in the summary).
 - **Fixture evals (manual `eval.yml`, costs money):** bundles with expected outcomes. Run before each prompt or model change and record the results in the PR. Minimum set:
   - clean small refactor -> `pass`, no high findings
   - real bug (`if (user.role = "admin")`) -> verified `bug` finding
@@ -591,7 +594,7 @@ condition (CEL):
   - fork PR whose own workflow has a job named `oc-claude-review` that starts before the required run (V8)
   - fork PR that adds `.github/workflows/claude-review.yml` to the target repo (V23)
   - Dependabot PR
-  - PR to a non-default branch (no required run starts), then retargeted to the default branch: must stay blocked until a push or reopen (V11)
+  - PR to a non-default branch (no required run starts), then retargeted to the default branch: must stay blocked until a review against the default branch passes; record whether the retarget starts a run (V11)
   - repeated close and reopen at one head: the cost of each run is visible in the summary
   - PR that was open before the repo joined the ruleset
   - pin moved to a new release while PRs are open (V22)
@@ -603,12 +606,12 @@ condition (CEL):
 
 1. **Verify:** run the "build" items in "Verify before building" in the scratch repo. Run V6 (which run counts) first: if the rule does not use the newest run, building stops.
 2. **Admin setup** (Irving, needs org owner): see the checklist below.
-3. **Build** in this repo, with unit tests and the fixture eval passing. Make two releases that differ only in the mode: advisory, then enforcing (see "Advisory and enforcing").
+3. **Build** in this repo, with unit tests and the fixture eval passing. Make two releases that differ only in the mode constant and the settings that it selects: advisory, then enforcing (see "Advisory and enforcing").
 4. **Acceptance:** the workflow acceptance tests pass in the scratch repo.
 5. **Pilot, advisory:** the "blocking" items must pass first. Add the advisory SHA to the federation rule. An org owner sets the workflows rule to the advisory release SHA, sets the target list to `back-end` only, reads the ruleset back (see "The org ruleset"), and enables it. Then list open PRs and start a run on each (push, or close and reopen), because the rule does not start on PRs that were already open. For 2 weeks, watch the real results in the summaries: false positives and the overrides they would need. Measure the egress allowlist and cost per run.
-6. **Promote:** the owner accepts in writing the residuals in "Which run counts" (an earlier pass on the same SHA, and run deletion if V6 f did not pass). Add the enforcing SHA to the federation rule. An org owner moves the pin to the enforcing release SHA, reads the ruleset back, and starts a fresh run on each open PR. Check that each PR now shows the enforcing result. Then remove the advisory SHA from the federation rule.
+6. **Promote:** the owner accepts in writing the residuals in "Which run counts" (an earlier pass on the same SHA, and run deletion if V6 f did not pass). Add the enforcing SHA to the federation rule. An org owner confirms that the mode constant at that SHA is `enforcing`, moves the pin to it, reads the ruleset back, and starts a fresh run on each open PR. Check that each PR now shows the enforcing result. Then remove the advisory SHA from the federation rule.
 7. **Expand:** build the supported repo inventory (see "Supported repos"), and add CODEOWNERS to each supported repo. Add repos to the target list in small groups, under the enforcing release. After each group, start a run on each open PR, and check that each shows the required workflow passing or failing on its own result.
-8. **Each release:** add the new SHA to the federation rule, then an org owner moves the ruleset pin to it and reads the ruleset back, then remove the previous SHA from the federation rule once open PRs have new runs (V22).
+8. **Each release:** add the new SHA to the federation rule, then an org owner confirms that the mode constant at the new SHA is `enforcing`, moves the ruleset pin to it and reads the ruleset back, then remove the previous SHA from the federation rule once open PRs have new runs (V22).
 
 ## Admin checklist (Irving)
 
@@ -621,7 +624,7 @@ condition (CEL):
 - [ ] Enable Dependabot alerts with npm malware detection on active repos ([changelog](https://github.blog/changelog/2026-03-17-dependabot-now-detects-malware-in-npm-dependencies/)).
 - [ ] Add CODEOWNERS in each active repo for `.github/`, `package.json`, lockfiles, `pyproject.toml`, `Dockerfile`.
 - [ ] Keep the supported repo inventory current (see "Supported repos").
-- [ ] Org ruleset: created disabled, with the rules in "The org ruleset". At rollout, set the pin (advisory release first) and the target list, read the workflow entry back (`repository_id`, path, `sha`, no `ref`), enable it, and start runs on open PRs (rollout steps 5 to 7).
+- [ ] Org ruleset: created disabled, with the rules in "The org ruleset". At rollout, set the pin (advisory release first) and the target list, read the workflow entry back (`repository_id`, path, `sha`, no `ref`), confirm the mode constant at that SHA (advisory for the pilot, `enforcing` at promotion and after), enable it, and start runs on open PRs (rollout steps 5 to 7).
 - [ ] Before promotion: record the owner's acceptance of the residuals in "Which run counts". Repo writers and admins can cancel, re-run and delete runs; no setting in this design limits that.
 
 ## Verify before building
@@ -646,7 +649,7 @@ These are assumptions I could not confirm from docs. Each has a concrete test. I
 8. **Forging (blocking).** Answered in part: a rule bound to a check name was satisfied by a fake job from a fork PR's own workflow; the workflows rule ignored the same fake job when it passed or failed, when it finished after the required run, and when it finished 179 seconds before it (T6, T7). The fake always started after the required run, the forks belonged to org admins, and the scratch repo was both workflow source and target. Use a source repo separate from the target. Still to test with an account that is not an org member, and with an org member without write access: (a) a fork PR whose own workflow has a same-name job that starts before the required run; pass when the box follows only the required run; (b) the real `pull_request_target` review starts with no approval click; if it waits, the goal "no maintainer step" fails for outside contributors and the owner decides.
 9. **Spend limit behavior (build).** The limit error is documented ([rate limits](https://platform.claude.com/docs/en/api/rate-limits)). Overshoot past the limit and billing of cancelled calls are not. Test: a test workspace with a very small limit. Record the overshoot and that the gate fails closed.
 10. **Egress allowlist (build).** Test: harden-runner in audit mode for a full run, including artifacts, OIDC and `uv sync`. Then block mode with the measured list. Pass when a full run succeeds.
-11. **Retarget (blocking).** The ruleset targets only the default branch, so a PR into another branch should start no required run. Test (a): open a PR to a staging branch that already holds a change not on the default branch; confirm that no required run starts; retarget to the default branch. Pass when the merge stays blocked until a push or reopen, and the new review shows the staging change in its diff. (b): the same, but the head SHA already has a passing required run from a PR to the default branch; record whether that pass counts after the retarget.
+11. **Retarget (blocking).** The ruleset targets only the default branch, so a PR into another branch should start no required run. Test (a): open a PR to a staging branch that already holds a change not on the default branch; confirm that no required run starts; retarget to the default branch, and record whether the retarget starts a required run. Pass when the merge stays blocked until a review against the default branch passes (from a run that the retarget starts, or from a push or reopen), and that review shows the staging change in its diff. (b): the same, but the head SHA already has a passing required run from a PR to the default branch; record whether that pass counts after the retarget.
 12. **Repo-level Actions settings (blocking).** Test: in the scratch repo, disable Actions or restrict allowed actions. Pass when merges block rather than skip the rule.
 13. **Dependency review on fork PRs (build).** Test: `actions/dependency-review-action` on a `pull_request_target` fork PR with no checkout, with `base-ref` and `head-ref` set to the merge base and head SHAs, and a known vulnerable version. Pass when the job fails.
 14. **Moot: which same-name check the merge box uses.** The gate no longer uses a check name. For a name-bound rule, the newest check suite decided (T2 to T4).
@@ -657,7 +660,7 @@ These are assumptions I could not confirm from docs. Each has a concrete test. I
 19. **Moot: called-workflow job check.** v1 has no caller. A required workflow can call a reusable workflow and pass it the PR number, and the call's result gated the merge (T6). v1 does not need this.
 20. **Merged into V6.** On a new head SHA, the box blocked while the required run was pending (T7).
 21. **Merged into V6.**
-22. **Pin after `.github` main moves (blocking).** The rule accepted a SHA pin, and the run used it (T6), but the pin was still the head of main, and the scratch repo was both source and target. Use a source repo separate from the target. Before each step, read the ruleset back and check `repository_id`, path and `sha`, with no `ref`. (a) Pin S1, push a changed workflow to the source main, open a PR in the target; pass when the run uses S1 (`job.workflow_sha`). (b) Move the pin to a new SHA; record whether runs from the old pin still satisfy the rule on open PRs. (c) Promotion: pin the advisory release; a PR whose real result is `fail` gets an advisory `success`; move the pin to the enforcing release. Pass when the box blocks on that PR until a new enforcing run decides, and stays blocked after it fails. If it does not pass, the enforcing release uses a new path (see "Advisory and enforcing").
+22. **Pin after `.github` main moves (blocking).** The rule accepted a SHA pin, and the run used it (T6), but the pin was still the head of main, and the scratch repo was both source and target. Use a source repo separate from the target. Before each step, read the ruleset back and check `repository_id`, path and `sha`, with no `ref`. (a) Pin S1, push a changed workflow to the source main, open a PR in the target; pass when the run uses S1 (`job.workflow_sha`). (b) Move the pin to a new SHA; record whether runs from the old pin still satisfy the rule on open PRs. (c) Promotion: pin the advisory release; a PR whose real result is `fail` gets an advisory `success`; move the pin to the enforcing release. Pass when the box blocks on that PR until a new enforcing run decides, and stays blocked after it fails. Then, as a repo writer, delete that failed enforcing run; pass when the box stays blocked and the advisory `success` does not count. If it does not pass, the enforcing release uses a new path (see "Advisory and enforcing").
 23. **Same-path workflow in the target repo (blocking).** T6 was inconclusive: the PR's copy never ran, and the scratch repo was both source and target. Use a source repo separate from the target. Test: a fork PR adds `.github/workflows/claude-review.yml` to the target repo with a passing job `oc-claude-review`, while the central run fails. Pass when the box blocks.
 24. **Run list for the final check (build).** Test: the gate job's `GITHUB_TOKEN` with `actions: read` lists runs by head SHA on fork and same-repo PRs, including ruleset-started runs, with their `path`. Record the delay between a run's creation and its first appearance in the list. The final check is defense in depth, so a delay does not stop the build.
 
@@ -708,3 +711,8 @@ T3: decisions on review J2 of the T2 revision, 2026-10-25. Where a T3- line chan
 - T3-4. Advisory pilot (Important 4): **accept, advisory restored with pinned code**. The pilot pins an advisory release whose gate job writes the real result and always exits 0; promotion moves the pin to an enforcing release. No variable selects the mode. V22 (c) tests that an advisory success does not satisfy the enforcing pin, with a new workflow path as the fallback; open PRs get fresh runs after promotion. Ruleset Evaluate mode is Enterprise only and not available on Team.
 - T3-5. Test claims (Minor 5): **accept**. Forgery claims now say the tests used one scratch repo as source and target. V8, V22 and V23 use a separate source repo. Before each activation and pin move, an org owner reads the ruleset back and checks `repository_id`, path and `sha`, with no `ref`. Untested: pin persistence, pin-change result selection, same-path collision and a fake that starts first.
 - T3-6. Current and historical text (Minor 6): **accept**. Approval claims name the org admin bypass. A PR into a non-default branch gets no required run; V11 tests a retarget with and without an earlier same-SHA pass. Superseded decision lines move to git history.
+
+T4: decisions on review J2F1 of the T3 revision, 2026-10-25. Where a T4- line changes a T3- line, the T4- line wins.
+
+- T4-1. Dependency-review block in the enforcing release (review J2F1 N1): **accept**. The dependency-review job exports the step `outcome` in both releases. The enforcing gate fails, not waivable, when it is missing or not `success`, apart from `needs.dependency-review.result`, so a stray `continue-on-error` cannot pass a vulnerable dependency. A unit test checks that `continue-on-error` agrees with the mode constant. Changes T3-4 only in this respect.
+- T4-2. Mode of a pinned release (review J2F1 N4): **accept**. Before the pin moves at promotion and at each release, an org owner confirms that the mode constant at the new SHA is `enforcing`. After promotion, `test.yml` on `.github` main fails if the mode is not `enforcing`.
