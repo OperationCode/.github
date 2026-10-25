@@ -25,6 +25,7 @@ import json
 import re
 import tomllib
 import unicodedata
+from array import array
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -46,6 +47,9 @@ MAX_LINES_PER_CHECK = 20
 FRESH_PUBLISH_WINDOW = timedelta(hours=72)
 LONG_LINE_CHARS = 500
 BLOB_RUN_CHARS = 200
+# Steps the line diff may take for one file. Past it, every head line between
+# the common prefix and suffix counts as changed.
+DIFF_WORK_BUDGET = 2_000_000
 
 Level = Literal["hard_block", "signal"]
 CoverageKind = Literal["full", "binary", "unavailable"]
@@ -262,17 +266,15 @@ class DependencyFacts:
     - `changes`: deps.compute_delta for every parsed changed file.
     - `new_global_sources`: file-wide sources (pip index URLs) at the head that
       are not at the merge base.
-    - `registry`: lookup results by (ecosystem, name, version) for every change
-      where `needs_registry_lookup` is true.
-    - `has_wheel`: PyPI (name, version) -> whether the version has a wheel.
-      deps.lookup_pypi does not report it yet; a missing key gives no signal.
+    - `registry`: the deps.lookup_npm / deps.lookup_pypi result, keyed by
+      `registry_key(change)`, for every change that has a key. The prefilter
+      reads the publish time, npm install scripts and PyPI `has_wheel` from it.
     """
 
     parsed_paths: frozenset[str] = frozenset()
     changes: Sequence[deps.PackageChange] = ()
     new_global_sources: Sequence[deps.SourceIssue] = ()
     registry: Mapping[tuple[str, str, str], deps.RegistryInfo] = field(default_factory=dict)
-    has_wheel: Mapping[tuple[str, str], bool] = field(default_factory=dict)
     failures: Sequence[DepFailure] = ()
 
 
@@ -314,17 +316,20 @@ def scan_blob(data: bytes | None, *, sha: str | None = None, cap: int = MAX_BLOB
     """Classify one blob as `full` text, `binary` or `unavailable`.
 
     Text is strict UTF-8 (a leading UTF-8 BOM is kept as U+FEFF). NUL bytes are
-    allowed in text, so a NUL cannot hide a valid UTF-8 file from the scan.
+    allowed in text, so a NUL cannot hide a valid UTF-8 file from the scan. A
+    blob over the cap is `unavailable` whatever its bytes: the spec allows no
+    binary exception, and a NUL must not turn an over-cap text file into a
+    signal.
     """
     if data is None:
         return BlobScan("unavailable", reason="unreadable")
     if sha is not None and git_blob_sha(data, len(sha)) != sha.lower():
         return BlobScan("unavailable", reason="sha-mismatch")
+    if len(data) > cap:
+        return BlobScan("unavailable", reason="over-cap")
     if data.startswith(_BOMS_UNSUPPORTED):
         return BlobScan("unavailable", reason="utf16-or-utf32")
     has_nul = b"\0" in data[:BINARY_SNIFF_BYTES]
-    if len(data) > cap:
-        return BlobScan("binary") if has_nul else BlobScan("unavailable", reason="over-cap")
     try:
         text = data.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
@@ -336,6 +341,9 @@ def scan_blob(data: bytes | None, *, sha: str | None = None, cap: int = MAX_BLOB
     if codec is not None and codec not in _UTF8_CODECS:
         return BlobScan("unavailable", reason="declared-encoding")
     return BlobScan("full", text=text)
+
+
+_GITLINK = BlobScan("binary")
 
 
 def _file_coverage(change: ChangedFile, base: BlobScan | None, head: BlobScan | None) -> FileCoverage:
@@ -372,16 +380,88 @@ class _Lines:
         return bisect.bisect_right(self.starts, offset)
 
 
-def _added_lines(head: _Lines, base: _Lines | None) -> list[int]:
-    """1-based head line numbers whose text is not a line of the base.
+def _added_lines(head: _Lines, base: _Lines | None, budget: int = DIFF_WORK_BUDGET) -> list[int]:
+    """1-based head line numbers that a line diff of base to head adds.
 
-    Linear and safe on hostile input. It never misses new text; it can miss a
-    second copy of a line the base already has, which adds no new content.
+    The common prefix and suffix are trimmed, then a Myers diff runs on the
+    middle. Each base line matches at most one head line, in order, so a
+    duplicate or a moved line counts as added. When the diff needs more than
+    `budget` steps, every head line in the middle counts as added: more lines
+    than git shows, never fewer.
     """
     if base is None:
         return list(range(1, len(head.lines) + 1))
-    seen = set(base.lines)
-    return [i for i, line in enumerate(head.lines, 1) if line not in seen]
+    ids: dict[str, int] = {}
+    a = [ids.setdefault(line, len(ids)) for line in base.lines]
+    b = [ids.setdefault(line, len(ids)) for line in head.lines]
+    pre = 0
+    while pre < len(a) and pre < len(b) and a[pre] == b[pre]:
+        pre += 1
+    suf = 0
+    while suf < len(a) - pre and suf < len(b) - pre and a[-1 - suf] == b[-1 - suf]:
+        suf += 1
+    a, b = a[pre : len(a) - suf], b[pre : len(b) - suf]
+    middle = _myers_inserts(a, b, budget)
+    if middle is None:
+        middle = list(range(len(b)))
+    return [pre + j + 1 for j in middle]
+
+
+def _myers_inserts(a: Sequence[int], b: Sequence[int], budget: int) -> list[int] | None:
+    """0-based indexes of `b` that a shortest edit script from `a` inserts.
+
+    Myers' O((N+M)D) greedy algorithm. `trace[d][i]` is the furthest x on
+    diagonal k = 2i - d after d edits. None when the work passes `budget`.
+    """
+    n, m = len(a), len(b)
+    if not n or not m:
+        return list(range(m))
+    trace: list[array] = []
+    prev = array("q")
+    work = 0
+    for d in range(n + m + 1):
+        cur = array("q", bytes(8 * (d + 1)))
+        for i in range(d + 1):
+            k = 2 * i - d
+            if d == 0:
+                x = 0
+            elif i == 0 or (i != d and prev[i - 1] < prev[i]):
+                x = prev[i]  # down from diagonal k+1: insert b[y-1]
+            else:
+                x = prev[i - 1] + 1  # right from diagonal k-1: delete a[x-1]
+            y = x - k
+            start = x
+            while x < n and y < m and a[x] == b[y]:
+                x += 1
+                y += 1
+            work += 1 + x - start
+            cur[i] = x
+            if x >= n and y >= m:
+                trace.append(cur)
+                return _myers_backtrack(trace, n, m)
+            if work > budget:
+                return None
+        trace.append(cur)
+        prev = cur
+    raise AssertionError("unreachable: a diff has at most n + m edits")
+
+
+def _myers_backtrack(trace: Sequence[array], n: int, m: int) -> list[int]:
+    inserts = []
+    x, y = n, m
+    for d in range(len(trace) - 1, 0, -1):
+        prev = trace[d - 1]
+        k = x - y
+        i = (k + d) // 2
+        if i == 0 or (i != d and prev[i - 1] < prev[i]):
+            x = prev[i]
+            y = x - (k + 1)
+            inserts.append(y)
+        else:
+            x = prev[i - 1]
+            y = x - (k - 1)
+    inserts.reverse()
+    return inserts
 
 
 def normalize_for_match(text: str) -> str:
@@ -393,40 +473,39 @@ def normalize_for_match(text: str) -> str:
     return _SEPARATORS_RE.sub(" ", text)
 
 
-def _ai_hits(lines: Sequence[tuple[int, str]]) -> dict[str, list[int]]:
-    """Run the AI-directed patterns over runs of consecutive lines.
+def _ai_hits(lines: Sequence[str], changed: Iterable[int] | None = None) -> dict[str, list[int]]:
+    """Run the AI-directed patterns over all `lines`, joined.
 
-    Lines are joined, so a phrase split over lines or comment markers still
-    matches. Returns pattern name -> line numbers of each match start.
+    Joining lets a phrase split over lines or comment markers match, and lets
+    a changed line that completes a phrase with unchanged neighbors match.
+    `changed` holds 1-based line numbers; a match counts only when it spans
+    one, and is reported at the first changed line it spans. With no
+    `changed`, every line counts. Returns pattern name -> line numbers.
     """
+    flags = [changed is None] * len(lines)
+    for n in changed or ():
+        flags[n - 1] = True
+    first_changed_at_or_after = [len(lines)] * (len(lines) + 1)
+    for i in range(len(lines) - 1, -1, -1):
+        first_changed_at_or_after[i] = i if flags[i] else first_changed_at_or_after[i + 1]
+
+    starts: list[int] = []
+    parts: list[str] = []
+    pos = 0
+    for raw in lines:
+        norm = normalize_for_match(_COMMENT_LEADER_RE.sub("", raw)).strip()
+        starts.append(pos)
+        parts.append(norm)
+        pos += len(norm) + 1
+    joined = " ".join(parts)
     hits: dict[str, list[int]] = {}
-    run: list[tuple[int, str]] = []
-
-    def flush() -> None:
-        if not run:
-            return
-        starts: list[int] = []
-        parts: list[str] = []
-        pos = 0
-        for _, raw in run:
-            norm = normalize_for_match(_COMMENT_LEADER_RE.sub("", raw)).strip()
-            starts.append(pos)
-            parts.append(norm)
-            pos += len(norm) + 1
-        joined = " ".join(parts)
-        for name, pattern in _AI_PATTERNS:
-            for m in pattern.finditer(joined):
-                idx = bisect.bisect_right(starts, m.start()) - 1
-                hits.setdefault(name, []).append(run[idx][0])
-        run.clear()
-
-    prev = None
-    for number, raw in lines:
-        if prev is not None and number != prev + 1:
-            flush()
-        run.append((number, raw))
-        prev = number
-    flush()
+    for name, pattern in _AI_PATTERNS:
+        for m in pattern.finditer(joined):
+            first = bisect.bisect_right(starts, m.start()) - 1
+            last = bisect.bisect_right(starts, max(m.end() - 1, m.start())) - 1
+            hit = first_changed_at_or_after[first]
+            if hit <= last:
+                hits.setdefault(name, []).append(hit + 1)
     return hits
 
 
@@ -523,23 +602,12 @@ def _check_text(out: _Results, path: str, head: _Lines, added: list[int]) -> Non
         out.lines_check(CREDENTIAL, SIGNAL, f"{kind} (value redacted)", path, lines)
 
     # Text that addresses an AI or reviewer, in changed lines.
-    for name, lines in sorted(_ai_hits([(n, head.lines[n - 1]) for n in added]).items()):
+    for name, lines in sorted(_ai_hits(head.lines, added).items()):
         out.lines_check(AI_DIRECTED_TEXT, SIGNAL, f"pattern {name}", path, lines)
 
     # Long lines and encoded blobs in changed lines.
     long_lines: list[int] = []
     blobs: dict[str, list[int]] = {}
-    wrapped_run: list[int] = []
-    wrapped_chars = 0
-
-    def end_wrapped() -> None:
-        nonlocal wrapped_chars
-        if wrapped_chars > BLOB_RUN_CHARS and len(wrapped_run) > 1:
-            blobs.setdefault("base64 (wrapped)", []).append(wrapped_run[0])
-        wrapped_run.clear()
-        wrapped_chars = 0
-
-    prev = None
     for n in added:
         line = head.lines[n - 1].rstrip("\r")
         if len(line) > LONG_LINE_CHARS:
@@ -551,16 +619,30 @@ def _check_text(out: _Results, path: str, head: _Lines, added: list[int]) -> Non
             for m in _ESCAPED_RUN_RE.finditer(line):
                 if len(m.group()) > BLOB_RUN_CHARS:
                     blobs.setdefault("escaped hex", []).append(n)
+
+    # Base64 wrapped over consecutive lines. The run is measured over all head
+    # lines, so changing one line inside a long blob still counts; it is
+    # reported at the first changed line in the run.
+    wrapped_run: list[int] = []
+    wrapped_chars = 0
+
+    def end_wrapped() -> None:
+        nonlocal wrapped_chars
+        if wrapped_chars > BLOB_RUN_CHARS and len(wrapped_run) > 1:
+            changed_in_run = [n for n in wrapped_run if n in added_set]
+            if changed_in_run:
+                blobs.setdefault("base64 (wrapped)", []).append(changed_in_run[0])
+        wrapped_run.clear()
+        wrapped_chars = 0
+
+    for n, raw in enumerate(head.lines, 1):
+        line = raw.rstrip("\r")
         w = _WRAPPED_B64_LINE_RE.match(line) if len(line) >= 40 else None
-        if w and prev is not None and n == prev + 1 and wrapped_run:
+        if w:
             wrapped_run.append(n)
             wrapped_chars += len(w.group(1))
         else:
             end_wrapped()
-            if w:
-                wrapped_run.append(n)
-                wrapped_chars = len(w.group(1))
-        prev = n
     end_wrapped()
     out.lines_check(LONG_LINE, SIGNAL, f"lines longer than {LONG_LINE_CHARS} characters", path, long_lines)
     for kind, lines in sorted(blobs.items()):
@@ -649,7 +731,7 @@ def _check_file(out: _Results, change: ChangedFile, base: BlobScan | None, head:
         bidi = _BIDI_RE.findall(p)
         if bidi:
             out.add(BIDI_PATH, HARD_BLOCK, f"bidi control characters {_codepoints(bidi)} in path", file=p)
-    path_hits = _ai_hits([(1, p) for p in paths])
+    path_hits = {name for p in paths for name in _ai_hits([p])}
     for name in sorted(path_hits):
         out.add(AI_DIRECTED_TEXT, SIGNAL, f"pattern {name} in path", file=path)
 
@@ -659,15 +741,26 @@ def _check_file(out: _Results, change: ChangedFile, base: BlobScan | None, head:
     if any(deps.is_unsupported_dep_file(p) or p.rsplit("/", 1)[-1].lower() in _EXTRA_UNSUPPORTED_DEP_FILES for p in paths):
         out.add(UNSUPPORTED_DEP_FILE, SIGNAL, "dependency file of an unsupported ecosystem changed", file=path)
 
-    if change.is_submodule:
-        out.add(
-            SUBMODULE, SIGNAL, "submodule commit changed", file=path,
-            subject=f"{change.base_sha or '(none)'} -> {change.head_sha or '(none)'}",
-        )
-        return
+    # Each side is a gitlink or a blob by its own mode. A blob side is checked
+    # like any file, even when the other side is a gitlink.
+    base_link = change.base_mode == MODE_SUBMODULE
+    head_link = change.head_mode == MODE_SUBMODULE
+    if base_link or head_link:
+        if base_link and head_link:
+            detail = "submodule commit changed"
+        elif head_link:
+            detail = "submodule added" if change.base_sha is None else "file replaced by a submodule"
+        else:
+            detail = "submodule removed" if change.head_sha is None else "submodule replaced by a file"
+        old = change.base_sha if base_link else ("(file)" if change.base_sha else "(none)")
+        new = change.head_sha if head_link else ("(file)" if change.head_sha else "(none)")
+        out.add(SUBMODULE, SIGNAL, detail, file=path, subject=f"{old} -> {new}")
     if change.became_executable:
         out.add(EXECUTABLE, SIGNAL, f"mode {change.base_mode or '(new)'} -> {change.head_mode}", file=path)
-    if head is not None and head.kind == "binary" and (base is None or base.kind != "binary"):
+    if (
+        head is not None and head.kind == "binary" and not head_link
+        and (base is None or base_link or base.kind != "binary")
+    ):
         out.add(BINARY_ADDED, SIGNAL, "binary file added" if base is None else "file became binary", file=path)
 
     head_text = head.text if head is not None and head.kind == "full" else None
@@ -708,6 +801,10 @@ def _check_file(out: _Results, change: ChangedFile, base: BlobScan | None, head:
 _OFFICIAL_HOSTS = {"npm": deps.NPM_OFFICIAL_HOSTS, "pypi": deps.PYPI_OFFICIAL_HOSTS}
 _NPM_FAMILIES = frozenset({"package.json", *deps.MANIFEST_LOCKFILES["package.json"]})
 _EXACT_VERSION_RE = re.compile(r"[A-Za-z0-9.+_-]+", re.ASCII)
+# One exact semver version in package.json, with npm's optional `=` or `v`.
+_NPM_EXACT_RE = re.compile(
+    r"\s*=?\s*v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)\s*", re.ASCII
+)
 
 
 def _is_foreign(ecosystem: str, source: deps.Source) -> bool:
@@ -720,18 +817,61 @@ def _is_foreign(ecosystem: str, source: deps.Source) -> bool:
     return False
 
 
-def needs_registry_lookup(change: deps.PackageChange) -> bool:
-    """True when the 72-hour rule applies, so collect must look the version up.
+def _exact_npm_spec(spec: str) -> tuple[str | None, str] | None:
+    """(alias target or None, version) when a package.json value names one
+    exact version: `1.2.3`, `=1.2.3`, `v1.2.3` or `npm:name@1.2.3`."""
+    target = None
+    if spec.strip().lower().startswith("npm:"):
+        target, _, spec = spec.strip()[4:].rpartition("@")
+        if not target:
+            return None
+    m = _NPM_EXACT_RE.fullmatch(spec)
+    return (target, m.group(1)) if m else None
 
-    That is a new or changed exact version from the official registry: every
-    lockfile entry, and requirements entries pinned with `==`.
+
+def _exact_pypi_spec(spec: str) -> str | None:
+    """The version a PyPI specifier pins: a bare version (deps.py strips a lone
+    `==`; Poetry reads a bare version as exact), or an `==`/`===` clause."""
+    if _EXACT_VERSION_RE.fullmatch(spec) and any(ch.isdigit() for ch in spec):
+        return spec
+    for clause in spec.split(","):
+        clause = clause.strip()
+        if clause.startswith("==="):
+            return clause[3:].strip() or None
+        if clause.startswith("==") and "*" not in clause:
+            return clause[2:].strip() or None
+    return None
+
+
+def registry_key(change: deps.PackageChange) -> tuple[str, str, str] | None:
+    """(ecosystem, name, version) collect must look up, or None.
+
+    The 72-hour rule applies to every new or changed exact version from the
+    official registry: every lockfile entry, and every manifest or
+    requirements entry that names one exact version, including an npm alias
+    to another package. A range names no version, so it has no key.
+    `DependencyFacts.registry` is keyed by this value.
     """
     if change.source.kind != "registry" or _is_foreign(change.ecosystem, change.source):
-        return False
+        return None
     family = deps.family_for_path(change.path)
     if family in deps.LOCKFILE_FAMILIES:
-        return True
-    return family == "requirements" and bool(_EXACT_VERSION_RE.fullmatch(change.new_version))
+        return (change.ecosystem, change.name, change.new_version)
+    if family == "package.json":
+        exact = _exact_npm_spec(change.new_version)
+        if exact is None:
+            return None
+        target, version = exact
+        return ("npm", target or change.name, version)
+    if family in ("pyproject.toml", "requirements"):
+        version = _exact_pypi_spec(change.new_version)
+        return ("pypi", change.name, version) if version else None
+    return None
+
+
+def needs_registry_lookup(change: deps.PackageChange) -> bool:
+    """True when the 72-hour rule applies, so collect must look the version up."""
+    return registry_key(change) is not None
 
 
 def _check_deps(
@@ -749,7 +889,8 @@ def _check_deps(
         out.add(INCOMPLETE_DEP_DATA, HARD_BLOCK, f"dependency data incomplete: {f.reason}", file=f.path)
     failed = {f.path for f in facts.failures}
     for c in changed:
-        if c.head_sha is None or c.is_submodule or deps.family_for_path(c.path) is None:
+        # A gitlink head has no file to parse; a file head does, whatever the base was.
+        if c.head_sha is None or c.head_mode == MODE_SUBMODULE or deps.family_for_path(c.path) is None:
             continue
         if c.path not in facts.parsed_paths and c.path not in failed:
             out.add(INCOMPLETE_DEP_DATA, HARD_BLOCK, "supported dependency file was not parsed", file=c.path)
@@ -770,8 +911,9 @@ def _check_deps(
                 file=c.path, subject=f"{subject} from {c.source.normalized}",
             )
             continue
-        info = facts.registry.get((c.ecosystem, c.name, c.new_version))
-        if needs_registry_lookup(c):
+        key = registry_key(c)
+        info = facts.registry.get(key) if key is not None else None
+        if key is not None:
             if info is None:
                 out.add(INCOMPLETE_DEP_DATA, HARD_BLOCK, "no registry data for a new version", file=c.path, subject=subject)
             elif info.published.tzinfo is None:
@@ -792,7 +934,7 @@ def _check_deps(
                     f"registry manifest has install scripts: {', '.join(sorted(scripts))}",
                     file=c.path, subject=subject,
                 )
-        if c.ecosystem == "pypi" and facts.has_wheel.get((c.name, c.new_version)) is False:
+        if c.ecosystem == "pypi" and info is not None and info.has_wheel is False:
             out.add(SDIST_ONLY, SIGNAL, "no wheel; setup.py runs at install", file=c.path, subject=subject)
 
     changed_paths = [c.path for c in changed]
@@ -834,17 +976,20 @@ def run_prefilter(
         if change.path in seen:
             raise ValueError(f"duplicate path in diff: {change.path[:200]!r}")
         seen.add(change.path)
-        if change.is_submodule:
-            # A gitlink has no blob; the old and new commit SHAs are its content.
-            file_cov.append(FileCoverage(change.path, "binary"))
-            collected += 1
-            _check_file(out, change, None, None)
-            continue
+        # A gitlink side has no blob; its commit SHA is its content, so it
+        # counts as binary. Every other side is read and scanned, so a gitlink
+        # on one side never hides the blob on the other.
         base = head = None
         if change.base_sha is not None:
-            base = scan_blob(blobs.get(change.base_sha), sha=change.base_sha, cap=max_blob_bytes)
+            base = (
+                _GITLINK if change.base_mode == MODE_SUBMODULE
+                else scan_blob(blobs.get(change.base_sha), sha=change.base_sha, cap=max_blob_bytes)
+            )
         if change.head_sha is not None:
-            head = scan_blob(blobs.get(change.head_sha), sha=change.head_sha, cap=max_blob_bytes)
+            head = (
+                _GITLINK if change.head_mode == MODE_SUBMODULE
+                else scan_blob(blobs.get(change.head_sha), sha=change.head_sha, cap=max_blob_bytes)
+            )
         if all(s.reason not in ("unreadable", "sha-mismatch") for s in (base, head) if s is not None):
             collected += 1
         file_cov.append(_file_coverage(change, base, head))
@@ -865,7 +1010,7 @@ def run_prefilter(
     _check_deps(out, dependencies, diff.files, frozenset(head_paths), now)
 
     for where, text in (("PR title", pr_title), ("PR body", pr_body)):
-        hits = _ai_hits(list(enumerate(text.split("\n"), 1)))
+        hits = _ai_hits(text.split("\n"))
         for name, lines in sorted(hits.items()):
             out.add(AI_DIRECTED_TEXT, SIGNAL, f"pattern {name} in {where}", lines=lines, count=len(lines))
 

