@@ -305,7 +305,8 @@ def test_pyproject_poetry():
     assert one(parsed, "requests").source.official
     assert one(parsed, "forked").source.kind == "git"
     assert one(parsed, "local").source.kind == "file"
-    assert one(parsed, "multi").version == "^1.0 || ^2.0"
+    # A list of alternatives is one package per alternative.
+    assert sorted(p.version for p in by_name(parsed)["multi"]) == ["^1.0", "^2.0"]
     assert one(parsed, "pytest").version == "^8"
 
 
@@ -564,6 +565,43 @@ def test_lookup_pypi_takes_earliest_upload():
     assert info.published == datetime(2023, 9, 30, 9, 59, tzinfo=UTC)
     assert fetch.calls[0][0] == "https://pypi.org/pypi/flask/json"
     assert fetch.calls[0][1] == deps.PYPI_MAX_RESPONSE_BYTES
+
+
+def test_lookup_npm_keeps_every_install_lifecycle_script():
+    scripts = {"preprepare": "a", "postprepare": "b", "prepublish": "c", "test": "jest", "build": "tsc"}
+    doc = {"name": "a", "time": {"1.0.0": "2024-01-01T00:00:00Z"}, "versions": {"1.0.0": {"scripts": scripts}}}
+    info = deps.lookup_npm("a", "1.0.0", FakeFetch(ok(doc, "https://registry.npmjs.org/a")))
+    assert info.install_scripts == {"preprepare": "a", "postprepare": "b", "prepublish": "c"}
+
+
+@pytest.mark.parametrize("stamp", ["2020-01-01T00:00:00", "2020-01-01T00:00:00.000", "2020-01-01"])
+def test_lookup_npm_time_without_time_zone_is_incomplete(stamp):
+    doc = {"name": "a", "time": {"1.0.0": stamp}, "versions": {"1.0.0": {}}}
+    with pytest.raises(RegistryError, match="time zone"):
+        deps.lookup_npm("a", "1.0.0", FakeFetch(ok(doc, "https://registry.npmjs.org/a")))
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        [{"upload_time_iso_8601": "2020-01-01T00:00:00"}],
+        # One naive time among good ones still fails the version.
+        [{"upload_time_iso_8601": "2023-01-01T00:00:00Z"}, {"upload_time_iso_8601": "2020-01-01T00:00:00"}],
+        # The naive `upload_time` field is never a fallback.
+        [{"upload_time": "2020-01-01T00:00:00"}],
+        [{"upload_time": "2020-01-01T00:00:00Z"}],
+    ],
+)
+def test_lookup_pypi_time_without_time_zone_is_incomplete(files):
+    doc = {"info": {"name": "a"}, "releases": {"1.0": files}}
+    with pytest.raises(RegistryError):
+        deps.lookup_pypi("a", "1.0", FakeFetch(ok(doc, "https://pypi.org/pypi/a/json")))
+
+
+def test_lookup_converts_an_offset_to_utc():
+    doc = {"name": "a", "time": {"1.0.0": "2020-01-01T02:00:00+02:00"}, "versions": {"1.0.0": {}}}
+    info = deps.lookup_npm("a", "1.0.0", FakeFetch(ok(doc, "https://registry.npmjs.org/a")))
+    assert info.published == datetime(2020, 1, 1, 0, 0, tzinfo=UTC)
 
 
 def test_lookup_never_fetches_for_a_bad_name():
@@ -828,6 +866,66 @@ def test_pyproject_global_index_options_and_poetry_sources():
 def test_uv_sources_keys_are_normalized():
     text = '[project]\ndependencies = ["my-pkg"]\n[tool.uv.sources]\nMy_Pkg = { git = "https://evil.com/x.git" }\n'
     assert foreign_names(parse("pyproject.toml", text)) == {"my-pkg"}
+
+
+# Regression (final review I-1): only the first alternative of a source list
+# was read, so a later git source, or a second exact pin, was never checked.
+UV_ALT_BASE = (
+    '[project]\nname = "example"\nversion = "1.0"\ndependencies = ["demo>=1"]\n'
+    "[tool.uv.sources]\ndemo = [\n"
+    "  {path = \"./demo\", marker = \"sys_platform == 'darwin'\"},\n"
+)
+UV_ALT_HEAD = UV_ALT_BASE + "  {git = \"https://evil.example/demo.git\", marker = \"sys_platform == 'linux'\"},\n]\n"
+
+
+def test_uv_source_list_reads_every_alternative():
+    parsed = parse("pyproject.toml", UV_ALT_HEAD)
+    assert sorted(p.source.kind for p in by_name(parsed)["demo"]) == ["file", "git"]
+    assert foreign_names(parsed) == {"demo"}
+
+
+def test_uv_later_git_alternative_is_in_the_delta():
+    [c] = deps.compute_delta(parse("pyproject.toml", UV_ALT_BASE + "]\n"), parse("pyproject.toml", UV_ALT_HEAD))
+    assert (c.name, c.source.kind, c.source.foreign) == ("demo", "git", True)
+    assert c.source.host == "evil.example"
+
+
+def test_uv_source_list_with_unknown_alternative_fails():
+    text = '[project]\ndependencies = ["demo"]\n[tool.uv.sources]\ndemo = [{path = "./d"}, {marker = "x"}]\n'
+    with pytest.raises(DepsError, match="alternative"):
+        parse("pyproject.toml", text)
+
+
+@pytest.mark.parametrize(
+    "value, kinds",
+    [
+        # Local source followed by a foreign one.
+        ('[{path = "../d", python = "<3.9"}, {git = "https://evil.example/d.git", python = ">=3.9"}]', ["file", "git"]),
+        ('[{path = "../d", python = "<3.9"}, {version = "1.0", source = "corp", python = ">=3.9"}]', ["file", "registry"]),
+        ('[{path = "../d", python = "<3.9"}, {url = "https://evil.example/d.tgz", python = ">=3.9"}]', ["file", "url"]),
+    ],
+)
+def test_poetry_local_alternative_then_foreign(value, kinds):
+    text = (
+        '[[tool.poetry.source]]\nname = "corp"\nurl = "https://pypi.corp.example/simple"\n'
+        f"[tool.poetry.dependencies]\ndemo = {value}\n"
+    )
+    parsed = parse("pyproject.toml", text)
+    assert sorted(p.source.kind for p in by_name(parsed)["demo"]) == kinds
+    # The corp index is also a file-wide source, with no name.
+    assert foreign_names(parsed) - {None} == {"demo"}
+
+
+def test_poetry_exact_pins_are_one_package_each():
+    text = '[tool.poetry.dependencies]\ndemo = [{version = "1.0.0", python = "<3.9"}, {version = "2.0.0", python = ">=3.9"}]\n'
+    changes = deps.compute_delta(None, parse("pyproject.toml", text))
+    assert sorted(c.new_version for c in changes) == ["1.0.0", "2.0.0"]
+    assert all(c.source.official for c in changes)
+
+
+def test_poetry_empty_alternative_list_fails():
+    with pytest.raises(DepsError, match="empty"):
+        parse("pyproject.toml", "[tool.poetry.dependencies]\ndemo = []\n")
 
 
 def test_shrinkwrap_is_an_unsupported_dep_file():

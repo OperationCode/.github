@@ -300,7 +300,9 @@ def _replace_spans(text: str, spans: list[tuple[str, int, int]]) -> str:
 # cannot hide the rest of the file. The prefilter makes the coverage of such a
 # file `unavailable` (`unterminated_private_keys`). Key data that has lost its
 # header is still redacted: the lines before an END with no open block, and
-# runs of full-width base64 lines (`KEY_BODY_WIDTHS`).
+# runs of full-width base64 lines (`KEY_BODY_WIDTHS`). A PuTTY `Private-Lines`
+# count is held to the same cap, and a block that is not complete (over the
+# cap, cut short, or with a line that is not key data) is unterminated too.
 #
 # Headers: PEM, OpenSSH and PGP (five dashes), and SSH2 (RFC 4716 form, four
 # dashes and spaces).
@@ -324,7 +326,8 @@ _PK_DATA = re.compile(
 KEY_BODY_WIDTHS = frozenset({64, 70, 76})
 KEY_BODY_MIN_LINES = 3
 _KEY_BODY_LINE = re.compile(r"[\s\"'`]*+([A-Za-z0-9+/]++={0,2})(?:\\n)?[\"'`]?[\s,;+]*+")
-# PuTTY key files: `Private-Lines: N`, then N lines of key data.
+# PuTTY key files: `Private-Lines: N`, then N lines of key data. N over
+# `PK_UNTERMINATED_MAX_LINES` redacts only that many lines and is unterminated.
 _PUTTY_HEADER = re.compile(r"PuTTY-User-Key-File-\d+:")
 _PUTTY_PRIVATE_LINES = re.compile(r"\s*Private-Lines:\s*(\d{1,6})\s*")
 # A whole PEM file encoded as base64 (a Kubernetes secret, for example). These
@@ -424,7 +427,18 @@ def _scan_private_keys(text: str) -> _KeyScan:
             if has_putty and end_tag is None:
                 m = _PUTTY_PRIVATE_LINES.fullmatch(body)
                 if m:
-                    putty_left = int(m.group(1))
+                    # PuTTY has no END header; the count is the only bound, so
+                    # the same 100-line cap applies. A block over the cap, cut
+                    # short, or with a line that is not key data is incomplete.
+                    count = int(m.group(1))
+                    putty_left = min(count, PK_UNTERMINATED_MAX_LINES)
+                    block = raw[i + 1 : i + 1 + putty_left]
+                    if (
+                        count > PK_UNTERMINATED_MAX_LINES
+                        or len(block) < count
+                        or not all(_is_key_data(b.rstrip("\r")) for b in block)
+                    ):
+                        unterminated.append(i + 1)
             if has_putty:
                 m = _PUTTY_HEADER.search(body)
                 if m:
@@ -478,12 +492,13 @@ def _redact_private_keys(text: str) -> str:
 
 
 def unterminated_private_keys(text: str) -> list[int]:
-    """1-based lines of private key headers with no END header after them.
+    """1-based lines of private key headers with no END header after them,
+    and of PuTTY `Private-Lines` lines whose block is not complete.
 
     Ruling R-KEYBLOCK: the redaction of such a block is cut off, so the
     prefilter marks the file's coverage `unavailable`.
     """
-    if "PRIVATE KEY" not in text:
+    if "PRIVATE KEY" not in text and _PUTTY_HEADER.search(text) is None:
         return []
     return _scan_private_keys(text).unterminated
 

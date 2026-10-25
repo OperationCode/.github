@@ -615,6 +615,41 @@ class TestExactManifestVersions:
         assert not run(cf, dependencies=facts).hard_blocks
 
 
+class TestSourceAlternatives:
+    # Regression (final review I-1): only the first alternative of a uv or
+    # Poetry list was read, so a later foreign source or a second exact pin
+    # passed with complete coverage and no hard block.
+    UV_BASE = (
+        b'[project]\nname = "example"\nversion = "1.0"\ndependencies = ["demo>=1"]\n'
+        b"[tool.uv.sources]\ndemo = [\n  {path = \"./demo\", marker = \"sys_platform == 'darwin'\"},\n"
+    )
+    UV_HEAD = UV_BASE + b"  {git = \"https://evil.example/demo.git\", marker = \"sys_platform == 'linux'\"},\n]\n"
+
+    def test_uv_later_git_source_blocks(self):
+        cf, facts = manifest_facts("pyproject.toml", self.UV_HEAD, self.UV_BASE + b"]\n")
+        r = run(cf, dependencies=facts)
+        [c] = checks(r, pf.FOREIGN_SOURCE)
+        assert c.level == pf.HARD_BLOCK and "evil.example" in c.subject
+
+    def test_poetry_local_then_foreign_source_blocks(self):
+        text = (
+            b"[tool.poetry.dependencies]\n"
+            b'demo = [{path = "../d", python = "<3.9"}, {git = "https://evil.example/d.git", python = ">=3.9"}]\n'
+        )
+        cf, facts = manifest_facts("pyproject.toml", text)
+        assert pf.FOREIGN_SOURCE in hard(run(cf, dependencies=facts))
+
+    def test_poetry_two_exact_pins_each_need_registry_data(self):
+        text = b'[tool.poetry.dependencies]\ndemo = [{version = "1.0.0", python = "<3.9"}, {version = "2.0.0", python = ">=3.9"}]\n'
+        cf, facts = manifest_facts("pyproject.toml", text)
+        r = run(cf, dependencies=facts)
+        assert sorted(c.subject for c in checks(r, pf.INCOMPLETE_DEP_DATA)) == ["demo@1.0.0", "demo@2.0.0"]
+        old = reg("pypi", "demo", "1.0.0", timedelta(days=9), has_wheel=True)
+        cf, facts = manifest_facts("pyproject.toml", text, lookups=old)
+        [c] = checks(run(cf, dependencies=facts), pf.INCOMPLETE_DEP_DATA)
+        assert c.subject == "demo@2.0.0"
+
+
 class TestIncompleteDependencyData:
     def test_failure_blocks(self):
         r = dep_run(failures=[pf.DepFailure("yarn.lock", "unknown lockfile version")], parsed=())
@@ -1255,3 +1290,25 @@ class TestUnterminatedKeyBlock:
         r = run(change("a.py", f"{self.BEGIN}\nQUJD\n{self.END}\n"))
         assert r.coverage.files[0].coverage == "full" and r.coverage.complete
         assert pf.INCOMPLETE_COVERAGE not in hard(r)
+
+    # Regression (final review I-2): a fake PuTTY count hid the rest of a
+    # source file, with complete coverage and no hard block.
+    PUTTY = '"""PuTTY-User-Key-File-3: ssh-ed25519\nPrivate-Lines: 999999\n"""\n'
+    CODE = "".join(f"value_{i} = compute({i})\n" for i in range(150))
+
+    @pytest.mark.parametrize("side", ["head", "base"])
+    def test_putty_fake_count_is_unavailable(self, side):
+        text = self.PUTTY + self.CODE
+        args = (text, "x = 1\n") if side == "head" else ("x = 1\n", text)
+        r = run(change("a.py", *args))
+        assert r.coverage.files[0] == pf.FileCoverage("a.py", "unavailable", "unterminated-private-key")
+        assert pf.INCOMPLETE_COVERAGE in hard(r) and not r.coverage.complete
+
+    def test_complete_putty_block_is_full(self):
+        text = (
+            "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none\nComment: k\nPublic-Lines: 1\n"
+            "AAAAC3NzaC1lZDI1NTE5AAAAIAm\nPrivate-Lines: 1\nAAAAIGsn0q3zBn2Fq4xD7Xo5ZcVvH1yKk2dJbRkQ6tSDmJ6c\n"
+            "Private-MAC: 00ff\n"
+        )
+        r = run(change("id.ppk", text))
+        assert r.coverage.files[0].coverage == "full" and r.coverage.complete

@@ -350,11 +350,35 @@ def test_truncated_either_side_is_incomplete():
         entry("a", "1" * 40, "100644", "commit"),
         entry("", "1" * 40),
         "not-an-object",
+        # Octal but not a git mode, or a mode of the wrong type.
+        entry("a", "1" * 40, "100664"),
+        entry("a", "1" * 40, "000000"),
+        entry("a", "1" * 40, "040000", "blob"),
+        entry("a", "1" * 40, "100644", "tree"),
+        entry("a", "1" * 40, "160000", "tree"),
+        entry("a", "1" * 40, mode=None),
     ],
 )
 def test_malformed_tree_entry_fails_closed(bad):
     with pytest.raises(s.SnapshotError):
         s.diff_trees(tree(bad), tree())
+
+
+@pytest.mark.parametrize("side", ["base", "head"])
+def test_blob_mode_on_tree_entry_does_not_drop_the_file(side):
+    # A `tree` type must not hide a file entry as a skipped directory.
+    bad = tree(entry("dropped.py", "1" * 40, "100644", "tree"))
+    args = (bad, tree()) if side == "base" else (tree(), bad)
+    with pytest.raises(s.SnapshotError, match="disagree"):
+        s.diff_trees(*args)
+
+
+@pytest.mark.parametrize(
+    "mode, kind",
+    [("040000", "tree"), ("100644", "blob"), ("100755", "blob"), ("120000", "blob"), ("160000", "commit")],
+)
+def test_every_git_mode_is_accepted_with_its_type(mode, kind):
+    s.diff_trees(tree(entry("a", "1" * 40, mode, kind)), tree())
 
 
 def test_duplicate_path_fails_closed():

@@ -50,7 +50,10 @@ PYPI_REGISTRY_HOST = "pypi.org"
 NPM_OFFICIAL_HOSTS = frozenset({"registry.npmjs.org", "registry.yarnpkg.com"})
 PYPI_OFFICIAL_HOSTS = frozenset({"pypi.org", "files.pythonhosted.org"})
 
-NPM_LIFECYCLE_SCRIPTS = ("preinstall", "install", "postinstall", "prepare")
+# Install lifecycle scripts, for the registry manifest and package.json
+# checks alike: the four install scripts, plus the three npm also runs on
+# install.
+NPM_LIFECYCLE_SCRIPTS = ("preinstall", "install", "postinstall", "prepare", "preprepare", "postprepare", "prepublish")
 
 FAMILIES = (
     "package.json",
@@ -884,11 +887,28 @@ def _pypi_package_from_requirement(req: str, *, direct: bool | None) -> Package:
 # ---------------------------------------------------------------------------
 
 
-def _uv_source_override(entry: Any, index_urls: Mapping[str, str], what: str) -> Source | None:
-    if isinstance(entry, list):
-        entry = entry[0] if entry else None
+def _uv_source_overrides(entry: Any, index_urls: Mapping[str, str], what: str) -> list[Source]:
+    """Every source a `tool.uv.sources` value names; [] for no override.
+
+    A list holds alternatives, usually split by markers. uv may install any of
+    them, so each one is read, whatever its marker. An alternative with no
+    known source key is a parse failure, never a skip.
+    """
     if entry is None:
-        return None
+        return []
+    if not isinstance(entry, list):
+        source = _uv_source_override(entry, index_urls, what)
+        return [] if source is None else [source]
+    sources = []
+    for item in entry:
+        source = _uv_source_override(item, index_urls, what)
+        if source is None:
+            raise DepsError(f"{what}: an alternative names no source")
+        sources.append(source)
+    return sources
+
+
+def _uv_source_override(entry: Any, index_urls: Mapping[str, str], what: str) -> Source | None:
     entry = _as_dict(entry, what)
     if "git" in entry:
         ref = entry.get("rev") or entry.get("tag") or entry.get("branch") or ""
@@ -917,35 +937,32 @@ def _foreign_registry(url: str) -> Source:
     return Source(kind="registry", normalized=text, host=host, official=False)
 
 
-def _poetry_dep_source(value: Any, poetry_sources: Mapping[str, str], what: str) -> Source:
-    items = value if isinstance(value, list) else [value]
-    chosen = official_pypi_source()
-    for item in items:
-        if isinstance(item, str):
-            continue
-        item = _as_dict(item, what)
-        if "git" in item:
-            ref = item.get("rev") or item.get("tag") or item.get("branch") or ""
-            base = classify_source(f"git+{item['git']}" if "://" in str(item["git"]) else str(item["git"]), frozenset())
-            return Source(kind="git", normalized=f"{base.normalized}#{ref}" if ref else base.normalized, host=base.host)
-        if "url" in item:
-            return classify_source(_as_str(item["url"], what), frozenset())
-        if "path" in item:
-            return Source(kind="file", normalized=str(item["path"]))
-        if "source" in item:
-            url = poetry_sources.get(str(item["source"]))
-            if url is None:
-                return Source(kind="unknown", normalized=f"source:{item['source']}")
-            if not _is_official_index(url):
-                chosen = _foreign_registry(url)
-    return chosen
+def _poetry_dep_source(item: Any, poetry_sources: Mapping[str, str], what: str) -> Source:
+    """The source of one Poetry constraint (one alternative of a list)."""
+    if isinstance(item, str):
+        return official_pypi_source()
+    item = _as_dict(item, what)
+    if "git" in item:
+        ref = item.get("rev") or item.get("tag") or item.get("branch") or ""
+        base = classify_source(f"git+{item['git']}" if "://" in str(item["git"]) else str(item["git"]), frozenset())
+        return Source(kind="git", normalized=f"{base.normalized}#{ref}" if ref else base.normalized, host=base.host)
+    if "url" in item:
+        return classify_source(_as_str(item["url"], what), frozenset())
+    if "path" in item:
+        return Source(kind="file", normalized=str(item["path"]))
+    if "source" in item:
+        url = poetry_sources.get(str(item["source"]))
+        if url is None:
+            return Source(kind="unknown", normalized=f"source:{item['source']}")
+        if not _is_official_index(url):
+            return _foreign_registry(url)
+    return official_pypi_source()
 
 
 def _poetry_dep_version(value: Any) -> str:
+    """The version of one Poetry constraint (one alternative of a list)."""
     if isinstance(value, str):
         return value
-    if isinstance(value, list):
-        return " || ".join(_poetry_dep_version(v) for v in value)
     if isinstance(value, dict):
         for key in ("version", "git", "url", "path"):
             if key in value:
@@ -985,10 +1002,9 @@ def _parse_pyproject(text: str) -> _Result:
     def add(reqs: Any, what: str) -> None:
         for req in _as_list(reqs, what):
             pkg = _pypi_package_from_requirement(_as_str(req, what), direct=True)
-            override = _uv_source_override(uv_sources.get(pkg.name), index_urls, f"tool.uv.sources.{pkg.name}")
-            if override is not None:
-                pkg = replace(pkg, source=override)
-            packages.append(pkg)
+            overrides = _uv_source_overrides(uv_sources.get(pkg.name), index_urls, f"tool.uv.sources.{pkg.name}")
+            # One package per source alternative, so each one is checked.
+            packages.extend([replace(pkg, source=o) for o in overrides] or [pkg])
 
     project = _as_dict(doc.get("project", {}), "project")
     if "dependencies" in project:
@@ -1021,15 +1037,22 @@ def _parse_pyproject(text: str) -> _Result:
         for name, value in _as_dict(table, "poetry dependencies").items():
             if name.lower() == "python":
                 continue
-            packages.append(
-                Package(
-                    ecosystem="pypi",
-                    name=_pep503(name),
-                    version=_poetry_dep_version(value),
-                    source=_poetry_dep_source(value, poetry_sources, f"poetry dependency {name}"),
-                    direct=True,
+            # A list holds alternatives (split by markers). Poetry may install
+            # any of them, so each one is a package with its own version and
+            # source.
+            alternatives = value if isinstance(value, list) else [value]
+            if not alternatives:
+                raise DepsError(f"poetry dependency {name} has an empty list")
+            for item in alternatives:
+                packages.append(
+                    Package(
+                        ecosystem="pypi",
+                        name=_pep503(name),
+                        version=_poetry_dep_version(item),
+                        source=_poetry_dep_source(item, poetry_sources, f"poetry dependency {name}"),
+                        direct=True,
+                    )
                 )
-            )
     return None, packages, global_sources
 
 
@@ -1426,8 +1449,8 @@ class RegistryInfo:
     name: str
     version: str
     published: datetime  # timezone-aware, UTC
-    # npm only: the preinstall, install, postinstall and prepare scripts of
-    # this version, from the registry manifest.
+    # npm only: the NPM_LIFECYCLE_SCRIPTS of this version, from the registry
+    # manifest.
     install_scripts: Mapping[str, str] = field(default_factory=dict)
     # PyPI only: some file of this version is a wheel (`bdist_wheel`). None
     # for npm. False means sdist only, which runs build code at install.
@@ -1441,7 +1464,11 @@ def _parse_time(value: Any, what: str) -> datetime:
         stamp = datetime.fromisoformat(value)
     except ValueError as exc:
         raise RegistryError(f"{what} is not an ISO timestamp") from exc
-    return stamp.replace(tzinfo=UTC) if stamp.tzinfo is None else stamp.astimezone(UTC)
+    # A publish time with no time zone is incomplete dependency data; never
+    # guess UTC.
+    if stamp.tzinfo is None:
+        raise RegistryError(f"{what} has no time zone")
+    return stamp.astimezone(UTC)
 
 
 def _fetch_json(
@@ -1565,7 +1592,9 @@ def lookup_pypi(
         if not isinstance(item, dict):
             raise RegistryError(f"{url}: release file is not an object")
         has_wheel = has_wheel or item.get("packagetype") == "bdist_wheel"
-        stamps.append(_parse_time(item.get("upload_time_iso_8601", item.get("upload_time")), "upload time"))
+        # Only the ISO field carries a time zone; the naive `upload_time` is
+        # never a fallback.
+        stamps.append(_parse_time(item.get("upload_time_iso_8601"), "upload time"))
     return RegistryInfo(
         ecosystem="pypi",
         name=normalized,

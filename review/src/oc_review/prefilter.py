@@ -172,9 +172,8 @@ _WRAPPED_B64_LINE_RE = re.compile(r"^\s*[\"'`]?([A-Za-z0-9+/]{40,}={0,2})[\"'`]?
 
 # --- paths ------------------------------------------------------------------
 
-# Install lifecycle scripts that run on `npm install` in the package root. The
-# spec names the first four; the others also run on install.
-_INSTALL_SCRIPTS = ("preinstall", "install", "postinstall", "prepare", "preprepare", "postprepare", "prepublish")
+# Install lifecycle scripts; one list with the registry manifest check.
+_INSTALL_SCRIPTS = deps.NPM_LIFECYCLE_SCRIPTS
 # Dependency files deps.py does not parse yet, on top of deps.UNSUPPORTED_DEP_FILES.
 _EXTRA_UNSUPPORTED_DEP_FILES = frozenset({"npm-shrinkwrap.json", ".pnpmfile.cjs", "deno.json", "deno.lock"})
 _JS_SUFFIXES = (".js", ".mjs", ".cjs")

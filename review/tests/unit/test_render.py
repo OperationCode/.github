@@ -623,6 +623,56 @@ def test_putty_private_lines_are_redacted():
     assert any(k == "private-key" for k, _, _ in r.find_credentials(text))
 
 
+# Regression (final review I-2): PuTTY trusted `Private-Lines: N` up to 999999
+# and never checked that N key lines exist, so a fake count hid the rest of a
+# source file with no hard block.
+PUTTY_FAKE = '"""PuTTY-User-Key-File-3: ssh-ed25519\nPrivate-Lines: 999999\n"""\n'
+PUTTY_CODE = [f"value_{i} = compute({i})" for i in range(150)]
+
+
+def putty_file(private, count=None, tail="Private-MAC: 00ff\n"):
+    count = len(private) if count is None else count
+    return (
+        "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none\nComment: k\nPublic-Lines: 1\nAAAAC3NzaC1lZDI1NTE5\n"
+        f"Private-Lines: {count}\n" + "".join(line + "\n" for line in private) + tail
+    )
+
+
+def test_putty_fake_count_redacts_at_most_100_lines():
+    text = PUTTY_FAKE + "\n".join(PUTTY_CODE) + "\n"
+    out = r.redact_text(text).split("\n")
+    # The closing `"""` and the first 99 code lines are redacted; the rest is
+    # visible again.
+    assert sum(line.startswith("[REDACTED:") for line in out) == r.PK_UNTERMINATED_MAX_LINES
+    assert out[2 + r.PK_UNTERMINATED_MAX_LINES : -1] == PUTTY_CODE[99:]
+    assert r.unterminated_private_keys(text) == [2]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Count over the cap, even when the lines are key data.
+        putty_file(pem_body(7000, 64, seed=4), count=150),
+        # Fewer lines than the count before the end of the file.
+        putty_file(pem_body(90, 64, seed=5), count=5, tail=""),
+        # A small count that covers code, not key data.
+        putty_file(["import os", "os.system('id')"]),
+    ],
+    ids=["over-cap", "cut-short", "code"],
+)
+def test_putty_incomplete_block_is_unterminated(text):
+    assert r.unterminated_private_keys(text) == [6]
+
+
+@pytest.mark.parametrize("crlf", [False, True])
+def test_complete_putty_block_is_not_unterminated(crlf):
+    text = putty_file(pem_body(60, 64, seed=3))
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    assert r.unterminated_private_keys(text) == []
+    assert_key_gone(r.redact_text(text), pem_body(60, 64, seed=3))
+
+
 def test_key_with_crlf_lines():
     body = pem_body(30, 8)
     text = "-----BEGIN PRIVATE KEY-----\r\n" + "\r\n".join(body) + "\r\n-----END PRIVATE KEY-----\r\n"

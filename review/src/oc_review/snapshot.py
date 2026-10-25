@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_MODE_RE = re.compile(r"^[0-7]{6}$")
 
 # Stale reasons (spec "Consistent snapshot", Re-validate).
 STALE_HEAD_SHA = "head_sha_changed"
@@ -22,6 +21,15 @@ STALE_MERGE_BASE = "merge_base_changed"
 
 MODE_SYMLINK = "120000"
 MODE_SUBMODULE = "160000"
+MODE_TREE = "040000"
+
+# The only git modes each tree entry type may carry. Any other pair is a
+# malformed response, never a skipped entry.
+_TYPE_MODES = {
+    "tree": frozenset({MODE_TREE}),
+    "blob": frozenset({"100644", "100755", MODE_SYMLINK}),
+    "commit": frozenset({MODE_SUBMODULE}),
+}
 
 STATUS_ADDED = "added"
 STATUS_REMOVED = "removed"
@@ -258,18 +266,17 @@ def _entries(tree: Mapping[str, Any], side: str) -> tuple[dict[str, tuple[str, s
         path, mode, kind, sha = (item.get(k) for k in ("path", "mode", "type", "sha"))
         if not isinstance(path, str) or not path:
             raise SnapshotError(f"{side} tree entry has no path")
-        if not isinstance(mode, str) or not _MODE_RE.match(mode):
-            raise SnapshotError(f"{side} tree entry {path!r} has a bad mode")
-        if kind not in ("blob", "tree", "commit"):
+        if not isinstance(kind, str) or kind not in _TYPE_MODES:
             raise SnapshotError(f"{side} tree entry {path!r} has a bad type")
+        # Check the pair before a directory is skipped, so a blob mode on a
+        # `tree` entry cannot drop a file from the comparison.
+        if not isinstance(mode, str) or mode not in _TYPE_MODES[kind]:
+            raise SnapshotError(f"{side} tree entry {path!r} type and mode disagree")
         _require_sha(sha, f"{side} tree entry {path!r} sha")
         if path in out:
             raise SnapshotError(f"{side} tree has duplicate path {path!r}")
         if kind == "tree":
             continue
-        # A submodule entry must carry the commit mode, and only that mode.
-        if (kind == "commit") != (mode == MODE_SUBMODULE):
-            raise SnapshotError(f"{side} tree entry {path!r} type and mode disagree")
         out[path] = (mode, kind, sha)
     return out, not truncated
 
