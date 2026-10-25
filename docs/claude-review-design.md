@@ -1,8 +1,8 @@
 # Claude PR Review: Design Spec
 
-Status: draft, revised after several adversarial design reviews (see "Decision log"). Ready for implementation after the phase 1 items in "Verify before building" pass.
+Status: draft, revised after several adversarial design reviews and a round of platform tests (see "Decision log"). Ready for implementation after the phase 1 items in "Verify before building" pass.
 Owner: Irving Popovetsky
-Last updated: 2026-10-24
+Last updated: 2026-10-25
 
 ## Summary
 
@@ -10,7 +10,7 @@ Every pull request in every active OperationCode repo gets an automatic review f
 
 Enforcement comes in two phases. In phase 1, each target repo has a small caller workflow that calls the central reusable workflow, and a repo ruleset requires the review's gate check. In phase 2, at the end of the project, an org ruleset takes over. With the "require workflows" rule (phase 2a), a repo admin can no longer remove the review. With only a status check rule (phase 2b), a repo admin can still replace the caller with a fake check. "Org-wide enforcement" says what each role can still do in each phase.
 
-The design treats the PR purely as data. Claude gets no checkout, no shell, no tools and no GitHub token. A script with no LLM collects the PR content through the GitHub API and sends it to the Claude Messages API in one call per pass. Claude can only return JSON. Code (again, no LLM) validates the JSON, checks every citation against the real diff, computes the gate result, and posts the comments and the gate check.
+The design treats the PR purely as data. Claude gets no checkout, no shell, no tools and no GitHub token. A script with no LLM collects the PR content through the GitHub API and sends it to the Claude Messages API in one call per pass. Claude can only return JSON. Code (again, no LLM) validates the JSON, checks every citation against the real diff, computes the gate result, and posts the comments. The gate is the check that GitHub creates for the publish job itself: the job exits 0 only on a pass.
 
 Claude is the first malware gate. A human approval is still required to merge.
 
@@ -27,7 +27,7 @@ Claude is the first malware gate. A human approval is still required to merge.
 - Enforced on every active repo: first by a caller workflow and a repo ruleset per repo, then by an org ruleset.
 - A successful prompt injection has nothing to steal and nothing to break.
 - The worst case of a successful injection is a wrong verdict, and a wrong verdict alone cannot get code merged.
-- The summary comment shows a pass only for a generation whose gate check is already `success`, and it always links to the current gate record, which is the result to trust (see "Gate record lifecycle").
+- The summary comment names its run and links to that run's gate check. The gate check in the merge box is the result to trust, never the summary (see "Gate record lifecycle").
 - Keep cost low, with a hard spend cap.
 
 Out of scope for v1: auto-fix, a verifier pass that drops false positives, review of issues or comments, private repos, repos that use a merge queue.
@@ -39,14 +39,14 @@ Out of scope for v1: auto-fix, a verifier pass that drops false positives, revie
 | PR code runs in CI with secrets (the classic `pull_request_target` mistake) | No PR code is ever checked out or executed. The workflow reads PR content through the GitHub REST API only. |
 | A PR edits the review workflow or prompts | `pull_request_target` and ruleset-required workflows run the workflow file from the central repo, at a pinned ref. The `.github` repo itself is excluded from the ruleset and protected by CODEOWNERS plus 1 approval. Only org admins may bypass, and only through a pull request. |
 | A PR edits the caller workflow in its own repo (phase 1) | `pull_request_target` runs the caller from the base branch, so the edit has no effect on the PR's own review. The edit takes effect only after merge, which needs a human approval and a code owner review. The prefilter flags every change under `.github/workflows/`. |
-| Someone forges the gate check, or a repo admin turns the review off | Depends on the phase. See the gap table in "Org-wide enforcement". |
-| Injection tells Claude to run commands, push code, approve or merge | Claude has no tools and no GitHub token. The job that calls Claude has `contents: read`, `checks: read` and `id-token: write` only. The job that writes to GitHub runs no LLM and has no Anthropic credential. The bot never submits `APPROVE` or `REQUEST_CHANGES`. |
+| Someone forges the gate check, or a repo admin turns the review off | Depends on the phase. The gate is a job check, so any newer Actions job with the same check name can satisfy it. A fork's own `pull_request` workflow waits for maintainer approval (V8). See the gap table in "Org-wide enforcement". |
+| Injection tells Claude to run commands, push code, approve or merge | Claude has no tools and no GitHub token. The job that calls Claude has `contents: read`, `pull-requests: read` and `id-token: write` only. The job that writes to GitHub runs no LLM and has no Anthropic credential. The bot never submits `APPROVE` or `REQUEST_CHANGES`. |
 | Injection steals the Anthropic credential | Claude cannot read the environment (no tools). Auth is workload identity federation only, with a short-lived token scoped to one workspace. There is no long-lived key to steal. |
 | Injection exfiltrates data through the review comment | The only output channel is schema-checked JSON. The publisher escapes every untrusted string (from Claude and from the PR), strips @mentions, links and images, and caps length. Credential-like strings in the PR are redacted before the model sees them and before anything is posted. |
 | Injection suppresses findings ("this code is safe") | Cannot be fully prevented. Deterministic prefilter checks run with no LLM and Claude cannot clear them. Claude also reports injection attempts as findings. A human approval is required. |
 | Injection floods the PR with fake findings | Findings must cite a real file, side and line, and the quoted text must match. Only verified findings that sit in the diff get inline comments. Findings per pass are capped. A fake blocking finding only blocks the attacker's own PR. |
 | Injection misleads the human reviewer | Model text is labeled as untrusted in the summary. "Verified" means only that the quote is at that place, not that the claim is true. |
-| Spam PRs, rapid pushes or repeated reopens burn the spend limit | Diff size gate, explicit output limits, bounded retries, a stale and superseded check before each Claude call, and a hard monthly spend limit on the Anthropic workspace. There is no per-PR quota in v1, so one abusive PR can use up the workspace limit and stop reviews for every PR. The response is the outage process in "Auth and cost". |
+| Spam PRs, rapid pushes or repeated reopens burn the spend limit | Diff size gate, explicit output limits, bounded retries, a stale check before each Claude call, and a hard monthly spend limit on the Anthropic workspace. There is no per-PR quota in v1, so one abusive PR can use up the workspace limit and stop reviews for every PR. The response is the outage process in "Auth and cost". |
 | Malicious dependency (a known attack on open source projects) | Deterministic lockfile and registry checks, `actions/dependency-review-action`, and the supply-chain pass. |
 | The reviewer's own supply chain | All actions pinned by full commit SHA. Python deps locked with hashes. The review code lives in one small repo with strict branch protection. |
 
@@ -70,24 +70,23 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
-  checks: write
-  actions: read
   id-token: write
 jobs:
-  review:
+  review:            # job ID is part of the required check name; do not rename
     uses: OperationCode/.github/.github/workflows/claude-review.yml@<full-sha>  # vX.Y.Z
 ```
 
+- The gate check name is `review / oc-claude-review`. GitHub names the check of a called job `<caller job> / <called job>`, so the caller job ID `review` and the central gate job `oc-claude-review` together make the name (V19 confirms the exact string). This document calls it "the gate check".
 - The caller passes no inputs and no secrets. The central workflow reads everything it needs from the event and from its own pinned code, so a repo cannot pass a setting that changes the result.
 - The caller's `permissions` are the ceiling. Each job in the central workflow narrows them, and a called workflow cannot raise them ([reuse workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows): "permissions can only be maintained or reduced").
 - The caller uses only the three default activity types. These are the only types a ruleset-required workflow gets in phase 2, so the behavior does not change between phases.
-- The org owner adds a **repo ruleset** on each target repo: default branch, "Require status checks to pass" on the check `oc-claude-review` with the source set to GitHub Actions, "Require a pull request before merging" with 1 approval, "Dismiss stale approvals on push" and "Require review from Code Owners", and "Block force pushes".
+- The org owner adds a **repo ruleset** on each target repo: default branch, "Require status checks to pass" on the check `review / oc-claude-review` with the source set to GitHub Actions, "Require a pull request before merging" with 1 approval, "Dismiss stale approvals on push" and "Require review from Code Owners", and "Block force pushes".
 - CODEOWNERS in each target repo covers `.github/` (and so the caller).
 
 ### Phase 2 (end of project): org ruleset
 
-- **Phase 2a, preferred:** an org ruleset with the "Require workflows to pass before merging" rule, pointing at `OperationCode/.github`, path `.github/workflows/claude-review.yml`, pinned to a commit SHA. The central workflow adds `pull_request_target` to its triggers. Ruleset-required workflows support `pull_request_target` ([changelog](https://github.blog/changelog/2023-10-26-requiring-workflows-with-rulesets-now-supports-the-pull_request_target-trigger)). The callers are removed after the rule is active, so each event runs the review once. While a repo has both a caller and the org rule, each event starts two trusted generations. If the caller run is newer, the required run is superseded, exits non-zero and blocks the merge until it is re-run. This is safe but random, so rollout step 8 removes the caller before it activates open PRs. Neither mode is given priority: a revoke through a caller generation must still count.
-- **Phase 2b, if Team does not have the workflows rule:** an org ruleset with "Require status checks to pass" on `oc-claude-review`, source GitHub Actions. The callers stay.
+- **Phase 2a, preferred:** an org ruleset with the "Require workflows to pass before merging" rule, pointing at `OperationCode/.github`, path `.github/workflows/claude-review.yml`, pinned to a commit SHA. The central workflow adds `pull_request_target` to its triggers. Ruleset-required workflows support `pull_request_target` ([changelog](https://github.blog/changelog/2023-10-26-requiring-workflows-with-rulesets-now-supports-the-pull_request_target-trigger)). The callers are removed after the rule is active, so each event runs the review once. The workflows rule reads the required run's result, not a check name. While a repo has both a caller and the org rule, each event starts two runs. Each run computes its own result from live state, and neither run reads or changes the other, so the overlap costs a second review but never blocks at random. The repo ruleset from phase 1 requires `review / oc-claude-review`, which only the caller produces, so rollout step 8 removes that requirement and the caller in one step.
+- **Phase 2b, if Team does not have the workflows rule:** an org ruleset with "Require status checks to pass" on `review / oc-claude-review`, source GitHub Actions. The callers stay.
 
 Org ruleset settings (both variants):
 
@@ -122,21 +121,23 @@ Facts that shape both phases ([troubleshooting rules](https://docs.github.com/en
                      (fork PR)
  phase 1             cannot change the     can forge the check    can remove the repo     everything
  caller + repo       caller for own PR;    from a same-repo       ruleset, edit or
- ruleset             cannot create the     workflow; can merge    delete the caller,
-                     check by API (read-   a caller change with   bypass the rule
-                     only token) [V8]      1 approval + owner
+ ruleset             a fork workflow job   workflow; can merge    delete the caller,
+                     with the gate name    a caller change with   bypass the rule
+                     waits for approval    1 approval + owner
+                     [V8]
  phase 2a            nothing               cannot forge or        cannot remove the       bypass list,
  org workflows rule                        remove the rule        rule; can still set     edits the org
                                                                   repo-level Actions      ruleset
                                                                   settings [V12]
- phase 2b            cannot create the     can forge the check    can replace the caller  bypass list,
- org status rule     check by API [V8]     from a same-repo       with a fake check, or   edits the org
-                                           workflow               delete it (then every   ruleset
-                                                                  merge blocks)
+ phase 2b            a fork workflow job   can forge the check    can replace the caller  bypass list,
+ org status rule     with the gate name    from a same-repo       with a fake check, or   edits the org
+                     waits for approval    workflow               delete it (then every   ruleset
+                     [V8]                                         merge blocks)
 ```
 
 - In every phase a merge still needs 1 human approval, and a writer can approve another writer's PR.
-- The check name identifies the GitHub Actions app, not the central workflow. Any Actions job in the repo that can create a check run or a job named `oc-claude-review` can try to satisfy it. A fork PR's `pull_request` run gets a read-only `GITHUB_TOKEN` ([events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)), so it cannot create the check run through the API. It can still name a job `oc-claude-review`. The admin checklist sets "Require approval for all external contributors" so that fork runs need a maintainer click, and the publisher fails the gate when it sees a check of that name on the head SHA that it cannot authenticate as a gate record (see "Gate record lifecycle"). Both mitigations need the test in V8. The authentication stops outsiders and accidental name collisions. It does not stop a repo writer, who can create a check that copies a real record.
+- The check name identifies the GitHub Actions app, not the central workflow. Any Actions job in the repo whose check is named `review / oc-claude-review` can satisfy the rule, if its run is newer than the last real run (see "Gate record lifecycle"). A fork PR's `pull_request` run uses the fork's own workflow files, so it can define such a job. Its read-only `GITHUB_TOKEN` ([events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)) does not matter here, because GitHub creates job checks itself. The only control is the org setting "Require approval for all external contributors", which makes such a run wait for a maintainer click, and maintainers never approve a fork run that adds or changes a workflow file. V8 tests this with an outside account. The tests so far ran only from an org admin's fork.
+- The publisher does not look for other checks with the gate name. An older one never decides the merge box, and a newer one decides it whatever the publisher wrote. A repo writer can always forge the check from a same-repo workflow.
 - Who can change the rules: in phase 1 the org owner creates the repo ruleset, but a repo admin can change or remove it. In phase 2 only org owners can change the org ruleset.
 - Phase 2b is weaker than phase 2a. The real fix for phase 2b is a dedicated GitHub App that alone owns the check, run outside the target repos. That is a separate design and is not in v1.
 - Phase 1 depends on repo admins. It protects against outside contributors, who are the main threat. It does not protect against a compromised repo admin.
@@ -146,20 +147,8 @@ Facts that shape both phases ([troubleshooting rules](https://docs.github.com/en
 ```
  PR opened / synchronize / reopened    (any repo, any author, drafts included)
    |
-   |  phase 1:  caller in target repo --workflow_call--> OperationCode/.github/.github/workflows/claude-review.yml@<sha>
-   |  phase 2a: org ruleset "require workflows" -------> same file, pinned SHA, trigger pull_request_target
-   v
- +------------------------------------------------------------------------------------+
- | job: open-gate          permissions: checks:write, pull-requests:write,            |
- |                                      issues:write, actions:read                    |
- |   NO Anthropic credential, NO id-token, NO LLM                                     |
- |   - read PR state; stop as "stale" if head moved                                   |
- |   - create check oc-claude-review (in_progress) on the head SHA = new generation   |
- |   - complete older trusted generations of this PR on this head as cancelled        |
- |   - mark the sticky summary "in progress" (only if it names no newer generation)   |
- |   - output: check run id                                                           |
- +------------------------------------------------------------------------------------+
-   |
+   |  phase 1:  caller job "review" --workflow_call--> OperationCode/.github/.github/workflows/claude-review.yml@<sha>
+   |  phase 2a: org ruleset "require workflows" -----> same file, pinned SHA, trigger pull_request_target
    v
  +------------------------------------------------------------------------------------+
  | job: collect            permissions: contents:read, pull-requests:read             |
@@ -177,11 +166,10 @@ Facts that shape both phases ([troubleshooting rules](https://docs.github.com/en
  | job: analyze                  |   | job: dependency-review                     |
  | needs: collect                |   | actions/dependency-review-action           |
  | permissions: contents:read,   |   | base-ref: merge base, head-ref: head SHA   |
- |   checks:read, id-token:write |   | fail-on-severity: high                     |
- | stale check, and skip if any  |   | permissions: contents:read                 |
- | newer oc-claude-review check, |   +--------------------------------------------+
- | then 3 Messages API calls,    |                      |
- | no tools:                     |                      |
+ |   pull-requests:read,         |   | fail-on-severity: high                     |
+ |   id-token:write              |   | permissions: contents:read                 |
+ | stale check, then 3 Messages  |   +--------------------------------------------+
+ | API calls, no tools:          |                      |
  |   review | security |         |                      |
  |   supply-chain                |                      |
  | output: exactly 3 pass        |                      |
@@ -190,38 +178,39 @@ Facts that shape both phases ([troubleshooting rules](https://docs.github.com/en
    |                                                    |
    v                                                    v
  +------------------------------------------------------------------------------------+
- | job: publish (the gate)   needs: open-gate, collect, analyze, dependency-review    |
- |   if: always()   concurrency: one publisher per PR, no cancel-in-progress          |
- |   permissions: pull-requests:write, issues:write, checks:write, actions:read       |
- |   NO Anthropic credential, NO id-token, NO LLM                                     |
- |   - no check id from open-gate -> create and complete a new failure check,         |
- |     unless a later trusted generation exists                                       |
+ | job: oc-claude-review (publish, the gate)                                          |
+ |   needs: collect, analyze, dependency-review    if: always()                       |
+ |   permissions: pull-requests:write, issues:write                                   |
+ |   NO Anthropic credential, NO id-token, NO LLM, NO Checks API writes               |
  |   - map every needs.<job>.result; anything but success -> fail                     |
  |   - download artifacts by exact id, check digest and envelope                      |
  |   - validate findings schema and citations                                         |
- |   - re-validate the snapshot; stale or superseded -> write nothing more            |
+ |   - re-validate the snapshot; stale -> fail, write nothing more                    |
  |   - read override comments and push epoch, check authority now                     |
  |   - compute one gate result (fail closed)                                          |
- |   - post inline comments (event: COMMENT), complete this generation's check,       |
- |     re-check for a newer generation, then the sticky summary                       |
- |   - exit 0 only when the gate result is pass and the run is not superseded         |
+ |   - post inline comments (event: COMMENT), then the sticky summary                 |
+ |   - exit 0 only when the gate result is pass                                       |
+ |   GitHub sets this job's own check run from its result: that check is the gate     |
  +------------------------------------------------------------------------------------+
    |
    v
- merge requires: gate pass (check oc-claude-review, or the workflow run in phase 2a)
+ merge requires: gate pass
+                   phase 1, 2b: check "review / oc-claude-review" (newest run decides)
+                   phase 2a:    the required workflow run
                  + 1 human approval (+ code owner where CODEOWNERS applies)
 ```
 
-Only the publish job may fail because of policy. The other jobs fail only on an infrastructure error, or, for dependency-review, on a vulnerable dependency. Any failed job makes the gate fail, and the publisher treats that failure as not waivable. If open-gate fails, publish (which runs because of `always()`) tries to create a new `oc-claude-review` check and complete it as `failure` with reason "open-gate failed", unless a later trusted generation already exists (see "When open-gate fails"). That is a new generation, so it blocks, and a revoke still works when open-gate failed on a transient error. If that write also fails, nothing changes on the PR and the run fails.
+Only the gate job may fail because of policy. The other jobs fail only on an infrastructure error, or, for dependency-review, on a vulnerable dependency. Any failed job makes the gate fail, and the gate job treats that failure as not waivable. Because of `always()`, the gate job runs even when an earlier job fails or the run is cancelled, and then it fails. If the gate job itself fails, times out, loses its runner or is cancelled, GitHub completes its check as `failure` or `cancelled`, which blocks. No path leaves the check `success` without an exit 0 from the gate job.
 
-Only open-gate and publish write to GitHub. Neither has an Anthropic credential or `id-token`. Both get `actions: read` to authenticate gate records (see "Gate record lifecycle"). When a job sets explicit permissions, every scope it does not list is `none`, so this scope must be listed. Analyze gets `checks: read` only. It skips the Claude calls when it sees any `oc-claude-review` check with a higher ID on the head, with no authentication. A forged newer check only makes that run skip, and its publisher then fails it as untrusted.
+Only the gate job writes to GitHub, and it writes only comments. It has no Anthropic credential and no `id-token`. No job writes a check run through the Checks API, so no job has `checks: write` or `actions: read`. When a job sets explicit permissions, every scope it does not list is `none`.
 
 ## Workflow details
 
 - **Trigger:** v1 central file: `workflow_call` only. Phase 2a adds `pull_request_target`. Callers use `pull_request_target` with types `opened, synchronize, reopened`. In a called workflow, `github.event` is the caller's event, so the code reads the event the same way in both phases.
 - **Drafts:** reviewed like any other PR. A ruleset-required workflow runs on `opened` for a draft and never sees `ready_for_review`, so a draft skip would leave a PR with no review when it becomes ready. Reviewing drafts removes that state. The cost of frequent draft pushes is accepted.
-- **No skips by `if:`:** never put `if:` on the publish job except `always()`. A job skipped by a condition reports success to required checks ([troubleshooting required status checks](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks)).
-- **Concurrency:** no workflow-level group. Ruleset-required workflows must not use `cancel-in-progress`. Only the publish job has a job-level group, `oc-review-publish-<repository_id>-<pr_number>`, with `cancel-in-progress: false`, so publishers for one PR never write at the same time. GitHub cancels a pending job in the group when a newer one queues. A cancelled publisher leaves its generation's check `in_progress`, which blocks, and a newer generation replaces it (see "Gate record lifecycle"). V15 tests this across caller and ruleset runs. Every job also checks the snapshot before it does costly or visible work (see "Consistent snapshot").
+- **Job names:** the gate job's ID is `oc-claude-review`, and no other job in the central workflow uses that ID or name. The caller job ID is `review`. Other jobs keep their IDs (`collect`, `analyze`, `dependency-review`).
+- **No skips by `if:`:** never put `if:` on the gate job except `always()`. A job skipped by a condition reports success to required checks ([troubleshooting required status checks](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks)).
+- **Concurrency:** no workflow-level group and no job-level group. Ruleset-required workflows must not use `cancel-in-progress`. Runs for one PR need no serialization: each run has its own gate check, the newest run decides (see "Gate record lifecycle"), and summary writes are ordered by run. Every job checks the snapshot before it does costly or visible work (see "Consistent snapshot").
 - **Getting the review code:** each job checks out `OperationCode/.github` at `${{ job.workflow_sha }}`, "the commit SHA of the workflow file that defines the current job" ([contexts](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts)). Never use `github.sha` (in `pull_request_target` it is the target repo's default branch) or `github.workflow_sha`. The checkout names `repository: OperationCode/.github` explicitly. The analyze job also checks that its OIDC `job_workflow_sha` claim equals `job.workflow_sha`.
 - **Never** `actions/checkout` the PR head. Never run `npm install`, `pip install` or any build step on PR content. Never use `actions/cache` in this workflow.
 - **Action pinning:** every `uses:` pinned to a full commit SHA with a version comment.
@@ -231,7 +220,7 @@ Only open-gate and publish write to GitHub. Neither has an Anthropic credential 
   - analyze: `api.anthropic.com` and the Actions OIDC token host
   - setup of Python deps (`uv sync` with hashes): `pypi.org`, `files.pythonhosted.org`
   The allowlist is defense in depth. It does not prove that no data can leave, because GitHub itself is on the list.
-- **Timeouts:** 10 minutes per job. Each Messages API call also has a request deadline (see "Request shape"). A job that times out or loses its runner never completes its generation's check, so the gate stays blocked until a newer generation completes.
+- **Timeouts:** 10 minutes per job. Each Messages API call also has a request deadline (see "Request shape"). A job that times out or loses its runner fails. If it is the gate job, its check fails, which blocks. If it is an earlier job, the gate job sees a non-`success` result and fails.
 - **Merge queue:** not supported in v1. Repos that enable a merge queue stay out of the target list until a `merge_group` path is designed and tested.
 
 ## Job handoff and provenance
@@ -245,16 +234,16 @@ Jobs pass data only through artifacts from the same run and the same run attempt
 
 ```
 { schema_version, kind: "bundle" | "pass",
-  run_id, run_attempt, generation (gate check run id),
+  run_id, run_attempt,
   repository_id, pr_number,
   head_sha, base_repository_id, base_ref, base_tip_sha, merge_base_sha,
   pass: "review" | "security" | "supply-chain"   (kind "pass" only)
-  status: "ok" | "failed" | "skipped-size" | "stale" | "superseded",
+  status: "ok" | "failed" | "skipped-size" | "stale",
   payload }
 ```
 
-- The publisher takes its write targets (repository, PR number) from the trusted event context, never from an artifact. It checks that every envelope matches those values, the current `run_id`, `run_attempt` and generation, and the bundle's snapshot.
-- Analyze always writes exactly three pass records, one per pass. When the size gate trips, or the run is stale or superseded before the calls, the records say so, so a missing record is always an error.
+- The publisher takes its write targets (repository, PR number) from the trusted event payload, never from an artifact or the run API. The run API's `pull_requests` list is empty for fork PR runs (V17). It checks that every envelope matches those values, the current `run_id` and `run_attempt`, and the bundle's snapshot.
+- Analyze always writes exactly three pass records, one per pass. When the size gate trips, or the run is stale before the calls, the records say so, so a missing record is always an error.
 - Collect and analyze run trusted code only. The artifacts they write hold untrusted data, so every consumer parses them as data with a schema and executes nothing from them.
 
 ## Bundle (collected by code)
@@ -276,8 +265,8 @@ The review covers one immutable comparison pair: the merge base commit and the h
 - **Capture.** Collect reads the PR through the API: head SHA, base repository ID, base ref, and the base tip SHA. If the head SHA differs from the event's head SHA, the run is `stale` and stops. Collect then gets the merge base from the compare API for `base_tip...head`, once.
 - **Collect from the pair only.** Collect reads the git trees of the merge base and the head (`GET /repos/{owner}/{repo}/git/trees/{sha}?recursive=1`) and computes the changed file list in code. File contents come from blobs by SHA (`GET /repos/{owner}/{repo}/git/blobs/{sha}`). Code computes the patches from the two blobs. Trees and blobs are immutable, so a push or a retarget during collection cannot mix two snapshots. The PR file list endpoint is not used for the review, because it can use a different merge base than a fresh comparison ([PR comparisons](https://docs.github.com/en/pull-requests/reference/pull-requests#differences-between-commits-on-compare-and-pull-request-pages)).
 - **Dependency review uses the pair too.** Collect passes the merge base and head SHAs as job outputs, and the dependency-review job sets `base-ref` and `head-ref` to them.
-- **Re-validate.** Analyze checks the head SHA and base ref before the first Claude call. The publisher, before it completes the gate, reads the PR again and recomputes the merge base from the current base tip. The snapshot is current only when the head SHA, base repository, base ref and merge base all still match. Otherwise the run is `stale`.
-- A stale run never passes, never updates the sticky comment and never removes anything. Its own generation's check (if open) is completed as `fail` with reason `stale`.
+- **Re-validate.** Analyze checks the head SHA and base ref before the first Claude call. The publisher, before it computes the gate, reads the PR again and recomputes the merge base from the current base tip. The snapshot is current only when the head SHA, base repository, base ref and merge base all still match. Otherwise the run is `stale`.
+- A stale run never passes, never updates the sticky comment and never removes anything. Its gate job exits non-zero with reason `stale`.
 - **Base moves on the same branch.** The ruleset blocks force pushes to the base branch, except for bypass actors (org admins, and in phase 1 also repo admins who change the repo ruleset). Without a force push, a new merge base can only move forward along the head's history, which makes the diff smaller, never larger. The stored result stays conservative. An override bound to the old merge base no longer matches.
 - **Retarget.** The gate passes only when the base ref is the repo's default branch at publish time. A PR into any other branch gets the full review for information, but its gate is `fail` with the not-waivable reason "base is not the default branch". When the PR is retargeted to the default branch, the failed check stays on the head SHA, so the merge blocks until a push or a reopen starts a review against the new base. This needs no `edited` event, so it works in both phases. Content on a writer's branch counts as unreviewed until a review against the default branch covers it. V11 tests this in phase 1 (before blocking) and phase 2a.
 - GitHub's own PR view may use an older merge base and show a different file list. If the PR's `changed_files` differs from the reviewed comparison, the summary shows a signal. The review result still uses the fresh comparison, which matches what a merge adds to the base.
@@ -433,20 +422,19 @@ Verified means only that the quoted text is at that place. It does not mean the 
 
 ## Gate (code, fail closed)
 
-The publisher computes one gate result for its generation: `pass` or `fail`. It writes that result to its generation's `oc-claude-review` check run, then to the sticky summary comment, then to its own exit code. GitHub has no transaction across these three writes, so "Gate record lifecycle" defines what each one means when a run stops part way.
+The gate job (`oc-claude-review`, the publisher) computes one gate result for its run: `pass` or `fail`. It writes the result to the sticky summary comment, then exits 0 for `pass` and non-zero for `fail`. GitHub creates the job's check run and sets its conclusion from the job result. That job check is the gate record. No code writes a check run. "Gate record lifecycle" says which run's check counts and what happens when a run stops part way.
 
 ### Reasons
 
 | Reason | Waivable by override? |
 |---|---|
-| any job result other than `success` (open-gate, collect, analyze, dependency-review, including `cancelled` and `skipped`) | no |
-| missing, extra, duplicate or invalid artifact or envelope; digest mismatch; envelope that does not match the run, the generation or the snapshot | no |
+| any job result other than `success` (collect, analyze, dependency-review, including `cancelled` and `skipped`) | no |
+| missing, extra, duplicate or invalid artifact or envelope; digest mismatch; envelope that does not match the run or the snapshot | no |
 | fewer or more than three pass records, or any pass `failed` (API error, refusal, schema failure, `max_tokens`, timeout) | no |
 | stale run (head SHA, base repository, base ref or merge base changed) | no |
 | base ref is not the repo's default branch | no |
 | any prefilter hard block (includes incomplete coverage and incomplete dependency data) | no |
 | dependency-review job failed | no |
-| a check named `oc-claude-review` on the head SHA that fails authentication as a gate record | no |
 | size gate tripped (`skipped-size`): all content was collected and the prefilter ran, but Claude did not review it | yes |
 | any finding with category `security`, `supply-chain`, `malicious` or `prompt-injection` at severity `high` or `critical`, verified or not | yes |
 
@@ -464,7 +452,7 @@ An override is a PR comment from an authorized person:
 
 - The summary comment prints the exact line to copy, with the full 40-character SHAs, when the gate fails for waivable reasons only.
 - Authority is bound to the exact SHA pair **and** to the PR's current push epoch. The push epoch is the server time of the newest of these PR timeline events ([timeline events](https://docs.github.com/en/rest/using-the-rest-api/issue-event-types)): `head_ref_force_pushed`, `head_ref_deleted`, `head_ref_restored`, `base_ref_changed`. A normal push always produces a new head SHA, so the SHA check covers it. A return to an earlier head SHA (A to B to A) needs a force push, which moves the epoch, so an old grant for A does not come back. V16 tests that fork PR branches emit these events.
-- Immediately before it completes the gate, the publisher reads all comments and the full timeline again (every page). If the timeline cannot be read completely, no override is accepted. It accepts an override comment only when all of these hold:
+- Immediately before it computes the gate, the publisher reads all comments and the full timeline again (every page). If the timeline cannot be read completely, no override is accepted. It accepts an override comment only when all of these hold:
   - both SHAs equal the snapshot's head SHA and merge base SHA exactly
   - the comment's `created_at` is strictly later than the push epoch (both have one-second precision, so a comment in the same second as the event does not count)
   - the comment was never edited (`updated_at` equals `created_at`), because anyone with write access can edit comments ([managing comments](https://docs.github.com/en/communities/moderating-comments-and-conversations/managing-disruptive-comments))
@@ -473,46 +461,41 @@ An override is a PR comment from an authorized person:
   - the reason is not empty
 - If several comments are valid, any one is enough, and the summary lists all of them.
 - The publisher parses comments with a fixed pattern. No LLM reads them.
-- **To apply:** after posting the comment, re-run the workflow ("Re-run all jobs") or close and reopen the PR. Both work in phase 1 and phase 2. Neither depends on `labeled` or `ready_for_review`. Each one starts a new generation (see "Gate record lifecycle"). A re-run uses the same `GITHUB_SHA` and ref ([re-run workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)), and the publisher reads the live PR state anyway. A re-run also repeats the Claude calls. The override still applies, because it covers the code at that SHA pair in that push epoch, not one set of findings.
+- **To apply:** after posting the comment, close and reopen the PR, or re-run the newest run ("Re-run all jobs"). Both work in phase 1 and phase 2. Neither depends on `labeled` or `ready_for_review`. Each one makes a new gate check that replaces the earlier one (see "Gate record lifecycle"). A re-run of an older run may not count (V21), but it can only leave the gate as it was. A re-run uses the same `GITHUB_SHA` and ref ([re-run workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)), and the publisher reads the live PR state anyway. A re-run also repeats the Claude calls. The override still applies, because it covers the code at that SHA pair in that push epoch, not one set of findings.
 - **Push invalidates:** a new commit has a new head SHA, and a force push or branch restore moves the epoch, so no earlier grant matches. Nothing needs cleanup.
-- **Revoke is a gate operation, not a comment deletion.** Deleting or editing the comment changes only future generations. To revoke, delete or edit the comment, then re-run or reopen. The new generation's open-gate marks the gate `in_progress` at once, which blocks the merge. The revoke is complete when the linked gate check (or, in phase 2a, the required run) shows the new generation's result. Until a new generation opens, the earlier pass stays on that SHA, and the merge still needs a human approval. The same applies when an approver loses their role.
+- **Revoke is a gate operation, not a comment deletion.** Deleting or editing the comment changes only future runs. To revoke, delete or edit the comment, then close and reopen the PR (or re-run the newest run). The revoke is complete when the new run's gate check (or, in phase 2a, the required run) shows its result in the merge box. Until then the earlier pass still counts on that SHA (see "Window between runs"), and the merge still needs a human approval. The same applies when an approver loses their role.
 - The summary records who overrode, when, the reason, a link to the comment, and the reasons that were waived.
 
 ### Gate record lifecycle
 
-A **generation** is one attempt to set the gate for one PR head. Each generation owns one check run named `oc-claude-review` on the head SHA. Its check run ID is the generation number. The check is the authoritative gate record in phase 1 and phase 2b. In phase 2a the required workflow run is authoritative (see "Phase 2a: which run counts"), and the check is still written so that generations stay ordered.
+The gate record is the gate job's own check run. GitHub creates it on the PR head SHA, in the check suite of the job's workflow run, and sets its conclusion from the job result. Each workflow run is its own check suite. Its name is `review / oc-claude-review` in phase 1 and 2b. In phase 2a the central workflow runs directly, so the check is named `oc-claude-review`, and the workflows rule reads the run result instead of a check name.
 
 ```
- open-gate                        publish                          (no completion)
- ---------                        -------                          ---------------
- create check (in_progress)  ---> complete check: success|failure  check stays in_progress
- cancel older trusted gens        or cancelled (superseded/stale)  -> blocks merge
- summary: "in progress, gen N"    re-check for a newer generation  -> a new generation
-                                  then summary: result for gen N      replaces it
+ head SHA H        suite of run A (older)          suite of run B (newer)
+ ----------        ----------------------          ----------------------
+                   review / oc-claude-review       review / oc-claude-review
+                   success                         in_progress | failure | success
+                                                                 ^
+                      ignored once B's check exists              |
+                                                    the merge box follows this one
 ```
 
-- **Open.** The open-gate job runs first, before any costly work. It creates the check with `status: in_progress` and `external_id` set to `<run_id>:<run_attempt>`. It then completes every older trusted generation of this PR on this head as `cancelled` ("superseded by generation N"). It records the ID of the summary comment it wrote in the check's output. This does not depend on how the merge box treats several checks with one name (V14): after open-gate, the only check of this PR on this head that is not `cancelled` is the new one.
-- **Authenticate.** A check named `oc-claude-review` is a gate record when all of these hold. It comes from the GitHub Actions app. Its `external_id` names a workflow run in this repo with event `pull_request_target`, for the same PR number. That run used the central workflow at an approved SHA (from the run's `referenced_workflows` in phase 1, or its `path` in phase 2a; V17). If V17 shows that the run's PR number is not available, `external_id` becomes `<run_id>:<run_attempt>:<pr_number>` and the PR number is taken from it. Trusting it there is acceptable, because the PR match serves liveness only, not trust. Reading the run needs `actions: read`, which open-gate and publish have. Approved SHAs are this run's own `job.workflow_sha` plus a list of earlier releases in the pinned code (a commit cannot contain its own SHA).
-  - Earlier trusted generations, including the other mode during the phase 2 overlap, pass this check.
-  - A check that fails it is the not-waivable reason "untrusted check with the gate name". This stops fork jobs and accidental collisions. A repo writer can still copy a real `external_id`, which is the writer gap in the table above.
-  - During a release rollout, an older release does not know the newer release's SHA, so it sees the newer generation as untrusted and fails its own check. If the older-release run opens last, its failed check is the newest, and the newer-release run cancels itself. A "re-run all jobs" re-runs at the original workflow SHA, so it can create this order. In the newer-release-opens-last order, the older-release publisher does not trust the newer generation, so it can complete its own already-cancelled check as `failure` ("untrusted check"); which check the merge box then uses is V14(c). In both orders the PR blocks until a run of the newer release is the newest generation. That is safe, because it blocks.
-  - A check from another PR on the same head SHA (for example, one PR to `main` and one to `staging` from the same branch) is ignored for supersession, but it is still a check of that name in the merge box and may block. Only someone who can open a PR from that head can cause this. It is a liveness issue, not a bypass.
-- **Supersede.** The newest trusted generation of this PR on the current head owns the result. Analyze skips the Claude calls when it sees any newer `oc-claude-review` check on the head, with no authentication. The publisher checks with authentication before each write. A superseded generation completes its own check as `cancelled` with "superseded by generation M", and writes nothing else.
-- **Serialize.** The job-level concurrency group on publish means only one publisher per PR writes at a time. With the supersede check inside that group, an older publisher cannot overwrite a newer publisher's check or summary. Open-gate is outside the group, so the next two rules cover it.
-- **Complete, then re-check.** Before it completes its own check, the publisher also completes any older trusted generation of this PR on this head that is not yet `cancelled`, so the cancel does not depend on open-gate alone. It then completes its own check by ID with the final result. It then reads the check list again. If a newer trusted generation of this PR now exists, it sets its own check back to `cancelled` and writes no summary. This closes the race where a newer open-gate cancels an older check and the older publisher then writes `success` (the Checks API allows a completed check to be updated again; V14). Residual risk: the older publisher dies between its final write and its re-check, and the newer run never reaches publish. Then the older `success` and the newer `in_progress` both stay, and V14 decides which one the merge box uses.
-- **Summary writes.** The summary stores the generation number in hidden metadata. Open-gate and publish never replace a summary that names a newer generation. A generation in a summary counts only when it is a trusted check of this PR (the authentication above). A reader uses the bot comment with the marker that names the highest such generation. Publish deletes other bot comments with the marker that name a lower trusted generation, so duplicates from two open-gates do not stay. A marker comment whose generation fails authentication is ignored and never causes a delete, so a forged high generation cannot capture the summary. Publish edits only the comment whose ID its own open-gate recorded in the gate check output, and readers use only that comment, so a forged marker that names the current generation is ignored too.
-- **What the summary guarantees.** The summary shows `pass` only for a generation whose check is already `success`. Each result says "result for generation N", names its head SHA and merge base, and says that the current gate is the linked check (or, in phase 2a, the required workflow run). It does not claim to be current: GitHub has no conditional comment update, so an older writer can still land after a newer one. The summary is never a trust source. The "in progress" text says: "If this stays in progress, re-run all jobs."
-- **When a run stops part way.** If the publisher never starts, times out, loses its runner, or is cancelled as a pending job in the concurrency group, its check stays `in_progress`, which never satisfies the rule. Recovery in every case: re-run all jobs or close and reopen, which opens a newer generation. One order can strand the newest generation: C publishes, B (newer) waits as pending, A (older, slow) queues and GitHub cancels B, then A sees B is newer and cancels itself. B's check stays `in_progress` and the PR needs a re-run. This is safe for merges (V15).
-- **When open-gate fails.** Publish has no check ID. If a later trusted generation of this PR already exists, it only exits non-zero. "Later" is by time, not by run ID: the generation's check was created after this run attempt started (the check's `started_at` is after the attempt's `run_started_at`). A re-run of an older run has a lower `run_id` but starts later, so it still creates its fallback check. Otherwise it creates a new check and completes it as `failure` with reason "open-gate failed". That is a new generation, so it blocks. If GitHub refuses that write too, nothing changes on the PR and the earlier result stays. This is why a revoke is complete only when the linked gate check (or, in phase 2a, the required run) shows the new generation.
+- **Which record counts.** When several suites on a head have a check with the required name, the merge box follows the check in the newest such suite. Older `failure`, `cancelled` or `in_progress` checks in older suites do not block, and an older `success` does not pass. Inside one suite, the check with the highest ID decides. Suites without a check of that name are ignored. Source: tests in [claude-review-test](https://github.com/OperationCode/claude-review-test) on same-repo and fork PRs (V14). "Newest" by suite ID and by suite creation time was not separated. The design does not depend on which, because both follow run creation order.
+- **Newer run wins.** So a newer run on the same head replaces an older run's result as soon as its gate check exists, whatever order the runs finish in. No code orders runs, cancels older results or re-writes another run's check. The rollup state (`statusCheckRollup`) lists every suite and can show `FAILURE` while the merge box is clean. Only the merge box (`mergeStateStatus`) is the gate.
+- **Fail closed.** The check is `success` only when the gate job exits 0. A gate job that fails, times out, loses its runner or is cancelled leaves `failure` or `cancelled`. A running gate job leaves `in_progress`. Each of these blocks when it is the newest. A new head SHA starts with no gate check, and a missing required check blocks.
+- **Window between runs.** On an unchanged head, the newer run counts only once its gate check exists. If GitHub creates that check only when the gate job's `needs` finish, the older run's result still counts while collect and analyze run (V20). This matters only for a revoke or a role removal on a head that was already reviewed. It never lets unreviewed content pass, because a new head SHA has no check. The same window applies to a new PR from a head that another PR's run already checked. This is weaker than the earlier design, where an open step blocked the merge at once. The revoke is complete when the new run's check shows its result.
+- **A run that stops before the gate job.** Because of `if: always()`, the gate job runs and fails after any failure or cancel of an earlier job. If GitHub never starts it, the new suite has no gate check. On a new head the required check is missing and blocks. On the same head the older result stays, as in the window above.
+- **Re-runs.** "Re-run all jobs" makes a new gate check. If GitHub keeps the run's existing suite, a re-run of the newest run replaces its result (highest ID in the suite), and a re-run of an older run does not count. If GitHub makes a new suite, the re-run counts. Both are safe, because every run reads the live PR, comments, timeline and permissions when its gate job runs. V21 records which one GitHub does. Instructions in this spec say "close and reopen, or re-run the newest run", which works in both cases ([claude-review-test](https://github.com/OperationCode/claude-review-test) used close and reopen for each new result).
+- **Summary writes.** The summary stores the run ID and run attempt in hidden metadata. The gate job does not replace a summary that names a higher run ID, or the same run ID with a higher attempt. It deletes other bot comments with the marker that name a lower run, so duplicates from two parallel runs do not stay. Each result says "result for run R, attempt N", names its head SHA and merge base, and links to its own gate check. GitHub has no conditional comment update, so an older writer can still land after a newer one.
+- **What the summary guarantees.** Less than before. The gate job writes the summary as its last step before it exits, so a `pass` in the summary normally matches a `success` check. If the job fails after that write (only by runner loss, timeout or cancel), the summary shows `pass` while the check fails. A repo writer can post a bot comment with the marker and a high run ID and so hide later summaries. Neither case changes the gate. The summary is never a trust source, and it says: "The result that counts is the gate check in the merge box."
 
 ### Phase 2a: which run counts
 
-In phase 2a the merge box uses the required workflow's run result, not the check.
+In phase 2a the merge box uses the required workflow's run result, not a check name. The run result is `success` only when every job succeeds, so it equals the gate job's result.
 
-- **Rule:** a run exits 0 only when its gate is `pass` and its generation is still the newest trusted one after the final re-check. Superseded, stale and cancelled runs always exit non-zero. So a writer who copies an `external_id` to make a real run look superseded can only block a merge, never pass one. This keeps the 2a row of the gap table true.
-- **Several runs on one head:** the docs do not say which run the rule uses. V6 tests it. If it uses the newest-created run, nothing more is needed. If it uses the last completed run, an older superseded run that finishes after the newest passing run blocks the merge. Recovery: re-run all jobs on the newest generation, which then completes last. This is a liveness cost, never a bypass.
-- **Considered and rejected:** also requiring the `oc-claude-review` check in the 2a org ruleset. Superseded runs must still exit non-zero to keep writers out, so the "which run counts" question stays. The extra rule adds a moving part without a stronger guarantee.
-- **Also considered and rejected:** signing each gate record with a GitHub OIDC token bound to the check ID, so a copied `external_id` would fail authentication. Reasons: the GitHub OIDC token expires within minutes, so a later verifier would have to ignore its expiry; every gate record would publish a signed token; phase 2a already closes the writer gap through the required run; and in phases 1 and 2b the merge box cannot verify a signature, so a writer's forged `success` check that lands after the last publish still satisfies the rule. Signing would only change what our own publisher trusts. Analyze could mint the token without giving a GitHub-writing job `id-token`, so CLAUDE.md does not forbid the design, but it adds a moving part for a small gain.
+- **Rule:** a run exits 0 only when its gate is `pass`. Stale runs always exit non-zero. There is no supersede rule.
+- **Several runs on one head:** the docs do not say which run the rule uses. V6 records it. If it uses the newest run, it matches phase 1. If it uses the last completed run, that run read the live PR state last, so its result is never older than the other runs' results. Claude's findings can differ between runs, so an older run that completes last can pass after a newer run failed on a finding. The PR author can already get a new run by close and reopen, so this adds no new power.
+- **Considered and rejected:** also requiring the `oc-claude-review` check in the 2a org ruleset. The run result already equals the gate job's result, so the extra rule adds a moving part without a stronger guarantee.
 
 ### Advisory and blocking
 
@@ -525,9 +508,9 @@ Advisory mode ends when the pilot review in "Rollout" step 5 is done. The owner 
 - **Escape all untrusted text** before posting: strings from Claude and strings from the PR (title, paths, package names, URLs, prefilter evidence). Remove control characters, replace `@` with `@​` (no pings), render as text with no Markdown links, images, HTML or autolinks, and truncate to fixed limits. Redact credential-like strings.
 - **Label model output:** each pass's text sits under a note that it is model output from untrusted input, to check before acting on it.
 - **Inline comments:** one review per run, with `event: COMMENT`, for verified and inline-eligible findings only. Skip a finding that was already posted on an earlier run (key: hash of file + side + title + quote).
-- **Summary comment:** one sticky comment, found by the hidden marker `<!-- oc-claude-review -->` and an author check (the `github-actions[bot]` identity). A comment with the marker from any other author is ignored. Readers and publish use only the comment whose ID the current generation's open-gate recorded in its gate check output. If that comment is missing, the bot comment that names the highest trusted generation is the summary, and publish deletes the others that name a lower trusted generation (see "Summary writes"). The author check proves only that some Actions workflow in the repo wrote it, so the summary is never a trust source for the gate. It contains the generation and its state (in progress or final), the gate result, every reason with its waivable flag, the head SHA, merge base SHA and base ref it was computed for, the override (if any), prefilter results, coverage, the dependency delta, findings per pass, unverified findings, run cost, and links to the gate check and the workflow run.
-- **Gate check:** one check run named `oc-claude-review` per generation on the PR head SHA, created by open-gate and completed by publish through the Checks API with `checks: write` ([check runs](https://docs.github.com/en/rest/checks/runs)). Its conclusion is the gate result. No job in the workflow is named `oc-claude-review`.
-- **Order of writes:** inline comments, then complete the check, then the summary, then exit. Every write is preceded by the supersede and snapshot checks. See "Gate record lifecycle" for partial runs.
+- **Summary comment:** one sticky comment, found by the hidden marker `<!-- oc-claude-review -->` and an author check (the `github-actions[bot]` identity). A comment with the marker from any other author is ignored. The bot comment that names the highest run is the summary, and the gate job deletes the others (see "Summary writes"). The author check proves only that some Actions workflow in the repo wrote it, so the summary is never a trust source for the gate. It contains the run ID and attempt, the gate result, every reason with its waivable flag, the head SHA, merge base SHA and base ref it was computed for, the override (if any), prefilter results, coverage, the dependency delta, findings per pass, unverified findings, run cost, and links to the gate check and the workflow run.
+- **Gate check:** the gate job's own check run, which GitHub creates and completes from the job result. Its conclusion is the gate result. No code calls the Checks API, and no job has `checks: write`. Tests showed that a check created through the API with the required name did not clear the merge box on a fork PR, while a job check did (V7, V14).
+- **Order of writes:** inline comments, then the summary, then the exit code. The summary write is the last step that can fail on its own. Every write is preceded by the snapshot check. See "Gate record lifecycle" for partial runs.
 - **Never** approve, request changes, merge, close, label or edit the PR.
 
 ## Auth and cost
@@ -550,7 +533,7 @@ condition (CEL):
 - **Only analyze can mint a token.** Collect and publish have no `id-token` permission. This is how "the GitHub-writing job has no Anthropic credential" holds, because the federation rule cannot tell jobs in the same workflow apart.
 - **No static key fallback.** An org secret is readable by any workflow in every repo that can see it, so a repo writer could copy it or spend it. If federation cannot be made to work (V2, V3), building stops and the auth design is revisited. If a static key is ever used, record that every writer of every target repo can read it.
 - **Workspace:** a dedicated Anthropic workspace with a hard monthly spend limit. When the limit is hit the API returns an error ([rate limits](https://platform.claude.com/docs/en/api/rate-limits)), every pass fails, and the gate fails. That is not waivable.
-- **No per-PR quota in v1.** A real per-PR cap needs an atomic, trusted counter that reserves each attempt before the calls start, including reopens, retries, concurrent runs and runs that fail before publishing. GitHub Actions has no such store, and a count kept in a bot comment is neither atomic nor trusted. v1 relies on the workspace limit. This is an outage boundary, not a quota: one abusive PR can use it up and stop reviews for every PR. Two cheap controls reduce waste without claiming a cap: analyze skips the Claude calls when its run is stale or superseded, and the size gate bounds one run. The response to abuse is the outage process plus closing or locking the PR, or blocking the user. A per-PR quota needs a central service and is a later design.
+- **No per-PR quota in v1.** A real per-PR cap needs an atomic, trusted counter that reserves each attempt before the calls start, including reopens, retries, concurrent runs and runs that fail before publishing. GitHub Actions has no such store, and a count kept in a bot comment is neither atomic nor trusted. v1 relies on the workspace limit. This is an outage boundary, not a quota: one abusive PR can use it up and stop reviews for every PR. Two cheap controls reduce waste without claiming a cap: analyze skips the Claude calls when its run is stale, and the size gate bounds one run. The response to abuse is the outage process plus closing or locking the PR, or blocking the user. A per-PR quota needs a central service and is a later design.
 - **Worst case per run:** three passes, each with all allowed retries and fallback attempts, each with a cold cache write of the bundle and a full `max_tokens` output. Compute this from current list prices before blocking is turned on, and keep the numbers out of this public repo.
 - **Outage process:** when the API, auth or budget fails, every gate fails and merges block. The owner announces it, then either waits, raises the limit, or for urgent merges uses the ruleset bypass (admin only, logged by GitHub). Test this before blocking (V9).
 - **Cost reporting:** the summary comment shows the run cost from `usage`. The publisher also appends one JSON line per run to the workflow summary, so monthly spend can be added up from Actions logs.
@@ -570,14 +553,13 @@ condition (CEL):
     src/oc_review/
       collect.py                          GitHub API + registry lookups -> bundle envelope
       snapshot.py                         comparison pair capture, re-validation, stale checks
-      gate.py                             open-gate, generations, gate record authentication, supersede checks
       prefilter.py                        deterministic checks, coverage
       deps.py                             lockfile and manifest parsing
       render.py                           bundle -> prompt text with nonce delimiters, redaction
       analyze.py                          Messages API calls, one per pass
       envelope.py                         artifact envelope schema and checks
       verdict.py                          citation check, gate reasons, override checks
-      publish.py                          escaping + GitHub comments + gate check
+      publish.py                          escaping + GitHub comments + exit code (the gate)
     prompts/
       system.md                           shared rules, grounding rules, output contract
       review.md, security.md, supply-chain.md
@@ -594,7 +576,7 @@ condition (CEL):
 ## Testing
 
 - **Unit tests (CI on every PR to this repo, no API calls):** prefilter checks, coverage rules, lockfile parsing per supported version, citation check (head and base side, inline eligibility, empty quotes), gate reasons, override checks, envelope checks, sanitizer and escaping, redaction, nonce handling, "every prompt has `<grounding_rules>`", schema validation of good and bad fixtures.
-- **Gate matrix (unit):** every row of the reasons table on its own and in combination, plus: missing pass record, duplicate pass record, extra file, wrong `run_attempt`, digest mismatch, envelope for another PR, each `needs.<job>.result` value (`failure`, `cancelled`, `skipped`), stale head, override with a wrong SHA, edited override, override by the PR author, override by a user with `read`, override against a non-waivable reason, override older than the push epoch, unreadable timeline, several valid overrides, spoofed sticky marker from another author, a bot-authored marker that names an untrusted high generation (ignored, causes no delete), a bot-authored marker that names the current generation but is not the recorded comment ID (ignored), an unauthenticated `oc-claude-review` check, an earlier trusted generation (must not block), a newer trusted generation (must supersede), a summary that names a newer generation, base ref not the default branch, merge base changed.
+- **Gate matrix (unit):** every row of the reasons table on its own and in combination, plus: missing pass record, duplicate pass record, extra file, wrong `run_attempt`, digest mismatch, envelope for another PR, each `needs.<job>.result` value (`failure`, `cancelled`, `skipped`), stale head, override with a wrong SHA, edited override, override by the PR author, override by a user with `read`, override against a non-waivable reason, override older than the push epoch, unreadable timeline, several valid overrides, spoofed sticky marker from another author, a summary that names a higher run or a higher attempt of the same run (not replaced), duplicate bot summaries (lower runs deleted), base ref not the default branch, merge base changed, and the exit code for every gate result (0 only for `pass`).
 - **Fixture evals (manual `eval.yml`, costs money):** bundles with expected outcomes. Run before each prompt or model change and record the results in the PR. Minimum set:
   - clean small refactor -> `pass`, no high findings
   - real bug (`if (user.role = "admin")`) -> verified `bug` finding
@@ -612,41 +594,37 @@ condition (CEL):
 - **Workflow acceptance tests (scratch repo, before pilot):** run each case with the real caller and repo ruleset, and again in phase 2 with the org ruleset:
   - fork PR from a second account, including a draft that later becomes ready
   - push during a run (stale), and two quick pushes (out-of-order publish)
-  - two runs at the same head (re-run plus reopen), with different override states: the newest generation owns the check and the summary
-  - override: fail, then override, then re-run; fail, then override, then reopen; push invalidates; force push A to B to A invalidates; delete before and during publish; approver role removed; non-waivable reason ignores it
+  - two runs at the same head (re-run plus reopen), with different override states: the merge box follows the newest run, and the summary names the highest run
+  - an older run that finishes after a newer run: the merge box keeps the newer run's result
+  - override: fail, then override, then re-run the newest run; fail, then override, then reopen; push invalidates; force push A to B to A invalidates; delete before and during publish; approver role removed; non-waivable reason ignores it
+  - revoke: pass by override, delete the comment, reopen: record how long the earlier pass still shows in the merge box (V20)
   - recovery: fail on a hard block or registry outage, then pass on a later run at the same head
-  - publisher failure at each boundary: before it starts (cancel the job), after inline comments, after the check, after the summary; summary write refused; job fails after the check is `success`
-  - open-gate fails (remove its write scope for one run): publish creates and completes a new `failure` check
-  - open-gate fails in a re-run of an older run (lower `run_id`) after a newer run passed: publish still creates its fallback check, because it started later
-  - open-gate fails while a generation created after this attempt started exists: publish creates no check and exits non-zero
-  - an older generation's check is `success` after the newer open-gate cancelled it: the newer publisher cancels it again before it completes its own check
-  - a newer open-gate cancels an older generation while the older publisher is about to write `success`: the older publisher's re-check sets its check back to `cancelled`
-  - two open-gates at once: one summary remains, with the higher generation
-  - two PRs from one head (one to the default branch, one to another branch): each PR's supersession ignores the other's checks
-  - a release rollout, in both orders (older-release run first, and newer-release run first): the PR blocks until a run of the newer release is the newest generation
+  - gate job failure at each point: cancel it before it starts, after inline comments, after the summary; summary write refused; each must leave the gate check `failure` or `cancelled`
+  - whole run cancelled during collect or analyze: the gate job still runs and fails
+  - two PRs from one head (one to the default branch, one to another branch): the newest run of either PR decides the head's check; a failing run from the other PR can block the default-branch PR until it runs again (liveness only)
   - analyze job cancelled; artifact upload removed; dependency-review failing
-  - fork PR that adds a workflow with a job named `oc-claude-review`
-  - same-repo branch workflow that creates an `oc-claude-review` check (confirms the writer gap)
+  - fork PR from an outside account that adds a `pull_request` workflow with a job whose check is named `review / oc-claude-review` (V8)
+  - same-repo branch workflow with a job whose check is named `review / oc-claude-review` (confirms the writer gap)
   - Dependabot PR
   - PR to a non-default branch that passes review, then is retargeted to the default branch: must stay blocked
   - repeated close and reopen at one head: the cost of each run is visible in the summary
   - PR that was open before the rule existed
-  - phase 2 overlap: caller and ruleset workflow on the same event. Expected: when the caller run is newest, the required run exits non-zero and blocks; a re-run of the required workflow clears it
+  - phase 2 overlap: caller and ruleset workflow on the same event. Expected: each run computes its own result, and neither blocks the other
   - egress in block mode
   - invalid federation rule and an exhausted test budget (outage process)
 - **Live smoke test:** the scratch repo above, before any real repo.
 
 ## Rollout
 
-1. **Verify:** run the phase 1 items in "Verify before building" in a scratch repo. Run V14(e) (the cross-run part) and V17 first, because the gate lifecycle cannot be built without them.
+1. **Verify:** run the phase 1 items in "Verify before building" in a scratch repo. Run V19 (called-workflow job check) and V20 (when the gate check appears) first, because the gate cannot be built without them.
 2. **Admin setup** (Irving, needs org owner): see the checklist below.
 3. **Build** in this repo, with unit tests and the fixture eval passing.
 4. **Acceptance:** the workflow acceptance tests pass in the scratch repo.
 5. **Pilot, advisory:** caller in `back-end` only, no ruleset. Watch false positives for 2 weeks. Measure the egress allowlist and cost per run.
-6. **Pilot, blocking:** V11 (retarget) and V14 (gate record lifecycle) must pass first. Then the repo ruleset on `back-end` requires `oc-claude-review`. Before it goes on, list open PRs and start a run on each (push, or close and reopen), because existing PRs do not start the new check.
+6. **Pilot, blocking:** V8 (forging and fork approval), V11 (retarget) and V21 (re-run suite) must pass first. Then the repo ruleset on `back-end` requires `review / oc-claude-review`. Before it goes on, list open PRs and start a run on each (push, or close and reopen), because existing PRs do not start the new check.
 7. **Expand phase 1:** build the supported repo inventory (see "Supported repos"); add the caller and CODEOWNERS to each supported repo; run advisory for a short period per repo, then add the repo ruleset; start runs on open PRs.
 8. **Phase 2:** run V1 (workflows rule on Team). Use the same inventory. Repos outside it (merge queue, private, Actions off) are never targeted.
-   - If it works: release the central workflow with `pull_request_target`. Create the org ruleset (2a) on a scratch target first and run the overlap test (V15). Then, per repo or in small groups, in this order: add the repo to the org ruleset target list, remove the caller, then list its open PRs and start a run on each (push, or close and reopen), and check that each open PR shows the required workflow as passing or failing on its own result. Removing the caller first means the activation runs have no caller run to race with.
+   - If it works: release the central workflow with `pull_request_target`. Create the org ruleset (2a) on a scratch target first and run the overlap test. Then, per repo or in small groups, in this order: add the repo to the org ruleset target list; in one change, remove the caller and remove `review / oc-claude-review` from the repo ruleset (only the caller produces that check, so a repo ruleset that still requires it blocks every PR); then list its open PRs and start a run on each (push, or close and reopen), and check that each open PR shows the required workflow as passing or failing on its own result.
    - If not: create the org ruleset with the status check rule (2b) for the inventory, and keep the callers. Open PRs already have the check from phase 1. Record the remaining gaps, and decide whether to build the GitHub App check.
 
 ## Admin checklist (Irving)
@@ -656,7 +634,7 @@ condition (CEL):
 - [ ] Also on `.github` main: dismiss stale approvals on push, and require the `test.yml` check.
 - [ ] Anthropic Console: dedicated workspace with a hard monthly spend limit, service account, federation rule as in "Auth and cost". No API key.
 - [ ] Org Actions setting: default `GITHUB_TOKEN` permissions read-only.
-- [ ] Org Actions setting: "Require approval for all external contributors" for fork PR workflows. It does not apply to `pull_request_target`, so the review still runs with no maintainer step (V8).
+- [ ] Org Actions setting: "Require approval for all external contributors" for fork PR workflows. This is the control that stops a fork's own `pull_request` workflow from posting a job check with the gate's name (see the gap table). Maintainers never approve a fork run that adds or changes a workflow file. The review itself runs on `pull_request_target`; tests saw such runs from an org admin's fork start with no approval, and V8 tests an outside contributor.
 - [ ] Org setting: require 2FA for all members. A stolen maintainer account bypasses everything in this design.
 - [ ] Enable Dependabot alerts with npm malware detection on active repos ([changelog](https://github.blog/changelog/2026-03-17-dependabot-now-detects-malware-in-npm-dependencies/)).
 - [ ] Add CODEOWNERS in each active repo for `.github/`, `package.json`, lockfiles, `pyproject.toml`, `Dockerfile`.
@@ -671,27 +649,31 @@ These are assumptions I could not confirm from docs. Each has a concrete test. I
 1. **Workflows rule on Team (phase 2).** No source says whether the "Require workflows to pass before merging" rule works on Team. The [free-pro-team rules page](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets) omits it, the [enterprise-cloud page](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets) has it, and the [REST docs](https://docs.github.com/en/rest/orgs/rules?apiVersion=2022-11-28) list it with no plan note. Test: an org ruleset, enforcement active, targeting only a scratch repo, requiring a central workflow that fails on purpose. Pass when the merge box shows it as required and blocks. Delete the ruleset after.
 2. **OIDC in both modes (phase 1, then phase 2).** Test: in the scratch repo, a fork PR run prints the decoded claims (no token) for the caller mode and the ruleset mode. Pass when `job_workflow_ref`, `job_workflow_sha`, `repository_owner_id` and `event_name` have the expected values, and `job.workflow_sha` equals `job_workflow_sha`.
 3. **Federation rule with list and prefix conditions (phase 1).** Exact claim matching and CEL conditions are documented ([WIF reference](https://platform.claude.com/docs/en/manage-claude/wif-reference)), so the old question "can a rule match `job_workflow_ref`" is answered. Test: first check the intended rule in "Auth and cost" against the WIF reference (field names, where issuer and audience go, CEL syntax for `startsWith` and `in`), and record the final rule text in this spec. Then create it on a test workspace. Pass when it accepts the central workflow and rejects a token from another repo's workflow, from another event and from an unapproved SHA.
-4. **Dependabot PRs (phase 1).** The docs say Dependabot-triggered `pull_request` runs get a read-only token and no Actions secrets, and point to `pull_request_target` as the way around it ([troubleshooting Dependabot](https://docs.github.com/en/code-security/dependabot/troubleshooting-dependabot/troubleshooting-dependabot-on-github-actions)). They say nothing about `id-token`. Test: a Dependabot PR in the scratch repo. Pass when analyze mints a token and publish creates the check run.
+4. **Dependabot PRs (phase 1).** The docs say Dependabot-triggered `pull_request` runs get a read-only token and no Actions secrets, and point to `pull_request_target` as the way around it ([troubleshooting Dependabot](https://docs.github.com/en/code-security/dependabot/troubleshooting-dependabot/troubleshooting-dependabot-on-github-actions)). They say nothing about `id-token`. Test: a Dependabot PR in the scratch repo. Pass when analyze mints a token and the gate job check shows the gate result.
 5. **Mid-conversation system message plus structured output plus server-side fallback** in one request (phase 1). No doc says they conflict or that they work together. Test: one request with all three. If it fails, put the pass instructions in the top-level `system` and accept 3 separate cache entries.
-6. **Re-run of a ruleset-required workflow (phase 2).** A re-run uses the same SHA and ref. Test: in phase 2a, fail the gate, post an override, re-run all jobs. Pass when the merge box turns green for the new attempt. Also, on one head: start run A (older, slowed on purpose) and run B (newer, passing); let A finish last as superseded (non-zero exit). Record which run the merge box uses. If it is A, confirm that re-running B makes B count (see "Phase 2a: which run counts").
-7. **Check run head SHA (phase 1).** `GITHUB_SHA` in `pull_request_target` is the default branch commit ([events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows)). The publisher creates the gate check on the PR head SHA explicitly. Test: the required check shows on the PR and blocks or allows merge as the gate says.
-8. **Forging the gate check (phase 1).** The docs tie the expected source to check runs, and say a required check can be a check or a status ([available rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)). They do not say what happens when two check runs share a name. Tests: (a) a fork PR adds a workflow with a job named `oc-claude-review`; record whether it runs without approval, whether it satisfies the rule alone, and whether a failed real check still blocks; (b) a status `oc-claude-review` set with a personal token does not satisfy the rule; (c) a same-repo branch workflow can create the check (expected yes, the writer gap). Update the gap table with the results.
+6. **Re-run of a ruleset-required workflow (phase 2).** A re-run uses the same SHA and ref. Test: in phase 2a, fail the gate, post an override, re-run all jobs. Pass when the merge box turns green for the new attempt. Also, on one head: start run A (older, slowed on purpose) and run B (newer); let A finish last with a different result. Record which run the merge box uses. Either answer is safe (see "Phase 2a: which run counts"); the result only goes into the operator notes.
+7. **Answered: check run head SHA.** Job checks of a `pull_request_target` run land on the PR head SHA, on fork and same-repo PRs, although `GITHUB_SHA` is the default branch commit ([claude-review-test](https://github.com/OperationCode/claude-review-test), T4). The gate needs no explicit head SHA.
+8. **Forging the gate check and fork approval (phase 1, before blocking).** The docs tie the expected source to check runs, and say a required check can be a check or a status ([available rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)). Use an outside account that is not an org member, with the org setting "Require approval for all external contributors". Tests: (a) a fork PR adds a `pull_request` workflow with a job whose check is named `review / oc-claude-review`; pass when it waits for approval; with approval in the scratch repo, record that it decides the merge box when it is the newest (expected, the reason for the setting); (b) a status `review / oc-claude-review` set with a personal token does not satisfy the rule; (c) a same-repo branch workflow can create the check (expected yes, the writer gap); (d) a fork PR from the same outside account starts the real `pull_request_target` review with no approval click; if it waits, the goal "no maintainer step" fails for outside contributors and the owner decides. Tests so far ran only from an org admin's fork, where `pull_request_target` runs started with no approval ([claude-review-test](https://github.com/OperationCode/claude-review-test), T3). Update the gap table with the results.
 9. **Spend limit behavior (phase 1).** The limit error is documented ([rate limits](https://platform.claude.com/docs/en/api/rate-limits)). Overshoot past the limit and billing of cancelled calls are not. Test: a test workspace with a very small limit. Record the overshoot and that the gate fails closed.
 10. **Egress allowlist (phase 1).** Test: harden-runner in audit mode for a full run, including artifacts, OIDC and `uv sync`. Then block mode with the measured list. Pass when a full run succeeds.
 11. **Retarget (phase 1 before blocking, then phase 2a).** By design a PR into a non-default branch never gets a passing gate, so a retarget to the default branch should stay blocked. Test: open a PR to a staging branch that already holds a change not on the default branch; let the review run; retarget to the default branch. Pass when the merge stays blocked until a push or reopen, and the new review shows the staging change in its diff. In phase 2a, also record whether GitHub reuses or re-runs the required workflow after the retarget.
 12. **Repo-level Actions settings under phase 2a (phase 2).** Test: in the scratch repo, disable Actions or restrict allowed actions. Pass when merges block rather than skip the rule.
 13. **Dependency review on fork PRs (phase 1).** Test: `actions/dependency-review-action` on a `pull_request_target` fork PR with no checkout, with `base-ref` and `head-ref` set to the merge base and head SHAs, and a known vulnerable version. Pass when the job fails.
-14. **Gate record lifecycle (phase 1, before blocking).** GitHub allows several check runs with one name on a commit ([check runs](https://docs.github.com/en/rest/checks/runs)). The docs do not say which one a required check uses. Tests on one head SHA: (a) an older `success` check and a newer `in_progress` check: pass when the merge blocks; (b) an older `failure` and a newer `success`: pass when the merge is allowed; (c) an older `success` completed after a newer `failure` was created: record which one wins; (d) check run IDs increase in creation order; (e) a completed check can be completed again with a new conclusion through the Checks API, where the second write comes from a different workflow run (open-gate's cancel and the publisher's re-check depend on it); the same test from a run of the other mode (caller run and ruleset run) is phase 2, because it needs the org workflows rule (V1); (e2) right after another run creates a check, the check list shows it within seconds; if not, the publisher waits and reads the list again before the re-check; (f) an older `cancelled` check and a newer `success`: pass when the merge is allowed. Open-gate already cancels older generations, so (a) to (c) only matter for the residual race in "Complete, then re-check". If (e) fails, the design must change before blocking.
-15. **Publish concurrency across modes (phase 1, then phase 2).** Test: the job-level group with `cancel-in-progress: false` is accepted in a ruleset-required workflow and in a called workflow, and it serializes a caller run and a ruleset run for the same PR. Record what happens to a cancelled pending publisher's check. Also run the stranding order: C publishes, B (newer) waits as pending, A (older) queues. Pass when B's check stays `in_progress` (blocks), the summary shows the "re-run all jobs" text, and a re-run clears it. In phase 2, run the overlap with both a caller and the org rule: when the caller run is newest, the required run exits non-zero and blocks, and a re-run of the required workflow clears it.
+14. **Answered: which same-name check the merge box uses.** Across check suites, the merge box follows the check in the newest suite that has the name; older failing, cancelled or in-progress checks do not block. Inside one suite, the highest check ID decides. A job check beats an older API-created check of the same name. An API-created check with the required name did not clear the merge box on a fork PR (cause unknown), so the design uses only the job check ([claude-review-test](https://github.com/OperationCode/claude-review-test), T2 to T4). Suite ID and suite creation time were not separated; the design does not depend on which.
+15. **Removed.** Publish concurrency is gone, so there is nothing to test.
 16. **Push epoch events (phase 1).** Test: on a fork PR, push A, force-push B, force-push A again, delete and restore the head branch, retarget, and reset the head branch to an earlier SHA while the PR is closed, then reopen. Pass when the timeline shows `head_ref_force_pushed`, `head_ref_deleted`, `head_ref_restored` and `base_ref_changed` with server times, and an override posted for A before any of these events is rejected. Record what the timeline shows for the reset while closed; if it shows nothing, add `reopened` to the epoch events.
-17. **Authenticating a run (phase 1, then phase 2).** Test: inside open-gate and publish, with the workflow's `GITHUB_TOKEN` and the final permission set (including `actions: read`), read `GET /repos/{owner}/{repo}/actions/runs/{run_id}` for a caller run and a ruleset run. Pass when `referenced_workflows` (caller mode) or `path` (ruleset mode) identify the central workflow and its SHA, and a run from another workflow does not authenticate. Record whether the run's PR number is available; if not, use the `external_id` fallback in "Gate record lifecycle". Also pass when the same call fails without `actions: read`, which confirms the scope is needed.
+17. **Answered: PR number of a run.** The event payload has it in every run. The run API's `pull_requests` list is empty for fork PR runs, also on re-runs and after a wait ([claude-review-test](https://github.com/OperationCode/claude-review-test), T3). The design takes the PR number from the event payload only. Run authentication is gone, so the rest of the old test is moot.
 18. **Fork head objects through the base repo (phase 1).** Test: for a fork PR, read the head commit's tree and blobs through the base repo's git API with the workflow's `GITHUB_TOKEN`. Pass when every object is readable.
+19. **Called-workflow job check as the gate (phase 1, first).** The tests used a job in a workflow that runs directly on `pull_request_target`. Test: the caller (job `review`) calls the central workflow; the gate job `oc-claude-review` has `needs` and `if: always()`. On a fork PR and a same-repo PR, record the exact check name (expected `review / oc-claude-review`). Pass when a repo ruleset that requires that name gives a clean merge box when the gate job succeeds and blocks when it fails, and the check sits on the PR head SHA.
+20. **When the gate check appears (phase 1, first).** Test: on a head whose last run passed, reopen the PR and slow down collect. Record when the new run's gate check appears (at run start as queued, or only when its `needs` finish) and the merge box state meanwhile; this is the length of the "window between runs". Pass when the box blocks while the new gate job is `in_progress` in the newest suite (tests so far showed `in_progress` blocking only inside one suite). Also cancel a run during collect; pass when the gate job still runs and fails.
+21. **Re-run suite (phase 1, before blocking).** Test: two runs A (older) and B (newer) on one head, both passing. Delete the override that let them pass, then "re-run all jobs" on A, then on B. Record whether a re-run's new checks join the run's existing suite or a new suite, and which result the merge box follows after each step. Pass when the box follows B's new attempt after B's re-run. Also record any check that GitHub copies into the suite as `cancelled` during a re-run (seen in the tests). The override and revoke instructions depend on this.
 
 Answered since the last version:
 
 - Skipped runs for drafts: drafts are now reviewed, because ruleset-required workflows run on `opened` for drafts and never see `ready_for_review` ([troubleshooting rules](https://docs.github.com/en/enterprise-cloud@latest/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/troubleshooting-rules)).
 - Checkout SHA: `job.workflow_sha` gives the SHA of the file that defines the job ([contexts](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts)). V2 confirms it in both modes.
 - `labeled` and `ready_for_review` in ruleset-required workflows: they do not start it, so the design no longer uses them (same source).
+- Cross-run check writes (old V14(e) and (e2)): a run can complete or re-complete by ID a check that another run created, and the check list shows a new check at once, on same-repo PRs and in 3 of 4 cases on a fork head ([claude-review-test](https://github.com/OperationCode/claude-review-test), T2, T3). The job-check gate no longer needs either fact.
 
 ## References
 
@@ -769,3 +751,16 @@ Round 5: final text pass. Most items were wording and tests. Two rules changed a
 
 - R5-G3. A forged marker can name the current generation: **accept**. Open-gate records its summary comment ID in the gate check output, and publish and readers use only that comment.
 - R5-G4. Fallback check ordered re-runs by run ID: **accept**. "Later" now means a generation whose check was created after this run attempt started, so a re-run of an older run still creates its fallback check and a revoke still works.
+
+Platform tests: decisions from the test rounds T2 (same-repo), T3 (fork PR) and T4 (job check as the gate) in [claude-review-test](https://github.com/OperationCode/claude-review-test), 2026-10-24 and 2026-10-25. Where a T- line changes an earlier line, the T- line wins.
+
+- T-1. The gate is the gate job's own check: an API-created check with the required name did not clear the merge box on a fork PR, while a job check gave clean on success and blocked on failure on fork and same-repo PRs. The API-created gate check, the open-gate job and `checks: write` are removed; the required name is `review / oc-claude-review` (V19 confirms the string).
+- T-2. Generations removed: the merge box follows the check in the newest suite with that name, so a newer run replaces an older result by itself. Generation numbers, `external_id`, cross-run cancels, the re-check after the final write, the open-gate fallback check and the generation field in the envelope are removed. Fail closed still holds: only an exit 0 of the gate job makes the check `success`.
+- T-3. Gate record authentication removed: an older foreign check never decides the merge box, and a newer one decides it whatever the publisher does, so the check added nothing. The "untrusted check" reason, the approved-SHA list for runs and `actions: read` are removed. Against outsiders the gate now rests on the fork approval setting (V8); against writers nothing changed.
+- T-4. Publish concurrency group removed: runs no longer share a check, so nothing needs serializing, and the stranding order goes away (old V15).
+- T-5. Superseded skip in analyze removed: a newer run's gate check appears only late, so analyze cannot see it. Analyze keeps the stale check and drops `checks: read`, and gets `pull-requests: read` to read the PR state. A run on a superseded event now pays for its Claude calls.
+- T-6. PR number from the event payload only: the run API's `pull_requests` list is empty for fork PR runs.
+- T-7. Phase 2a: the supersede exit rule and the overlap race are removed, because runs no longer touch each other. Rollout step 8 removes the caller and the repo ruleset's required check in one step. The OIDC-signed record option is dropped, because there are no records to authenticate.
+- T-8. Guarantee changed, revoke timing: a revoke or a role removal on an unchanged head takes effect when the new run's gate check appears, not at once (V20 measures the window). New heads are not affected.
+- T-9. Guarantee changed, summary: the summary can no longer be ordered after the check, so a job that fails after the summary write can leave a `pass` summary next to a failed check, and a repo writer can hide summaries with a forged bot marker. The summary was never a trust source.
+- T-10. Verify list: V7, V14 and V17 answered from the tests, V15 removed, V6 narrowed, V8 extended to outside contributors, and V19 to V21 added for what the job-check gate still depends on.
