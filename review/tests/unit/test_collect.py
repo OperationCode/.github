@@ -6,6 +6,7 @@ import base64
 import json
 import random
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -963,3 +964,214 @@ def test_base_symlink_or_gitlink_lockfile_counts_as_absent():
     for base in (("120000", "other.json"), ("160000", GITLINK)):
         col, _, _ = run(_snapshot({"package-lock.json": base}, {"package-lock.json": ("100644", EMPTY_LOCK)}))
         assert _dep_blocks(col) == set()
+
+
+def test_rename_to_another_family_does_not_parse_the_base():
+    # The base of another family is ignored, so it gives no base signal.
+    sha = prefilter.git_blob_sha(b"")
+    change = c.ChangedFile("requirements.txt", "renamed", "package-lock.json", sha, sha, "100644", "100644")
+    facts = c.dependency_facts(c.TreeDiff((change,), True), {sha: b""}, fetch=RegistryReplay({}))
+    assert facts.base_failures == ()
+    assert facts.failures == ()
+    assert facts.parsed_paths == {"requirements.txt"}
+
+
+# ---------------------------------------------------------------- registry lookup limits (R-LOOKUPS)
+
+
+class FakeClock:
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class CountingFetch:
+    """Registry fetch with a packument for every npm name; records each call."""
+
+    def __init__(self, clock: FakeClock | None = None, step: float = 0.0) -> None:
+        self.clock, self.step = clock, step
+        self.calls: list[tuple[str, float]] = []
+        self.lock = threading.Lock()
+
+    def __call__(self, url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        with self.lock:
+            self.calls.append((url, timeout))
+            if self.clock is not None:
+                self.clock.now += self.step
+        name = url.rsplit("/", 1)[1]
+        doc = {"name": name, "time": {}, "versions": {}}
+        for v in ("1.0.0", "2.0.0"):
+            doc["time"][v] = "2018-01-01T00:00:00.000Z"
+            doc["versions"][v] = {"name": name, "version": v}
+        return deps.FetchResult(200, json.dumps(doc).encode(), url)
+
+    def urls(self) -> list[str]:
+        return [u for u, _ in self.calls]
+
+
+def _keys(*names: str, version: str = "1.0.0") -> list[tuple[str, str, str]]:
+    return [("npm", n, version) for n in names]
+
+
+def _no_sleep(seconds: float) -> None:
+    raise AssertionError("no retry expected")
+
+
+def test_lookup_limit_constants():
+    # Spec "Dependency delta" and K-11: well under the 10-minute job timeout.
+    assert c.REGISTRY_LOOKUP_CONCURRENCY == 8
+    assert c.REGISTRY_LOOKUP_BUDGET_SECONDS == 240.0
+    assert c.MAX_REGISTRY_LOOKUPS == 3000
+    assert c.REGISTRY_LOOKUP_BUDGET_SECONDS <= 600 * 0.4
+
+
+def test_lookup_budget_fails_every_remaining_key():
+    clock = FakeClock()
+    fetch = CountingFetch(clock, step=115.0)
+    registry, failed = c.lookup_registry(
+        _keys("a", "b", "c", "d", "e"), fetch=fetch, sleep=_no_sleep, clock=clock, concurrency=1
+    )
+    # a: 0 -> 115, b: 115 -> 230, c starts with 10 s left; d and e start after the deadline.
+    assert sorted(k[1] for k in registry) == ["a", "b", "c"]
+    assert failed == {k: c.LOOKUP_BUDGET_EXCEEDED for k in _keys("d", "e")}
+    assert fetch.calls == [
+        ("https://registry.npmjs.org/a", 20.0),
+        ("https://registry.npmjs.org/b", 20.0),
+        ("https://registry.npmjs.org/c", 10.0),
+    ]
+
+
+def test_lookup_retry_past_the_deadline_is_not_taken():
+    clock = FakeClock()
+    slept: list[float] = []
+
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        clock.now = c.REGISTRY_LOOKUP_BUDGET_SECONDS - 0.2
+        return deps.FetchResult(503, b"", url)
+
+    registry, failed = c.lookup_registry(_keys("a"), fetch=fetch, sleep=slept.append, clock=clock)
+    assert registry == {}
+    assert failed == {("npm", "a", "1.0.0"): c.LOOKUP_BUDGET_EXCEEDED}
+    assert slept == []
+
+
+def test_lookup_budget_does_not_wait_for_a_hung_lookup():
+    clock = FakeClock()
+    started, release = threading.Event(), threading.Event()
+
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        if url.endswith("/slow"):
+            clock.now = c.REGISTRY_LOOKUP_BUDGET_SECONDS + 1
+            started.set()
+            release.wait(10)
+            return deps.FetchResult(404, b"", url)
+        started.wait(10)
+        return deps.FetchResult(404, b"", url)
+
+    try:
+        _, failed = c.lookup_registry(_keys("a", "slow"), fetch=fetch, sleep=_no_sleep, clock=clock, concurrency=2)
+        assert not release.is_set()  # returned while the slow lookup still runs
+    finally:
+        release.set()
+    assert failed[("npm", "slow", "1.0.0")] == c.LOOKUP_BUDGET_EXCEEDED
+    assert failed[("npm", "a", "1.0.0")] in (c.LOOKUP_FAILED, c.LOOKUP_BUDGET_EXCEEDED)
+
+
+@pytest.mark.parametrize("n", [3, 4])
+def test_lookup_count_cap_boundary(n):
+    keys = _keys(*(f"p{i}" for i in range(n)))
+    fetch = CountingFetch()
+    registry, failed = c.lookup_registry(keys, fetch=fetch, sleep=_no_sleep, clock=FakeClock(), max_lookups=3)
+    assert sorted(registry) == sorted(keys)[:3]
+    assert failed == ({} if n == 3 else {("npm", "p3", "1.0.0"): c.LOOKUP_COUNT_CAP})
+    assert len(fetch.calls) == 3
+
+
+@pytest.mark.parametrize("n,reason", [(3, None), (4, "registry lookup failed: over the lookup count cap")])
+def test_lookup_count_cap_is_a_file_failure(n, reason):
+    data = _v3_lock(*((f"p{i}", "1.0.0") for i in range(n))).encode()
+    sha = prefilter.git_blob_sha(data)
+    change = c.ChangedFile("package-lock.json", "added", None, None, sha, None, "100644")
+    facts = c.dependency_facts(
+        c.TreeDiff((change,), True), {sha: data}, fetch=CountingFetch(), sleep=_no_sleep, clock=FakeClock(), max_lookups=3
+    )
+    assert [(f.path, f.reason) for f in facts.failures] == ([] if reason is None else [("package-lock.json", reason)])
+    result = prefilter.run_prefilter(
+        c.TreeDiff((change,), True), {sha: data}, head_paths=frozenset({"package-lock.json"}),
+        now=datetime.fromisoformat("2026-10-25T00:00:00+00:00"), dependencies=facts,
+        author_association=None, pr_title="t", pr_body="",
+    )
+    blocks = {h.detail for h in result.hard_blocks if h.id == prefilter.INCOMPLETE_DEP_DATA}
+    if reason is None:
+        assert blocks == set()
+    else:
+        assert f"dependency data incomplete: {reason}" in blocks
+
+
+def test_lookups_are_deduplicated_before_they_start():
+    fetch = CountingFetch()
+    keys = _keys("a", "a", "b") + _keys("a", version="2.0.0") + _keys("b")
+    registry, failed = c.lookup_registry(keys, fetch=fetch, sleep=_no_sleep, clock=FakeClock(), max_lookups=3)
+    # Three unique keys fit the cap of 3; two versions of `a` fetch it once.
+    assert failed == {}
+    assert sorted(registry) == [("npm", "a", "1.0.0"), ("npm", "a", "2.0.0"), ("npm", "b", "1.0.0")]
+    assert sorted(fetch.urls()) == ["https://registry.npmjs.org/a", "https://registry.npmjs.org/b"]
+
+
+def test_same_version_in_two_files_is_looked_up_once():
+    lock = _v3_lock(("left-pad", "1.3.0"))
+    fx = _snapshot({}, {"package-lock.json": ("100644", lock), "sub/package-lock.json": ("100644", lock)})
+    fx["registry"] = OLD_PACKUMENTS
+    col, _, registry = run(fx)
+    assert registry.urls == ["https://registry.npmjs.org/left-pad"]
+    assert _dep_blocks(col) == set()
+
+
+@pytest.mark.parametrize("limit", [1, 8])
+def test_lookup_concurrency_limit_is_respected(limit):
+    lock = threading.Lock()
+    active = peak = 0
+    # The barrier releases only when `limit` fetches run at once, so the
+    # peak shows the limit is reached; a larger pool would push it higher.
+    barrier = threading.Barrier(limit, timeout=10)
+
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            barrier.wait()
+        finally:
+            with lock:
+                active -= 1
+        return deps.FetchResult(404, b"", url)
+
+    names = [f"p{i:02d}" for i in range(2 * limit)]
+    _, failed = c.lookup_registry(_keys(*names), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=limit)
+    assert peak == limit
+    assert set(failed.values()) == {c.LOOKUP_FAILED}
+
+
+def test_lookup_budget_hit_is_a_hard_block_and_the_bundle_is_written(tmp_path):
+    # The clock is past the deadline from the first check, so no lookup runs.
+    ticks = iter([0.0])
+
+    def clock() -> float:
+        return next(ticks, c.REGISTRY_LOOKUP_BUDGET_SECONDS + 1)
+
+    col, _, registry = run(_migration(), registry_clock=clock)
+    assert registry.urls == []
+    assert col.envelope["status"] == "ok"
+    assert _dep_blocks(col) == {
+        ("package-lock.json", "dependency data incomplete: registry lookup failed: lookup time budget exceeded"),
+        ("package-lock.json", "no registry data for a new version"),
+    }
+    assert col.envelope["payload"]["dependency_delta"]["failures"] == [
+        {"path": "package-lock.json", "reason": c.LOOKUP_BUDGET_EXCEEDED}
+    ]
+    path = c.write_bundle(col, tmp_path)
+    assert path.read_bytes() == col.data
+    envelope.validate_envelope(envelope.parse_json(path.read_bytes()))

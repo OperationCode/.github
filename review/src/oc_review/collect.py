@@ -36,11 +36,13 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -78,6 +80,24 @@ RETRIES = 2
 # Blob reads per run. The job token has a small hourly request budget per
 # repo; past this cap a blob counts as unreadable (coverage `unavailable`).
 MAX_BLOB_READS = 500
+
+# Registry lookups per run (ruling R-LOOKUPS, K-11). A large lockfile, or a
+# migration whose base counts as empty (K-10), can need thousands of
+# lookups; done one by one they outlast the 10-minute job timeout, and the
+# run fails with no bundle and no reason. Lookups go to the two fixed
+# registry hosts only, at most this many at once.
+REGISTRY_LOOKUP_CONCURRENCY = 8
+# Wall-clock budget for all lookups of a run, well under the job timeout so
+# collect still writes the bundle. A key with no result by then fails.
+REGISTRY_LOOKUP_BUDGET_SECONDS = 240.0
+# Unique keys looked up per run; past the cap a key fails without a lookup.
+MAX_REGISTRY_LOOKUPS = 3000
+# Fixed failure reasons ("incomplete dependency data"), in the order a file
+# with several picks its one reason.
+LOOKUP_BUDGET_EXCEEDED = "registry lookup failed: lookup time budget exceeded"
+LOOKUP_COUNT_CAP = "registry lookup failed: over the lookup count cap"
+LOOKUP_FAILED = "registry lookup failed"
+_LOOKUP_REASON_ORDER = (LOOKUP_BUDGET_EXCEEDED, LOOKUP_COUNT_CAP, LOOKUP_FAILED)
 
 SIZE_GATE_TOKENS = 150_000
 CHARS_PER_TOKEN = 4
@@ -606,7 +626,8 @@ def _failure_reason(exc: deps.DepsError) -> str:
 
 class _LastUrlCache:
     """Remembers the last successful registry response, so several versions
-    of one package fetch its packument once (lookups run sorted by name)."""
+    of one package fetch its packument once (one group's lookups run in
+    version order on one thread)."""
 
     def __init__(self, fetch: deps.Fetcher) -> None:
         self._fetch = fetch
@@ -620,12 +641,106 @@ class _LastUrlCache:
         return result
 
 
+RegistryKey = tuple[str, str, str]
+
+
+class _BudgetSpent(deps.RegistryError):
+    """No time is left in the run's lookup budget for a fetch or a retry."""
+
+
+def lookup_registry(
+    keys: Iterable[RegistryKey],
+    *,
+    fetch: deps.Fetcher = deps.default_fetch,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    budget_seconds: float = REGISTRY_LOOKUP_BUDGET_SECONDS,
+    concurrency: int = REGISTRY_LOOKUP_CONCURRENCY,
+    max_lookups: int = MAX_REGISTRY_LOOKUPS,
+) -> tuple[dict[RegistryKey, deps.RegistryInfo], dict[RegistryKey, str]]:
+    """Registry data by key, and a fixed failure reason by key for every key
+    that has no data (ruling R-LOOKUPS, K-11).
+
+    Keys are deduplicated and sorted before any lookup starts. Keys past
+    `max_lookups` are not looked up. The versions of one package run in
+    order on one worker, so its packument is fetched once; at most
+    `concurrency` packages run at once. Every lookup must finish within
+    `budget_seconds` of the start: a fetch never gets more time than is left,
+    no fetch or retry starts after the deadline, and a key with no result at
+    the deadline fails. Collect does not wait for a lookup past the deadline.
+    """
+    unique = sorted(set(keys))
+    failed = {key: LOOKUP_COUNT_CAP for key in unique[max_lookups:]}
+    groups: dict[tuple[str, str], list[RegistryKey]] = {}
+    for key in unique[:max_lookups]:
+        groups.setdefault(key[:2], []).append(key)
+    deadline = clock() + budget_seconds
+    lock = threading.Lock()
+    results: dict[RegistryKey, deps.RegistryInfo | str] = {}
+
+    def remaining() -> float:
+        return deadline - clock()
+
+    def bounded_fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        left = remaining()
+        if left <= 0:
+            raise _BudgetSpent("lookup time budget exceeded")
+        return fetch(url, max_bytes, min(timeout, left))
+
+    def bounded_sleep(seconds: float) -> None:
+        if seconds >= remaining():
+            raise _BudgetSpent("lookup time budget exceeded")
+        sleep(seconds)
+
+    def run_group(group: list[RegistryKey]) -> None:
+        cached = _LastUrlCache(bounded_fetch)
+        for key in group:
+            ecosystem, name, version = key
+            lookup = deps.lookup_npm if ecosystem == "npm" else deps.lookup_pypi
+            result: deps.RegistryInfo | str
+            try:
+                result = lookup(name, version, cached, sleep=bounded_sleep)
+            except _BudgetSpent:
+                result = LOOKUP_BUDGET_EXCEEDED
+            except deps.DepsError:
+                result = LOOKUP_BUDGET_EXCEEDED if remaining() <= 0 else LOOKUP_FAILED
+            with lock:
+                results[key] = result
+
+    pool = ThreadPoolExecutor(max_workers=max(1, concurrency), thread_name_prefix="registry-lookup")
+    try:
+        pending = {pool.submit(run_group, group) for group in groups.values()}
+        while pending and (left := remaining()) > 0:
+            done, pending = wait(pending, timeout=left, return_when=FIRST_COMPLETED)
+            for future in done:
+                future.result()  # an unexpected error fails collect, as before
+    finally:
+        # Queued groups never start; running ones stop at their next fetch or
+        # retry, because the budget is spent.
+        pool.shutdown(wait=False, cancel_futures=True)
+        with lock:
+            final = dict(results)
+    registry: dict[RegistryKey, deps.RegistryInfo] = {}
+    for group in groups.values():
+        for key in group:
+            found = final.get(key)
+            if isinstance(found, deps.RegistryInfo):
+                registry[key] = found
+            else:
+                failed[key] = found if found is not None else LOOKUP_BUDGET_EXCEEDED
+    return registry, failed
+
+
 def dependency_facts(
     diff: TreeDiff,
     blobs: Mapping[str, bytes | None],
     *,
     fetch: deps.Fetcher = deps.default_fetch,
     sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    budget_seconds: float = REGISTRY_LOOKUP_BUDGET_SECONDS,
+    concurrency: int = REGISTRY_LOOKUP_CONCURRENCY,
+    max_lookups: int = MAX_REGISTRY_LOOKUPS,
 ) -> prefilter.DependencyFacts:
     """Parse each changed supported file at the merge base and the head, and
     look up every new exact registry version (`prefilter.registry_key`).
@@ -637,6 +752,9 @@ def dependency_facts(
     is only a signal (`base_failures`). A base blob that was not read is still
     a `DepFailure`. A file gets at most one `DepFailure`. A base symlink or
     gitlink holds no dependency data, so it counts as absent with no failure.
+    A rename to another dependency family ignores the base, so the base is
+    not parsed. A key with no registry data (`lookup_registry`: failed, over
+    the count cap or past the time budget) is a `DepFailure` for its file.
     """
     parsed: set[str] = set()
     changes: list[deps.PackageChange] = []
@@ -658,7 +776,15 @@ def dependency_facts(
             else:
                 parsed.add(c.path)
         old: deps.ParsedDeps | None = None
-        if base_family is not None and c.base_sha is not None and c.base_mode not in (MODE_SUBMODULE, MODE_SYMLINK):
+        # A base of another family counts as absent; a rename to a path that
+        # is not a dependency file is a delete.
+        base_ignored = family is not None and base_family != family
+        if (
+            base_family is not None
+            and not base_ignored
+            and c.base_sha is not None
+            and c.base_mode not in (MODE_SUBMODULE, MODE_SYMLINK)
+        ):
             try:
                 old = _parse_side(base_path, c.base_mode, blobs.get(c.base_sha))
             except deps.DepsError as exc:
@@ -669,29 +795,31 @@ def dependency_facts(
                     failures.append(failure)
         if new is None:
             continue
-        if base_family != family:
-            old = None
         changes.extend(deps.compute_delta(old, new))
         old_sources = {s.normalized for s in old.global_sources} if old is not None else set()
         new_sources.extend(
             deps.SourceIssue(c.path, None, None, s) for s in new.global_sources if s.normalized not in old_sources
         )
 
-    registry: dict[tuple[str, str, str], deps.RegistryInfo] = {}
-    failed_keys: set[tuple[str, str, str]] = set()
-    cached = _LastUrlCache(fetch)
-    keys = sorted({k for ch in changes if (k := prefilter.registry_key(ch)) is not None})
-    for key in keys:
-        ecosystem, name, version = key
-        lookup = deps.lookup_npm if ecosystem == "npm" else deps.lookup_pypi
-        try:
-            registry[key] = lookup(name, version, cached, sleep=sleep)
-        except deps.DepsError:
-            failed_keys.add(key)
-    # One fixed reason per file; the delta shows which entries have no
-    # registry data.
-    for path in sorted({ch.path for ch in changes if prefilter.registry_key(ch) in failed_keys}):
-        failures.append(prefilter.DepFailure(path, "registry lookup failed"))
+    registry, failed_keys = lookup_registry(
+        (k for ch in changes if (k := prefilter.registry_key(ch)) is not None),
+        fetch=fetch,
+        sleep=sleep,
+        clock=clock,
+        budget_seconds=budget_seconds,
+        concurrency=concurrency,
+        max_lookups=max_lookups,
+    )
+    # One fixed reason per file, the run-limit reason first; the delta shows
+    # which entries have no registry data.
+    reasons: dict[str, set[str]] = {}
+    for ch in changes:
+        key = prefilter.registry_key(ch)
+        if key is not None and key in failed_keys:
+            reasons.setdefault(ch.path, set()).add(failed_keys[key])
+    for path in sorted(reasons):
+        reason = next(r for r in _LOOKUP_REASON_ORDER if r in reasons[path])
+        failures.append(prefilter.DepFailure(path, reason))
     return prefilter.DependencyFacts(
         parsed_paths=frozenset(parsed),
         changes=tuple(changes),
@@ -878,6 +1006,7 @@ def collect(
     now: datetime,
     registry_fetch: deps.Fetcher = deps.default_fetch,
     registry_sleep: Callable[[float], None] = time.sleep,
+    registry_clock: Callable[[], float] = time.monotonic,
     max_blob_bytes: int = prefilter.MAX_BLOB_BYTES,
     max_blob_reads: int = MAX_BLOB_READS,
     size_gate_tokens: int = SIZE_GATE_TOKENS,
@@ -959,7 +1088,7 @@ def collect(
         max_blob_bytes=max_blob_bytes, max_reads=max_blob_reads,
     )
 
-    facts = dependency_facts(diff, blobs, fetch=registry_fetch, sleep=registry_sleep)
+    facts = dependency_facts(diff, blobs, fetch=registry_fetch, sleep=registry_sleep, clock=registry_clock)
     pr_meta = _pr_payload(pr, event)
     result = prefilter.run_prefilter(
         diff,
