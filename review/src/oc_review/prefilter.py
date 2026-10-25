@@ -41,6 +41,15 @@ MAX_BLOB_BYTES = 16 * 1024 * 1024
 # A blob is binary when its first bytes hold a NUL and it is not valid UTF-8
 # (the same window git uses to call a file binary).
 BINARY_SNIFF_BYTES = 8000
+# Ruling R-BIN: such a blob counts as binary only when its path has one of
+# these extensions (images, fonts, archives, compiled objects). Any other path
+# gets coverage `unavailable`, so binary bytes cannot hide source text.
+BINARY_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".tif", ".tiff", ".avif",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".zip", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".tar", ".jar",
+    ".o", ".a", ".so", ".dylib", ".dll", ".exe", ".class", ".pyc", ".wasm",
+})
 # Line numbers kept per check and file; `count` keeps the full total.
 MAX_LINES_PER_CHECK = 20
 # A package version published less than this long ago is a hard block.
@@ -312,14 +321,26 @@ def _declared_codec(data: bytes) -> str | None:
     return None
 
 
-def scan_blob(data: bytes | None, *, sha: str | None = None, cap: int = MAX_BLOB_BYTES) -> BlobScan:
+def has_binary_extension(path: str | None) -> bool:
+    """True when the file name ends in one of `BINARY_EXTENSIONS` (any case)."""
+    if not path:
+        return False
+    name = path.rsplit("/", 1)[-1].lower()
+    return any(name.endswith(ext) for ext in BINARY_EXTENSIONS)
+
+
+def scan_blob(
+    data: bytes | None, *, sha: str | None = None, cap: int = MAX_BLOB_BYTES, path: str | None = None
+) -> BlobScan:
     """Classify one blob as `full` text, `binary` or `unavailable`.
 
     Text is strict UTF-8 (a leading UTF-8 BOM is kept as U+FEFF). NUL bytes are
     allowed in text, so a NUL cannot hide a valid UTF-8 file from the scan. A
     blob over the cap is `unavailable` whatever its bytes: the spec allows no
     binary exception, and a NUL must not turn an over-cap text file into a
-    signal.
+    signal. A blob that looks binary is `binary` only when `path` has a known
+    binary extension (ruling R-BIN); otherwise, or with no path, it is
+    `unavailable`.
     """
     if data is None:
         return BlobScan("unavailable", reason="unreadable")
@@ -333,7 +354,11 @@ def scan_blob(data: bytes | None, *, sha: str | None = None, cap: int = MAX_BLOB
     try:
         text = data.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
-        return BlobScan("binary") if has_nul else BlobScan("unavailable", reason="undecodable")
+        if not has_nul:
+            return BlobScan("unavailable", reason="undecodable")
+        if not has_binary_extension(path):
+            return BlobScan("unavailable", reason="binary-content-unknown-extension")
+        return BlobScan("binary")
     if data.count(0) * 4 > len(data):
         # Valid UTF-8 but mostly NUL: UTF-16 or UTF-32 text without a BOM.
         return BlobScan("unavailable", reason="nul-heavy")
@@ -983,12 +1008,15 @@ def run_prefilter(
         if change.base_sha is not None:
             base = (
                 _GITLINK if change.base_mode == MODE_SUBMODULE
-                else scan_blob(blobs.get(change.base_sha), sha=change.base_sha, cap=max_blob_bytes)
+                else scan_blob(
+                    blobs.get(change.base_sha), sha=change.base_sha, cap=max_blob_bytes,
+                    path=change.old_path or change.path,
+                )
             )
         if change.head_sha is not None:
             head = (
                 _GITLINK if change.head_mode == MODE_SUBMODULE
-                else scan_blob(blobs.get(change.head_sha), sha=change.head_sha, cap=max_blob_bytes)
+                else scan_blob(blobs.get(change.head_sha), sha=change.head_sha, cap=max_blob_bytes, path=change.path)
             )
         if all(s.reason not in ("unreadable", "sha-mismatch") for s in (base, head) if s is not None):
             collected += 1

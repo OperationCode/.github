@@ -103,7 +103,7 @@ class TestScanBlob:
         assert (s.kind, s.text) == ("full", "héllo\n")
 
     def test_png_is_binary(self):
-        assert pf.scan_blob(PNG).kind == "binary"
+        assert pf.scan_blob(PNG, path="img/logo.png").kind == "binary"
 
     def test_none_is_unavailable(self):
         assert pf.scan_blob(None) == pf.BlobScan("unavailable", reason="unreadable")
@@ -158,7 +158,24 @@ class TestScanBlob:
         assert s.kind == "full" and "‮" in s.text
 
     def test_invalid_utf8_with_nul_is_binary(self):
-        assert pf.scan_blob(b"\x00\xff\xfe\xfd").kind == "binary"
+        assert pf.scan_blob(b"\x00\xff\xfe\xfd", path="lib/x.so").kind == "binary"
+
+    # Ruling R-BIN: binary bytes count as binary only for a known binary
+    # extension. Any other path is `unavailable` (hard block).
+    @pytest.mark.parametrize("path", ["a.js", "src/x.py", "README", "logo.png.js", "x.svg", None])
+    def test_binary_bytes_without_binary_extension_are_unavailable(self, path):
+        s = pf.scan_blob(PNG, path=path)
+        assert s == pf.BlobScan("unavailable", reason="binary-content-unknown-extension")
+
+    @pytest.mark.parametrize("path", ["a.PNG", "fonts/x.woff2", "dist/app.wasm", "lib/A.class", "x.tar.gz"])
+    def test_binary_extension_any_case(self, path):
+        assert pf.scan_blob(PNG, path=path).kind == "binary"
+
+    def test_binary_extension_list_is_short_and_explicit(self):
+        assert len(pf.BINARY_EXTENSIONS) <= 40
+        assert all(e.startswith(".") and e == e.lower() for e in pf.BINARY_EXTENSIONS)
+        for text_ext in (".js", ".py", ".ts", ".sh", ".json", ".yml", ".md", ".txt", ".svg", ".html", ".bin"):
+            assert text_ext not in pf.BINARY_EXTENSIONS
 
     def test_utf8_bom_kept_as_feff(self):
         s = pf.scan_blob(b"\xef\xbb\xbfx\n")
@@ -1016,7 +1033,29 @@ class TestFileKinds:
         assert not checks(run(change("img/logo.png", PNG + b"\x00", PNG)), pf.BINARY_ADDED)
 
     def test_text_became_binary(self):
-        assert checks(run(change("a.js", b"\x00\xff" + b"x" * 10, "x\n")), pf.BINARY_ADDED)
+        assert checks(run(change("a.png", b"\x00\xff" + b"x" * 10, "x\n")), pf.BINARY_ADDED)
+
+    def test_source_file_with_binary_bytes_hard_blocks(self):
+        # Ruling R-BIN: a .js file with one NUL and one invalid byte is not
+        # "binary"; its text would go unscanned, so coverage is unavailable.
+        data = b"/*\x00\xff*/ var a = '\xe2\x80\xae';\n"
+        r = run(change("a.js", data, "x\n"))
+        assert r.coverage.files[0] == pf.FileCoverage("a.js", "unavailable", "binary-content-unknown-extension")
+        assert pf.INCOMPLETE_COVERAGE in hard(r)
+        assert not checks(r, pf.BINARY_ADDED)
+
+    def test_rename_binary_to_source_extension_hard_blocks(self):
+        # Same blob, renamed from a binary extension to a source extension:
+        # each side is judged by its own path.
+        sha = pf.git_blob_sha(PNG)
+        cf = ChangedFile("x.js", "renamed", "x.png", sha, sha, "100644", "100644")
+        r = run((cf, {sha: PNG}))
+        assert r.coverage.files[0].reason == "binary-content-unknown-extension"
+        assert pf.INCOMPLETE_COVERAGE in hard(r)
+
+    def test_removed_binary_uses_its_base_path(self):
+        r = run(change("img/old.png", None, PNG))
+        assert r.coverage.files[0].coverage == "binary" and r.coverage.complete
 
     def test_text_file_is_not_binary(self):
         assert not checks(run(change("a.js", "x\n")), pf.BINARY_ADDED)
