@@ -59,7 +59,7 @@ wheels = [
 [[package]]
 name = "oc-review"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "jsonschema" },
     { name = "pyyaml" },
