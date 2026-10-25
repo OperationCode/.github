@@ -362,6 +362,15 @@ def test_duplicate_path_fails_closed():
         s.diff_trees(tree(entry("a", "1" * 40), entry("a", "2" * 40)), tree())
 
 
+@pytest.mark.parametrize("side", ["base", "head"])
+def test_missing_truncated_key_fails_closed(side):
+    # A response with no `truncated` key must not count as a complete tree.
+    no_flag = {"sha": "d" * 40, "tree": [entry("a", "1" * 40)]}
+    args = (no_flag, tree()) if side == "base" else (tree(), no_flag)
+    with pytest.raises(s.SnapshotError, match="truncated"):
+        s.diff_trees(*args)
+
+
 def test_missing_tree_key_fails_closed():
     with pytest.raises(s.SnapshotError):
         s.diff_trees({"truncated": False}, tree())

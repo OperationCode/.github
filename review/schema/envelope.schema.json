@@ -43,6 +43,17 @@
         "then": { "properties": { "payload": { "type": "object" } } },
         "else": { "properties": { "payload": { "type": "null" } } }
       }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "bundle" }, "status": { "const": "skipped-size" } },
+        "required": ["kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "payload": { "propertyNames": { "enum": ["prefilter", "coverage", "dependency_delta", "size"] } }
+        }
+      }
     }
   ],
   "$defs": {

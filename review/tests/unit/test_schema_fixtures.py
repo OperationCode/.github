@@ -53,6 +53,7 @@ ENVELOPE_BAD = {
     "bad-bundle-missing-hard-blocks": "payload/prefilter: [required] 'hard_blocks'",
     "bad-bundle-missing-prefilter": "payload: [required] 'prefilter'",
     "bad-bundle-skipped-size-null-payload": "payload: [type]",
+    "bad-bundle-skipped-size-with-files": "payload: [enum] 'files' is not one of",
     "bad-bundle-with-pass": "envelope schema: <root>: [not]",
     "bad-empty-base-ref": "base_ref: [minLength]",
     "bad-extra-property": "<root>: [additionalProperties]",

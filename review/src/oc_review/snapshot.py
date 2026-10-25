@@ -246,7 +246,9 @@ def _entries(tree: Mapping[str, Any], side: str) -> tuple[dict[str, tuple[str, s
     items = _get(tree, "tree", what=f"{side} tree entries")
     if not isinstance(items, list):
         raise SnapshotError(f"{side} tree entries are not a list")
-    truncated = tree.get("truncated", False)
+    # A response with no `truncated` key fails closed: a default of False
+    # would drop the "incomplete coverage" hard block.
+    truncated = _get(tree, "truncated", what=f"{side} tree truncated flag")
     if not isinstance(truncated, bool):
         raise SnapshotError(f"{side} tree truncated flag is not a boolean")
     out: dict[str, tuple[str, str, str]] = {}

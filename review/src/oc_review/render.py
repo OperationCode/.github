@@ -259,10 +259,16 @@ def _assignment_kind(name: str) -> str:
 def _value_spans(text: str) -> list[tuple[str, int, int]]:
     """(kind, start, end) of values after credential names and auth schemes."""
     found = []
-    for m in _ASSIGNMENT.finditer(text):
+    pos = 0
+    while (m := _ASSIGNMENT.search(text, pos)) is not None:
         group = "qv" if m.group("qv") is not None else "uv"
         if _secret_like(m.group(group), quoted=group == "qv"):
             found.append((_assignment_kind(m.group("name")), m.start(group), m.end(group)))
+            pos = m.end()
+        else:
+            # Not a secret: search again from the value, so a value that is not
+            # a secret cannot hide an assignment inside it (`pw=$X&token=...`).
+            pos = m.start(group)
     for m in _AUTH_SCHEME.finditer(text):
         if _secret_like(m.group("uv"), quoted=True):
             found.append((f"{m.group('name').lower()}-credentials", m.start("uv"), m.end("uv")))
@@ -813,6 +819,20 @@ def _side_line(lines: tuple[list[str], list[str]] | None, n: int | None, text: s
     return lines[1][n - 1]
 
 
+_ANY_MARKER = re.compile(r"\[REDACTED:[^\[\]\s]+\]")
+
+
+def _more_redacted(from_base: str, from_head: str) -> str:
+    """The redacted form of a context line that hides more of it: fewer
+    characters left outside markers, then more markers. A full tie takes the
+    head, which is then the same text."""
+
+    def rank(line: str) -> tuple[int, int]:
+        return (len(_ANY_MARKER.sub("", line)), -len(_ANY_MARKER.findall(line)))
+
+    return from_base if rank(from_base) < rank(from_head) else from_head
+
+
 def redact_patch(patch: str, base_text: str | None, head_text: str | None) -> str:
     """Redact a unified diff with the context of its two full blobs.
 
@@ -822,8 +842,8 @@ def redact_patch(patch: str, base_text: str | None, head_text: str | None) -> st
     key whose header is outside the hunk, so each patch line is replaced with
     the same line of `redact_text(<whole blob>)`, which is also the text that
     verdict.py cites (`model_text`). Removed lines come from the base blob,
-    added lines from the head blob. A context line takes the side with more
-    markers.
+    added lines from the head blob. A context line takes the side that hides
+    more of it (`_more_redacted`).
 
     `base_text` is None for an added file, `head_text` for a removed one. Every
     patch line must equal its blob line, else RenderError (fail closed).
@@ -843,10 +863,7 @@ def redact_patch(patch: str, base_text: str | None, head_text: str | None) -> st
         elif marker == "+":
             out.append("+" + _side_line(head, h, text, "head"))
         else:
-            from_base = _side_line(base, b, text, "base")
-            from_head = _side_line(head, h, text, "head")
-            more_base = from_base.count("[REDACTED:") > from_head.count("[REDACTED:")
-            out.append(" " + (from_base if more_base else from_head))
+            out.append(" " + _more_redacted(_side_line(base, b, text, "base"), _side_line(head, h, text, "head")))
     return "".join(line + "\n" for line in out)
 
 

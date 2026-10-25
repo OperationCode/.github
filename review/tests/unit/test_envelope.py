@@ -289,3 +289,19 @@ def test_skipped_size_bundle_payload_needs_the_deterministic_results(good_envelo
         doc = {**good_envelope, "status": "skipped-size", "payload": payload}
         with pytest.raises(EnvelopeError, match=f"payload: \\[required\\] '{key}'"):
             envelope.validate_envelope(doc)
+
+
+@pytest.mark.parametrize("key", ["files", "pr", "content", "anything"])
+def test_skipped_size_bundle_has_no_content_for_claude(good_envelope, key):
+    # The size gate skipped the Claude calls, so the payload holds only the
+    # deterministic results (K-7). Content for Claude is rejected.
+    doc = {**good_envelope, "status": "skipped-size", "payload": {**BUNDLE_PAYLOAD, key: []}}
+    with pytest.raises(EnvelopeError, match=f"payload: \\[enum\\] '{key}'"):
+        envelope.validate_envelope(doc)
+    ok = {**good_envelope, "status": "ok", "payload": {**BUNDLE_PAYLOAD, key: []}}
+    envelope.validate_envelope(ok)
+
+
+def test_skipped_size_bundle_may_carry_size(good_envelope):
+    doc = {**good_envelope, "status": "skipped-size", "payload": {**BUNDLE_PAYLOAD, "size": {"estimated_tokens": 1}}}
+    envelope.validate_envelope(doc)

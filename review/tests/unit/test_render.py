@@ -1339,3 +1339,40 @@ def test_base64_encoded_public_pem_is_kept():
     token = base64.b64encode(b"-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE\n-----END PUBLIC KEY-----\n").decode()
     text = f"pub: {token}\n"
     assert r.redact_text(text) == text
+
+
+# Consolidation Minors: a value that is not a secret does not hide the next
+# assignment; a patch context line takes the side that hides more.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "url = '/login?password=$PW&token=Zx9Qw7Er5Ty3Ui1OpAs'",
+        "password=${PASSWORD}&api_key=Zx9Qw7Er5Ty3Ui1OpAs",
+        "secret: {{ vault }}&access_key=Zx9Qw7Er5Ty3Ui1OpAs",
+    ],
+)
+def test_non_secret_value_does_not_hide_next_assignment(text):
+    out = r.redact_text(text)
+    assert "Zx9Qw7Er5Ty3Ui1OpAs" not in out
+    assert "[REDACTED:credential-assignment]" in out
+    assert any(k == "credential-assignment" for k, _, _ in r.find_credentials(text))
+
+
+def test_patch_context_tie_takes_the_side_that_hides_more():
+    # One marker on each side, but the base hides the whole line (it sits in a
+    # key block there) and the head only the token.
+    line = f"foo {GH_TOKEN} bar"
+    base = f"-----BEGIN PRIVATE KEY-----\n{line}\n-----END PRIVATE KEY-----\n"
+    head = f"x = 1\n{line}\ny = 2\n"
+    out = r.redact_patch(unified(base, head, 1), base, head)
+    assert " [REDACTED:text-in-private-key-block]" in out.split("\n")
+    assert "foo" not in out and GH_TOKEN not in out
+
+
+def test_patch_context_tie_ranks():
+    assert r._more_redacted("a [REDACTED:x] b", "[REDACTED:y]") == "[REDACTED:y]"
+    assert r._more_redacted("[REDACTED:y]", "a [REDACTED:x] b") == "[REDACTED:y]"
+    assert r._more_redacted("[REDACTED:x][REDACTED:y]", "[REDACTED:z]") == "[REDACTED:x][REDACTED:y]"
+    assert r._more_redacted("same", "same") == "same"

@@ -348,3 +348,9 @@ def test_pass_check_catches_mutation(name, label):
     mutated = PASS_MUTATIONS[label](name, text)
     assert mutated != text
     assert pass_violations(name, mutated, load_schema())
+
+
+def test_prompts_do_not_name_commit_messages():
+    # The bundle holds no commit messages, so no prompt may point Claude at them.
+    for path in prompt_files():
+        assert "commit message" not in path.read_text(encoding="utf-8").lower(), path.name

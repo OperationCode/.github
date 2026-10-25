@@ -117,26 +117,8 @@ _UTF8_CODECS = frozenset({"utf-8", "utf-8-sig", "ascii"})
 
 # --- credentials --------------------------------------------------------------
 
-# (kind, pattern). Matches are reported by kind and location only.
-CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
-    (kind, re.compile(pattern, re.ASCII))
-    for kind, pattern in (
-        ("private-key", r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"),
-        ("github-token", r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})"),
-        ("aws-access-key-id", r"\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}\b"),
-        ("anthropic-key", r"\bsk-ant-[A-Za-z0-9_-]{20,}"),
-        ("openai-key", r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}"),
-        ("slack-token", r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
-        ("slack-webhook", r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]{20,}"),
-        ("google-api-key", r"\bAIza[0-9A-Za-z_-]{35}"),
-        ("stripe-key", r"\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}"),
-        ("npm-token", r"\bnpm_[A-Za-z0-9]{36}\b"),
-        ("pypi-token", r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}"),
-        ("gitlab-token", r"\bglpat-[A-Za-z0-9_-]{20,}"),
-        ("sendgrid-key", r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b"),
-        ("jwt", r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
-    )
-)
+# Credential kinds and patterns live in render.py, so the credential signal
+# reports every kind that render redacts (see `find_credentials`).
 
 # --- text that addresses an AI or reviewer ------------------------------------
 
@@ -248,10 +230,13 @@ class PrefilterResult:
     coverage: Coverage
 
     def to_dict(self) -> dict[str, Any]:
-        """JSON-ready form for the bundle."""
+        """JSON-ready part of the bundle payload: the `prefilter` and
+        `coverage` keys of the envelope schema. Collect adds the rest."""
         return {
-            "signals": [asdict(c) for c in self.signals],
-            "hard_blocks": [asdict(c) for c in self.hard_blocks],
+            "prefilter": {
+                "signals": [asdict(c) for c in self.signals],
+                "hard_blocks": [asdict(c) for c in self.hard_blocks],
+            },
             "coverage": {**asdict(self.coverage), "complete": self.coverage.complete},
         }
 
@@ -514,20 +499,27 @@ def _ai_hits(lines: Sequence[str], changed: Iterable[int] | None = None) -> dict
     for i in range(len(lines) - 1, -1, -1):
         first_changed_at_or_after[i] = i if flags[i] else first_changed_at_or_after[i + 1]
 
+    # Lines that are empty after the comment leader is removed are left out of
+    # the join, so a blank or bare comment line between two parts of a phrase
+    # does not leave a double space that breaks the match.
     starts: list[int] = []
+    line_of_part: list[int] = []
     parts: list[str] = []
     pos = 0
-    for raw in lines:
+    for i, raw in enumerate(lines):
         norm = normalize_for_match(_COMMENT_LEADER_RE.sub("", raw)).strip()
+        if not norm:
+            continue
         starts.append(pos)
+        line_of_part.append(i)
         parts.append(norm)
         pos += len(norm) + 1
     joined = " ".join(parts)
     hits: dict[str, list[int]] = {}
     for name, pattern in _AI_PATTERNS:
         for m in pattern.finditer(joined):
-            first = bisect.bisect_right(starts, m.start()) - 1
-            last = bisect.bisect_right(starts, max(m.end() - 1, m.start())) - 1
+            first = line_of_part[bisect.bisect_right(starts, m.start()) - 1]
+            last = line_of_part[bisect.bisect_right(starts, max(m.end() - 1, m.start())) - 1]
             hit = first_changed_at_or_after[first]
             if hit <= last:
                 hits.setdefault(name, []).append(hit + 1)
@@ -535,11 +527,9 @@ def _ai_hits(lines: Sequence[str], changed: Iterable[int] | None = None) -> dict
 
 
 def find_credentials(text: str) -> list[tuple[str, int, int]]:
-    """(kind, start, end) of every credential-like string. For redaction too."""
-    out = []
-    for kind, pattern in CREDENTIAL_PATTERNS:
-        out.extend((kind, m.start(), m.end()) for m in pattern.finditer(text))
-    return out
+    """(kind, start, end) of every credential-like string: the same detection
+    that render.redact_text uses, so the signal and the redaction agree."""
+    return render.find_credentials(text)
 
 
 # ---------------------------------------------------------------------------

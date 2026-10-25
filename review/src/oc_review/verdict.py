@@ -334,10 +334,19 @@ def _hard_block_label(item: Mapping[str, Any]) -> str:
 
 
 def _bundle_hard_blocks(bundle: Mapping[str, Any]) -> tuple[str, ...]:
-    """Hard block labels of a schema-valid bundle; empty when it has no payload."""
+    """Hard block labels of a schema-valid bundle; empty when it has no payload.
+
+    Defense in depth: a coverage record whose `complete` is not exactly true
+    is a hard block too, even when the prefilter list holds no
+    `incomplete-coverage` entry.
+    """
     if bundle["status"] not in BUNDLE_PAYLOAD_STATUSES:
         return ()
-    return tuple(_hard_block_label(b) for b in bundle["payload"]["prefilter"]["hard_blocks"])
+    payload = bundle["payload"]
+    labels = [_hard_block_label(b) for b in payload["prefilter"]["hard_blocks"]]
+    if payload["coverage"].get("complete") is not True:
+        labels.append("incomplete-coverage (coverage record is not complete)")
+    return tuple(labels)
 
 
 def prefilter_evidence_from_bundle(read: ArtifactRead) -> PrefilterEvidence:

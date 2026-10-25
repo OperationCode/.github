@@ -201,7 +201,7 @@ Jobs pass data only through artifacts from the same run and the same run attempt
 
 - Each producer writes one envelope file. In a trusted step, it computes the SHA-256 of the file bytes (`sha256sum`). Then it uploads the file as one artifact with `actions/upload-artifact`. It sets two job outputs: the `artifact-id` and that file digest. The `artifact-digest` of the upload step is the digest of the zip. A consumer cannot recompute it from the extracted file. A workflow step may check it as an extra control. The consumer gate does not depend on it.
 - Each consumer downloads with `actions/download-artifact` by exact `artifact-ids`, never by name or pattern, and never from another run. It checks the SHA-256 of the extracted file bytes against the file digest output of the producer before it parses anything. A mismatch fails the run.
-- Downloads go to `$RUNNER_TEMP/data/<kind>/`, never into the code checkout. The consumer rejects a missing file, an extra file or a file over the size cap. An artifact holds exactly one file. The size cap is per kind: 16 MiB for a `bundle` and 1 MiB for a `pass` record. The consumer opens the file without following symbolic links and rejects anything that is not a regular file. Its check on the `kind` field of the envelope must match the kind it expected.
+- Downloads go to `$RUNNER_TEMP/data/<kind>/`, never into the code checkout. The consumer rejects a missing file, an extra file or a file over the size cap. An artifact holds exactly one file. The size cap is per kind: 16 MiB for a `bundle` and 1 MiB for a `pass` record. The consumer opens the file without following symbolic links and rejects anything that is not a regular file. The kind field of the envelope must match the kind the consumer expects.
 - Every artifact is a versioned envelope:
 
 ```
@@ -215,7 +215,7 @@ Jobs pass data only through artifacts from the same run and the same run attempt
 ```
 
 - The publisher takes its write targets (repository, PR number) from the trusted event payload, never from an artifact or the run API. The run API's `pull_requests` list is empty for fork PR runs (V17). It checks that every envelope matches those values, the current `run_id` and `run_attempt`, and the bundle's snapshot.
-- The `payload` is an object when `status` is `ok`. A `bundle` with status `skipped-size` also has a payload (see "Bundle"). Every other payload is `null`: a `pass` record with any status but `ok`, and a `bundle` with status `failed` or `stale`. A record with a payload where `null` belongs is rejected. A `pass` record with status `ok` has a payload that matches the findings schema (K-7).
+- The `payload` is an object when `status` is `ok`. A `bundle` with status `skipped-size` also has a payload (see "Bundle", K-7). That payload holds only `prefilter`, `coverage`, `dependency_delta` and `size`; the schema rejects any other key, so it carries no content for Claude. Every other payload is `null`: a `pass` record with any status but `ok`, and a `bundle` with status `failed` or `stale`. A record with a payload where `null` belongs is rejected. A `pass` record with status `ok` has a payload that matches the findings schema.
 - Analyze always writes exactly three pass records, one per pass. When the size gate trips, or the run is stale before the calls, the records say so, so a missing record is always an error.
 - Collect and analyze run trusted code only. The artifacts they write hold untrusted data, so every consumer parses them as data with a schema and executes nothing from them.
 
@@ -390,7 +390,7 @@ Two separate questions: is the evidence real, and can the finding be an inline c
 
 1. `file` is in the PR's changed files (for `side: "base"`, the old path of a rename also counts), or is `/.pr/title` or `/.pr/body` with `side: "head"`.
 2. `line` exists in that side's blob, or in the rendered title or body.
-3. `quote`, with whitespace normalized, appears in that side's blob, or in the rendered title or body, within 3 lines of `line`.
+3. `quote`, with whitespace normalized, appears in the redacted text of that side's blob (see "Redacted text"), or in the rendered title or body, within 3 lines of `line`.
 
 **PR title and body.** A finding in the title or body cites `/.pr/title` or `/.pr/body` with `side: "head"` (K-6). It never cites a code file. Code checks it against the rendered title or body text. It is never inline-eligible, because it is not in the diff, so it goes to the summary only. The publisher escapes it like all untrusted text.
 

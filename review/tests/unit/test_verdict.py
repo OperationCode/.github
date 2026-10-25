@@ -558,3 +558,25 @@ def test_final_check_keeps_prefilter_reasons():
     initial = compute_gate(inputs)
     final = run_final(initial, inputs)
     assert verdict.R_HARD_BLOCK in final.codes and final.status == FAIL
+
+
+# ---------------------------------------------------------------- coverage record (defense in depth)
+
+
+@pytest.mark.parametrize("status", ["ok", "skipped-size"])
+@pytest.mark.parametrize("coverage", [{"complete": False}, {}, {"complete": "true"}, {"complete": 1}])
+def test_incomplete_coverage_record_fails_without_hard_block_entry(status, coverage):
+    read = bundle(status)
+    read.envelope["payload"]["coverage"] = coverage
+    passes = [pass_rec(n, "skipped-size") for n in PASS_NAMES] if status == "skipped-size" else None
+    over = {"bundle": read, "overrides": ov_inputs([override_comment()])}
+    if passes:
+        over["passes"] = passes
+    r = gate(**over)
+    assert verdict.R_HARD_BLOCK in r.codes
+    assert r.status == FAIL and not r.override_applied
+    assert any("coverage record" in x.detail for x in r.reasons)
+
+
+def test_complete_coverage_record_adds_nothing():
+    assert gate().status == PASS
