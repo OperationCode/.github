@@ -27,15 +27,16 @@ Done when:
                             bypass: org admins)        risk acceptance, re-tests)
 
  Gate on each arrow: the exit criteria of the phase before it.
+ Exception: 1a may start in parallel with phase 0 (see phase 1a).
  V6 fails (an older run decides)  -> stop, change the gate design.
  V2 or V3 fails (no federation)   -> stop, change the auth design.
 ```
 
-There is one build of the central workflow. Its gate job fails for real when the result is `fail`. The pilot and org-wide enforcement differ only in who can merge past a failed run (spec "Pilot and enforcement").
+There is one build of the central workflow. Its gate job fails for real when the result is `fail`. The pilot and org-wide enforcement differ only in who can merge past a failed run (spec "Pilot and enforcement"). The pilot does not protect merges: a maintainer or repo admin can merge past any failed run, also on their own PR. Each pilot repo needs its own approval protection.
 
 ## Phase 0: platform tests that block the build
 
-Use [claude-review-test](https://github.com/OperationCode/claude-review-test) as the target and a separate source repo for the workflow. Record each result in the spec, in the same PR as any design change it causes.
+Use [claude-review-test](https://github.com/OperationCode/claude-review-test) as the target and a scratch source repo for the workflow. Only one ruleset requires the workflow on claude-review-test at a time. Record each result in the spec, in the same PR as any design change it causes.
 
 Tasks:
 
@@ -52,7 +53,9 @@ Tasks:
 
 Owner:
 
-- [ ] Owner: Anthropic Console: a dedicated workspace with a hard monthly spend limit, a service account, and the federation rule from V3. No API key.
+- [ ] Owner: create a scratch source repo in the org for the V tests, separate from claude-review-test.
+- [ ] Owner: Anthropic Console: a dedicated workspace with a hard monthly spend limit and a service account. Create the production federation rule from V3 with the condition shape only; it gets its first SHA in phase 3. No API key.
+- [ ] Owner: a separate eval workspace with its own small spend limit, and a federation rule for `eval.yml` on `workflow_dispatch` in `OperationCode/.github` only (spec "Auth and cost"). Needed before phase 2.
 - [ ] Owner: a test workspace with a very small spend limit for V9.
 - [ ] Owner: the test org ruleset for V6 that targets only claude-review-test.
 - [ ] Owner: a Dependabot PR in claude-review-test for V4.
@@ -69,7 +72,7 @@ Python lives in `review/`, managed with `uv`. Unit tests make no network or API 
 
 ### 1a. Code that does not depend on the gate
 
-These depend on no V item. Each task comes with its unit tests.
+1a may start in parallel with phase 0. It merges to main only after phase 0 exits. Any V result that changes 1a code is fixed before 1b starts. Each task comes with its unit tests.
 
 - [ ] `review/` project: `pyproject.toml`, `uv.lock` with hashes, `tests/unit/`.
 - [ ] `schema/findings.schema.json` and `schema/envelope.schema.json`, with good and bad fixtures.
@@ -77,13 +80,13 @@ These depend on no V item. Each task comes with its unit tests.
 - [ ] `snapshot.py`: comparison pair, tree diff by path, blob SHA and mode, stale checks.
 - [ ] `prefilter.py`: every row of the spec's prefilter table, and the coverage rules.
 - [ ] `deps.py`: one parser per supported file family, with fixtures for each supported version. Registry lookups on fixed routes only, with byte caps and timeouts.
-- [ ] `collect.py`: GitHub REST reads into the bundle envelope. Tests use recorded responses, no network.
+- [ ] `collect.py`: GitHub REST reads into the bundle envelope. Tests use recorded responses, no network. Depends on V18 (fork objects through the base repo).
 - [ ] `render.py`: bundle to prompt text with nonce delimiters and redaction. Test that the rendered text cannot contain `untrusted_pr_{nonce}`.
 - [ ] Prompts: `system.md`, `review.md`, `security.md`, `supply-chain.md`. A unit test fails if any prompt file loses its `<grounding_rules>` block.
-- [ ] `verdict.py`: citation check, inline eligibility, gate reasons, override checks. The full gate matrix from the spec's "Testing" section.
+- [ ] `verdict.py`: citation check, inline eligibility, gate reasons, override checks. The full gate matrix from the spec's "Testing" section. The push epoch part depends on V16 (it may add `reopened`).
 - [ ] Sanitizer and escaping for every untrusted string that the publisher posts.
 
-Depends on: none.
+Depends on: none for most tasks; V18 for `collect.py`, V16 for the push epoch in `verdict.py`.
 
 ### 1b. Analyze and publish
 
@@ -120,7 +123,7 @@ Exit criteria:
 The fixture eval calls the live API and costs money. The owner runs it on request only.
 
 - [ ] Add the fixture bundles from the spec's minimum set, with expected outcomes.
-- [ ] Owner: run `eval.yml` and record the results in the PR.
+- [ ] Owner: run `eval.yml` with the eval federation rule and eval workspace from phase 0, and record the results in the PR.
 - [ ] Fix prompts or code for each miss, then run again on request.
 
 Depends on: phase 1.
@@ -132,7 +135,7 @@ Exit criteria:
 
 ## Phase 3: smoke test on claude-review-test
 
-Run the spec's workflow acceptance tests under a test org ruleset that requires the central workflow from a separate source repo and targets only claude-review-test.
+Run the spec's workflow acceptance tests under a test org ruleset that requires the central workflow from `OperationCode/.github` at the candidate release SHA and targets only claude-review-test. Only one ruleset requires the workflow there at a time.
 
 - [ ] A fork PR from an account outside the org, including a draft that later becomes ready. The review starts with no approval click (V8 b).
 - [ ] V8 a: a fork PR whose own workflow has a job named `oc-claude-review` that starts before the required run.
@@ -140,11 +143,12 @@ Run the spec's workflow acceptance tests under a test org ruleset that requires 
 - [ ] V12: repo-level Actions settings.
 - [ ] V22 a and b: pin behind main, then a pin move with PRs open.
 - [ ] V23: a same-path workflow file in the target repo.
-- [ ] V25: the pilot bypass. Maintain and Admin can merge past a failed run, Write cannot, and GitHub records each bypass. Record the role `actor_id` values.
+- [ ] V25: the pilot bypass. Maintain and Admin can merge past a failed run, Write cannot, and GitHub records each bypass. Record the role `actor_id` values, and whether a direct push to the default branch is blocked.
 - [ ] The rest of the acceptance list in the spec's "Testing" section, including the outage process (V9).
 
 Owner:
 
+- [ ] Owner: add the candidate release SHA to the production federation rule.
 - [ ] Owner: an account outside the org opens the fork PRs.
 - [ ] Owner: test users with Write, Maintain and Admin on claude-review-test for V25.
 
@@ -157,14 +161,17 @@ Exit criteria:
 
 ## Phase 4: pilot
 
-- [ ] Owner: add the release SHA to the federation rule.
+- [ ] Owner: before a repo joins the pilot, give it its own approval protection on the default branch: a repo ruleset or branch protection with at least 1 approval, code owner review and dismiss stale approvals on push. `back-end` has none today.
+- [ ] Owner: before a repo joins the pilot, check it for people or bots that push to the default branch directly (V25).
+- [ ] Owner: accept that during the pilot a maintainer or repo admin can merge past any failed run, also on their own PR (spec "Pilot and enforcement").
+- [ ] Owner: confirm the release SHA is in the federation rule.
 - [ ] Owner: create the pilot ruleset. Only the rule "Require workflows to pass before merging" with the central workflow `repository_id`, path and release SHA. Targets: the pilot repos by name (first `back-end`), default branch. Bypass in `pull_request` mode: the Maintain and Admin repository roles, and org admins.
 - [ ] Owner: read the pilot ruleset back through the [org rules API](https://docs.github.com/en/rest/orgs/rules#get-an-organization-repository-ruleset). Check `repository_id`, path, `sha`, no `ref`, and the role `actor_id` values from V25. Then enable it.
 - [ ] Owner: require 2FA for all org members.
 - [ ] Owner: CODEOWNERS in each pilot repo for `.github/`, manifests, lockfiles, `pyproject.toml`, `Dockerfile`.
 - [ ] Start a run on each open PR in the pilot repos (push, or close and reopen).
-- [ ] Each week, record false positives, overrides, bypasses, failed runs by reason, egress blocks and cost per run. Keep cost numbers out of this public repo.
-- [ ] Fix false positives in prompts or code. Each fix goes through phase 2 again.
+- [ ] Each week, record false positives, overrides, bypasses, failed runs by reason, egress blocks and cost per run. Keep cost numbers in the owner's private notes and the Anthropic Console, never in this public repo.
+- [ ] Fix false positives in prompts or code. Each fix goes through phase 2 again, then ships as in "Each release" below.
 
 Depends on: phase 3.
 
@@ -180,7 +187,7 @@ Exit criteria:
   - [ ] `OrganizationAdmin` bypass mode: `pull_request`, not `always`
   - [ ] remove the empty required status checks rule
   - [ ] fill the workflows rule with the `repository_id` of `OperationCode/.github`, the path `.github/workflows/claude-review.yml` and the pinned release SHA
-  - [ ] targets: never `.github`
+  - [ ] targets: never `.github`, and none of the repos still in the pilot ruleset
 - [ ] Owner: read the org ruleset back and check the workflow entry (`repository_id`, path, `sha`, no `ref`).
 - [ ] Build the supported repo inventory (spec "Supported repos") as a list in this repo.
 - [ ] Owner: CODEOWNERS in each supported repo.
@@ -197,17 +204,19 @@ Exit criteria:
 
 ## Phase 6: org-wide enforcement
 
-- [ ] Owner: remove the Maintain and Admin repository roles from the pilot bypass list.
-- [ ] Owner: enable the org ruleset. Add supported repos to its targets in small groups.
-- [ ] After each group, start a run on each open PR, and check that each shows the required workflow passing or failing on its own result.
-- [ ] Owner: delete the pilot ruleset when the org ruleset covers every pilot repo.
-
-Each later release:
-
-- [ ] Owner: add the new SHA to the federation rule, move the ruleset pin, read the ruleset back.
-- [ ] Owner: remove the previous SHA from the federation rule once open PRs have new runs.
+- [ ] Owner: enable the org ruleset with the supported repos that are not in the pilot. Add them in small groups.
+- [ ] Owner: move each pilot repo: remove it from the pilot ruleset targets, then add it to the org ruleset targets at once. Never let both rulesets require the workflow on one repo.
+- [ ] After each group or move, start a run on each open PR, and check that each shows the required workflow passing or failing on its own result.
+- [ ] Owner: delete the pilot ruleset when no repo is left in it.
 - [ ] Keep the supported repo inventory current. A repo joins or leaves through a PR to this repo.
 
 Exit criteria:
 
 - [ ] Every supported repo is a target of the org ruleset, and only org admins can bypass, through a pull request.
+
+## Each release (from phase 4 on)
+
+- [ ] Run unit tests, and the fixture eval on request when prompts or the model change.
+- [ ] Owner: add the new SHA to the production federation rule.
+- [ ] Owner: move the pin of every ruleset that requires the workflow (the pilot ruleset, the org ruleset, or both), then read each back: `repository_id`, path, `sha`, no `ref`.
+- [ ] Owner: remove the previous SHA from the federation rule once open PRs have new runs (V22).
