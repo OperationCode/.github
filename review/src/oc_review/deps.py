@@ -18,8 +18,10 @@ Rules this module keeps:
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
+import shlex
 import time
 import tomllib
 import urllib.error
@@ -84,6 +86,7 @@ UNSUPPORTED_DEP_FILES = frozenset(
         "pipfile",
         "pipfile.lock",
         "pdm.lock",
+        "npm-shrinkwrap.json",
         "pom.xml",
         "build.gradle",
         "build.gradle.kts",
@@ -293,6 +296,25 @@ def official_pypi_source() -> Source:
     return _registry_source(PYPI_REGISTRY_HOST, True)
 
 
+def _npm_registry_source(url: str, name: str, version: str) -> Source:
+    """Classify an npm tarball URL; an official host must serve this package.
+
+    The path of an official tarball must be `/<name>/-/<base>-<version>.tgz`.
+    Any other path on an official host is a foreign `url` source. The path
+    stays in `normalized`, so a swapped tarball shows in the delta.
+    """
+    src = classify_source(url, NPM_OFFICIAL_HOSTS)
+    if src.kind != "registry" or not src.official:
+        return src
+    text, _host = _normalize_url(url.strip(), keep_fragment=True)
+    path = urllib.parse.urlsplit(url.strip()).path
+    base = name.rsplit("/", 1)[-1]
+    expected = {f"/{name}/-/{base}-{version}.tgz", f"/{name}/-/{base}-{version.split('+', 1)[0]}.tgz"}
+    if path not in expected:
+        return Source(kind="url", normalized=text, host=src.host)
+    return Source(kind="registry", normalized=text.removeprefix("https://"), host=src.host, official=True)
+
+
 def _normalize_url(url: str, keep_fragment: bool) -> tuple[str, str | None]:
     """Lowercase scheme and host, drop credentials; return (text, host)."""
     parts = urllib.parse.urlsplit(url)
@@ -466,6 +488,8 @@ def _pep503(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 _NPM_DEP_SECTIONS = ("dependencies", "devDependencies", "optionalDependencies")
+# Sections npm or pnpm also install from; their values can be git or URL specs.
+_NPM_EXTRA_SECTIONS = ("peerDependencies", "overrides", "resolutions")
 
 _Result = tuple[str | None, list[Package], list[Source]]
 
@@ -487,7 +511,25 @@ def _parse_package_json(text: str) -> _Result:
                     direct=True,
                 )
             )
+    extra: list[tuple[str, Any]] = [(s_, doc[s_]) for s_ in _NPM_EXTRA_SECTIONS if s_ in doc]
+    if "pnpm" in doc and "overrides" in _as_dict(doc["pnpm"], "pnpm"):
+        extra.append(("pnpm.overrides", doc["pnpm"]["overrides"]))
+    for section, table in extra:
+        for name, spec in _walk_npm_specs(_as_dict(table, section), section):
+            packages.append(
+                Package(ecosystem="npm", name=name, version=spec, source=_classify_npm_spec(spec), direct=True)
+            )
     return None, packages, []
+
+
+def _walk_npm_specs(table: dict[str, Any], what: str) -> Iterable[tuple[str, str]]:
+    """(name, spec) pairs of a dependency table; npm `overrides` may nest."""
+    for name, value in table.items():
+        if isinstance(value, dict):
+            for inner, spec in _walk_npm_specs(value, f"{what}.{name}"):
+                yield (name if inner == "." else inner), spec
+        else:
+            yield name, _as_str(value, f"{what}.{name}")
 
 
 # ---------------------------------------------------------------------------
@@ -503,16 +545,37 @@ def _parse_package_lock(text: str) -> _Result:
     entries = _as_dict(doc.get("packages"), "packages")
     root = entries.get("", {})
     root_deps: set[str] = set()
-    for section in (*_NPM_DEP_SECTIONS, "peerDependencies"):
-        if section in _as_dict(root, "root package"):
-            root_deps.update(_as_dict(root[section], section))
+    # The root and every workspace member (a key without `node_modules/`)
+    # declare direct dependencies.
+    for key, entry in entries.items():
+        if key != "" and "node_modules/" in key:
+            continue
+        member = _as_dict(entry, f"packages[{key!r}]")
+        for section in (*_NPM_DEP_SECTIONS, "peerDependencies"):
+            if section in member:
+                root_deps.update(_as_dict(member[section], section))
     packages = []
     for key, entry in entries.items():
         if key == "":
             continue
         entry = _as_dict(entry, f"packages[{key!r}]")
         if "node_modules/" not in key:
-            continue  # a workspace member: code in the repo, not a download
+            # A workspace member is code in the repo, not a download. One with
+            # a `resolved` value is not a plain member: classify it.
+            if entry.get("resolved") is not None:
+                url = _as_str(entry["resolved"], f"{key} resolved")
+                member_name = _as_str(entry.get("name", key), f"{key} name")
+                member_version = _as_str(entry.get("version", ""), f"{key} version")
+                packages.append(
+                    Package(
+                        ecosystem="npm",
+                        name=member_name,
+                        version=member_version,
+                        source=_npm_registry_source(url, member_name, member_version),
+                        direct=False,
+                    )
+                )
+            continue
         key_name = key.rsplit("node_modules/", 1)[1]
         name = _as_str(entry.get("name", key_name), f"{key} name")
         top_level = key == f"node_modules/{key_name}"
@@ -526,12 +589,12 @@ def _parse_package_lock(text: str) -> _Result:
                 source = Source(kind="bundled", normalized="")
             else:
                 source = Source(kind="unknown", normalized="")
-        else:
-            source = classify_source(resolved, NPM_OFFICIAL_HOSTS)
         pkg_version = entry.get("version")
         if pkg_version is None and entry.get("link") is True:
             pkg_version = ""
         pkg_version = _as_str(pkg_version, f"{key} version")
+        if entry.get("link") is not True and resolved is not None:
+            source = _npm_registry_source(resolved, name, pkg_version)
         install = entry.get("hasInstallScript")
         if install is not None and not isinstance(install, bool):
             raise DepsError(f"{key} hasInstallScript is not a boolean")
@@ -601,7 +664,7 @@ def _parse_yarn_v1(text: str) -> list[Package]:
             local = all(p.split("@", 1)[-1].startswith(("file:", "link:", "workspace:")) for p in patterns)
             source = Source(kind="file", normalized="") if local else Source(kind="unknown", normalized="")
         else:
-            source = classify_source(resolved, NPM_OFFICIAL_HOSTS)
+            source = _npm_registry_source(resolved, _name_from_pattern(patterns[0]), fields["version"])
         packages.append(
             Package(
                 ecosystem="npm",
@@ -633,7 +696,7 @@ def _parse_yarn_v1(text: str) -> list[Package]:
     return packages
 
 
-def _yarn_berry_source(resolution: str, name: str) -> Source:
+def _yarn_berry_source(resolution: str, name: str, version: str) -> Source:
     # resolution looks like `name@npm:1.2.3` or `name@workspace:.`.
     i = resolution.find("@", 1)
     if i < 0:
@@ -642,11 +705,16 @@ def _yarn_berry_source(resolution: str, name: str) -> Source:
     if ref.startswith("npm:"):
         if "__archiveUrl=" in ref:
             archive = urllib.parse.unquote(ref.split("__archiveUrl=", 1)[1])
-            return classify_source(archive, NPM_OFFICIAL_HOSTS)
+            return _npm_registry_source(archive, name, version)
         return official_npm_source()
     if ref.startswith("workspace:"):
         return Source(kind="workspace", normalized=ref)
     if ref.startswith("patch:"):
+        # `patch:<inner descriptor>#<patch>::<params>`: classify the inner one.
+        inner = urllib.parse.unquote(ref[len("patch:") :].split("#", 1)[0])
+        inner_source = _yarn_berry_source(inner, name, version)
+        if inner_source.foreign:
+            return inner_source
         if "builtin<" in ref:
             return official_npm_source()
         return Source(kind="patch", normalized=ref)
@@ -656,7 +724,7 @@ def _yarn_berry_source(resolution: str, name: str) -> Source:
 
 
 def _parse_yarn_berry(text: str) -> _Result:
-    doc = _as_dict(yaml.load(text, Loader=_SafeLoader), "yarn.lock")
+    doc = _as_dict(yaml.load(text, Loader=_UniqueKeyLoader), "yarn.lock")
     meta = _as_dict(doc.get("__metadata"), "__metadata")
     version = meta.get("version")
     if isinstance(version, bool) or version not in SUPPORTED_YARN_BERRY_VERSIONS:
@@ -671,12 +739,13 @@ def _parse_yarn_berry(text: str) -> _Result:
         pkg_version = entry.get("version")
         pkg_version = str(pkg_version) if isinstance(pkg_version, (int, float)) else pkg_version
         resolution = _as_str(entry.get("resolution"), f"{key} resolution")
+        pkg_version = _as_str(pkg_version, f"{key} version")
         packages.append(
             Package(
                 ecosystem="npm",
                 name=name,
-                version=_as_str(pkg_version, f"{key} version"),
-                source=_yarn_berry_source(resolution, name),
+                version=pkg_version,
+                source=_yarn_berry_source(resolution, name, pkg_version),
             )
         )
     return str(version), packages, []
@@ -689,6 +758,21 @@ def _parse_yarn_berry(text: str) -> _Result:
 _SafeLoader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
 
+class _UniqueKeyLoader(_SafeLoader):  # type: ignore[misc, valid-type]
+    """Safe loader that refuses a duplicate mapping key (parser differential)."""
+
+    def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
+        seen: set[Any] = set()
+        for key_node, _value in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                continue
+            key = self.construct_object(key_node, deep=True)
+            if key in seen:
+                raise DepsError(f"duplicate YAML key {str(key)[:60]!r}")
+            seen.add(key)
+        return super().construct_mapping(node, deep)
+
+
 def _pnpm_split_key(key: str) -> tuple[str, str]:
     """Name and version of a pnpm package key (`/a@1(peer@2)` or `a@1`)."""
     key = key.lstrip("/").split("(", 1)[0]
@@ -698,9 +782,9 @@ def _pnpm_split_key(key: str) -> tuple[str, str]:
     return key[:i], key[i + 1 :]
 
 
-def _pnpm_source(resolution: dict[str, Any], key: str) -> Source:
+def _pnpm_source(resolution: dict[str, Any], key: str, name: str, version: str) -> Source:
     if "tarball" in resolution:
-        return classify_source(_as_str(resolution["tarball"], f"{key} tarball"), NPM_OFFICIAL_HOSTS)
+        return _npm_registry_source(_as_str(resolution["tarball"], f"{key} tarball"), name, version)
     rtype = resolution.get("type")
     if rtype == "git" or "repo" in resolution:
         repo = _as_str(resolution.get("repo", ""), f"{key} repo")
@@ -715,12 +799,12 @@ def _pnpm_source(resolution: dict[str, Any], key: str) -> Source:
 
 
 def _parse_pnpm_lock(text: str) -> _Result:
-    doc = _as_dict(yaml.load(text, Loader=_SafeLoader), "pnpm-lock.yaml")
+    doc = _as_dict(yaml.load(text, Loader=_UniqueKeyLoader), "pnpm-lock.yaml")
     version = str(doc.get("lockfileVersion"))
     if version not in SUPPORTED_PNPM_LOCK_VERSIONS:
         raise UnsupportedVersionError(f"pnpm-lock.yaml lockfileVersion {version!r} is not supported")
-    entries = _as_dict(doc.get("packages") or {}, "packages")
-    snapshots = _as_dict(doc.get("snapshots") or {}, "snapshots")
+    entries = _as_dict({} if doc.get("packages") is None else doc["packages"], "packages")
+    snapshots = _as_dict({} if doc.get("snapshots") is None else doc["snapshots"], "snapshots")
     build_names: set[tuple[str, str]] = set()
     for key, snap in snapshots.items():
         if _as_dict(snap, f"snapshots[{key!r}]").get("requiresBuild") is True:
@@ -743,7 +827,7 @@ def _parse_pnpm_lock(text: str) -> _Result:
                 ecosystem="npm",
                 name=name,
                 version=pkg_version,
-                source=_pnpm_source(resolution, key),
+                source=_pnpm_source(resolution, key, name, pkg_version),
                 direct=name in direct_names,
                 has_install_script=requires_build,
             )
@@ -770,14 +854,14 @@ def _pnpm_direct_names(doc: dict[str, Any]) -> set[str]:
 # PyPI: PEP 508 strings
 # ---------------------------------------------------------------------------
 
-_PYPI_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
-_PEP508_RE = re.compile(r"^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*(?:\[[^\]]*\])?\s*(.*)$", re.DOTALL)
+_PYPI_NAME_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+_PEP508_RE = re.compile(r"([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*(?:\[[^\]]*\])?\s*(.*)", re.DOTALL)
 
 
 def _pypi_package_from_requirement(req: str, *, direct: bool | None) -> Package:
     """Parse a PEP 508 requirement. A direct URL reference sets the source."""
     req = req.strip()
-    match = _PEP508_RE.match(req)
+    match = _PEP508_RE.fullmatch(req)
     if not match:
         raise DepsError(f"requirement {req[:60]!r} does not parse")
     name, rest = match.group(1), match.group(2).strip()
@@ -885,12 +969,23 @@ def _parse_pyproject(text: str) -> _Result:
                 index_urls[str(index["name"])] = url
             if not _is_official_index(url):
                 global_sources.append(_foreign_registry(url))
-    uv_sources = _as_dict(uv_tool.get("sources", {}), "tool.uv.sources")
+    for table, what in ((uv_tool, "tool.uv"), (_as_dict(uv_tool.get("pip", {}), "tool.uv.pip"), "tool.uv.pip")):
+        for key in ("index-url", "extra-index-url", "find-links"):
+            if key not in table:
+                continue
+            values = table[key] if isinstance(table[key], list) else [table[key]]
+            for url in values:
+                url = _as_str(url, f"{what}.{key}")
+                if not _is_official_index(url):
+                    global_sources.append(_foreign_registry(url) if "://" in url else Source(kind="file", normalized=url))
+    uv_sources = {
+        _pep503(str(k)): v for k, v in _as_dict(uv_tool.get("sources", {}), "tool.uv.sources").items()
+    }
 
     def add(reqs: Any, what: str) -> None:
         for req in _as_list(reqs, what):
             pkg = _pypi_package_from_requirement(_as_str(req, what), direct=True)
-            override = _uv_source_override(uv_sources.get(pkg.name) or uv_sources.get(pkg.name.replace("-", "_")), index_urls, f"tool.uv.sources.{pkg.name}")
+            override = _uv_source_override(uv_sources.get(pkg.name), index_urls, f"tool.uv.sources.{pkg.name}")
             if override is not None:
                 pkg = replace(pkg, source=override)
             packages.append(pkg)
@@ -915,6 +1010,8 @@ def _parse_pyproject(text: str) -> _Result:
         src = _as_dict(src, "tool.poetry.source entry")
         if "name" in src and "url" in src:
             poetry_sources[str(src["name"])] = _as_str(src["url"], "tool.poetry.source url")
+        if "url" in src and not _is_official_index(_as_str(src["url"], "tool.poetry.source url")):
+            global_sources.append(_foreign_registry(src["url"]))
     tables = [poetry.get("dependencies"), poetry.get("dev-dependencies")]
     for group in _as_dict(poetry.get("group", {}), "tool.poetry.group").values():
         tables.append(_as_dict(group, "poetry group").get("dependencies"))
@@ -1018,6 +1115,8 @@ def _parse_uv_lock(text: str) -> _Result:
             source = Source(kind="workspace", normalized=value)
         else:
             source = Source(kind="unknown", normalized=f"{kind}:{value}")
+        if source.official:
+            source = _uv_file_hosts_source(entry, name, source)
         pkg_version = entry.get("version", "")
         packages.append(
             Package(
@@ -1030,11 +1129,27 @@ def _parse_uv_lock(text: str) -> _Result:
     return str(version), packages, []
 
 
+def _uv_file_hosts_source(entry: dict[str, Any], name: str, source: Source) -> Source:
+    """uv installs from the sdist and wheel URLs, not from `source`: check them."""
+    urls = []
+    sdist = entry.get("sdist")
+    if sdist is not None and "url" in _as_dict(sdist, f"{name} sdist"):
+        urls.append(_as_str(sdist["url"], f"{name} sdist url"))
+    for wheel in _as_list(entry.get("wheels", []), f"{name} wheels"):
+        wheel = _as_dict(wheel, f"{name} wheel")
+        if "url" in wheel:
+            urls.append(_as_str(wheel["url"], f"{name} wheel url"))
+    for url in urls:
+        found = classify_source(url, PYPI_OFFICIAL_HOSTS)
+        if not found.official:
+            return found if found.foreign else _foreign_registry(url)
+    return source
+
+
 # ---------------------------------------------------------------------------
 # PyPI: requirements*.txt
 # ---------------------------------------------------------------------------
 
-_REQ_INDEX_OPTIONS = ("--index-url", "--extra-index-url", "--find-links", "-i", "-f")
 _EGG_RE = re.compile(r"[#&]egg=([A-Za-z0-9][A-Za-z0-9._-]*)")
 
 
@@ -1065,25 +1180,76 @@ def _parse_requirements(text: str) -> _Result:
     return None, packages, global_sources
 
 
+# Options on a requirements line. Anything not listed fails closed: pip
+# (optparse) takes attached values (`-ihttps://x`) and unique prefixes
+# (`--index=...`), so a parser that skips unknown options can miss an index.
+_REQ_VALUE_OPTIONS = frozenset(
+    {"-r", "--requirement", "-c", "--constraint", "--hash", "--no-binary", "--only-binary", "--trusted-host"}
+)
+_REQ_FLAG_OPTIONS = frozenset({"--no-index", "--require-hashes", "--prefer-binary", "--pre"})
+_REQ_INDEX_LONG = ("--index-url", "--extra-index-url", "--find-links")
+_REQ_SHORT = {"-i": "--index-url", "-f": "--find-links", "-e": "--editable", "-r": "-r", "-c": "-c"}
+
+
 def _requirements_option(line: str, packages: list[Package], global_sources: list[Source]) -> None:
-    head = line.split(None, 1)[0]
-    if "=" in head:
-        opt, _, value = line.partition("=")
-    else:
-        parts = line.split(None, 1)
-        opt, value = parts[0], parts[1] if len(parts) > 1 else ""
-    value = value.strip()
-    if opt in ("-e", "--editable"):
-        packages.append(_requirements_entry(value, editable=True))
-    elif opt in _REQ_INDEX_OPTIONS:
-        if "://" in value:
+    try:
+        tokens = shlex.split(line, comments=False)
+    except ValueError as exc:
+        raise DepsError(f"requirements option line does not parse: {line[:60]!r}") from exc
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        i += 1
+        attached: str | None = None
+        if token.startswith("--"):
+            opt, eq, value = token.partition("=")
+            attached = value if eq else None
+            if opt in _REQ_FLAG_OPTIONS:
+                if eq:
+                    raise DepsError(f"requirements option {opt} takes no value")
+                continue
+            if opt in _REQ_VALUE_OPTIONS:
+                if attached is None:
+                    i += 1
+                continue
+            if opt == "--editable":
+                canonical = "--editable"
+            else:
+                matches = [name for name in _REQ_INDEX_LONG if len(opt) > 2 and name.startswith(opt)]
+                if not matches:
+                    raise DepsError(f"requirements option {opt!r} is not on the allowlist")
+                canonical = matches[0]
+        elif token.startswith("-") and len(token) >= 2:
+            canonical = _REQ_SHORT.get(token[:2])
+            if canonical is None:
+                raise DepsError(f"requirements option {token[:2]!r} is not on the allowlist")
+            attached = token[2:] or None
+        else:
+            raise DepsError(f"unexpected token {token[:60]!r} on a requirements option line")
+        if canonical in ("-r", "-c"):
+            if attached is None:
+                i += 1
+            continue
+        if attached is not None:
+            value = attached.lstrip("=")
+        elif canonical == "--editable":
+            value = " ".join(tokens[i:])
+            i = len(tokens)
+        elif i < len(tokens):
+            value = tokens[i]
+            i += 1
+        else:
+            value = ""
+        value = value.strip()
+        if not value:
+            raise DepsError(f"requirements option {canonical} has no value")
+        if canonical == "--editable":
+            packages.append(_requirements_entry(value, editable=True))
+        elif "://" in value:
             source = classify_source(value, PYPI_OFFICIAL_HOSTS)
             global_sources.append(source if source.kind == "registry" else _foreign_registry(value))
         else:
             global_sources.append(Source(kind="file", normalized=value))
-    elif opt == "--no-index":
-        pass
-    # Other options (-r, -c, --hash, --no-binary and so on) change no source.
 
 
 def _requirements_entry(line: str, editable: bool = False) -> Package:
@@ -1094,7 +1260,7 @@ def _requirements_entry(line: str, editable: bool = False) -> Package:
         egg = _EGG_RE.search(url)
         name = _pep503(egg.group(1)) if egg else "(url)"
         return Package(ecosystem="pypi", name=name, version=url, source=classify_source(url, frozenset()), direct=True)
-    if line.startswith((".", "/", "~")) or (editable and not _PEP508_RE.match(line)):
+    if line.startswith((".", "/", "~")) or (editable and not _PEP508_RE.fullmatch(line)):
         return Package(ecosystem="pypi", name="(path)", version=line, source=Source(kind="file", normalized=line), direct=True)
     return _pypi_package_from_requirement(line, direct=True)
 
@@ -1172,17 +1338,17 @@ def compute_delta(old: ParsedDeps | None, new: ParsedDeps) -> list[PackageChange
 # Registry lookups: fixed routes, injected fetch
 # ---------------------------------------------------------------------------
 
-_NPM_NAME_RE = re.compile(r"^(?:@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$")
+_NPM_NAME_RE = re.compile(r"(?:@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*")
 
 
 def validate_npm_name(name: str) -> str:
-    if not isinstance(name, str) or len(name) > 214 or not _NPM_NAME_RE.match(name):
+    if not isinstance(name, str) or len(name) > 214 or not _NPM_NAME_RE.fullmatch(name):
         raise RegistryError(f"not a valid npm package name: {str(name)[:60]!r}")
     return name
 
 
 def validate_pypi_name(name: str) -> str:
-    if not isinstance(name, str) or len(name) > 214 or not _PYPI_NAME_RE.match(name):
+    if not isinstance(name, str) or len(name) > 214 or not _PYPI_NAME_RE.fullmatch(name):
         raise RegistryError(f"not a valid PyPI package name: {str(name)[:60]!r}")
     return _pep503(name)
 
@@ -1207,8 +1373,8 @@ class FetchResult:
     url: str
 
 
-# fetch(url, max_bytes, timeout_seconds) -> FetchResult. It raises OSError or
-# TimeoutError on a network failure.
+# fetch(url, max_bytes, timeout_seconds) -> FetchResult. It raises OSError,
+# TimeoutError or http.client.HTTPException on a network failure.
 Fetcher = Callable[[str, int, float], FetchResult]
 
 
@@ -1217,19 +1383,41 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def default_fetch(url: str, max_bytes: int, timeout: float) -> FetchResult:
-    """urllib fetch for the two fixed routes. It never follows a redirect."""
+def default_fetch(
+    url: str,
+    max_bytes: int,
+    timeout: float,
+    *,
+    opener: Any = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> FetchResult:
+    """urllib fetch for the two fixed routes. It never follows a redirect.
+
+    `timeout` bounds each socket operation and also the whole fetch.
+    """
     parts = urllib.parse.urlsplit(url)
     if parts.scheme != "https" or parts.hostname not in (NPM_REGISTRY_HOST, PYPI_REGISTRY_HOST):
         raise RegistryError("default_fetch refuses a URL outside the fixed registry hosts")
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = opener or urllib.request.build_opener(_NoRedirect)
     request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "oc-claude-review"})
+    deadline = clock() + timeout
     try:
         with opener.open(request, timeout=timeout) as resp:
-            body = resp.read(max_bytes + 1)
-            return FetchResult(status=resp.status, body=body, url=resp.url)
+            chunks: list[bytes] = []
+            size = 0
+            while size <= max_bytes:
+                if clock() > deadline:
+                    raise TimeoutError(f"{url}: over the {timeout}s total deadline")
+                chunk = resp.read(min(65536, max_bytes + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            return FetchResult(status=resp.status, body=b"".join(chunks), url=resp.url)
     except urllib.error.HTTPError as exc:
         return FetchResult(status=exc.code, body=b"", url=url)
+    except http.client.HTTPException as exc:
+        raise OSError(f"{url}: {type(exc).__name__}: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -1241,6 +1429,9 @@ class RegistryInfo:
     # npm only: the preinstall, install, postinstall and prepare scripts of
     # this version, from the registry manifest.
     install_scripts: Mapping[str, str] = field(default_factory=dict)
+    # PyPI only: some file of this version is a wheel (`bdist_wheel`). None
+    # for npm. False means sdist only, which runs build code at install.
+    has_wheel: bool | None = None
 
 
 def _parse_time(value: Any, what: str) -> datetime:
@@ -1268,7 +1459,7 @@ def _fetch_json(
             sleep(0.5 * 2 ** (attempt - 1))
         try:
             result = fetch(url, max_bytes, timeout)
-        except (OSError, TimeoutError) as exc:
+        except (OSError, http.client.HTTPException) as exc:  # TimeoutError is an OSError
             last = exc
             continue
         if result.status == 429 or result.status >= 500:
@@ -1330,6 +1521,17 @@ def lookup_npm(
     )
 
 
+def _norm_version(value: str) -> str:
+    """Rough PEP 440 normal form: no `v`, no trailing `.0`, no separators."""
+    match = re.fullmatch(r"v?(\d+(?:\.\d+)*)(.*)", value.strip().lower())
+    if not match:
+        return value.strip().lower()
+    release = match.group(1).split(".")
+    while len(release) > 1 and release[-1] == "0":
+        release.pop()
+    return ".".join(release) + re.sub(r"[-_.]", "", match.group(2))
+
+
 def lookup_pypi(
     name: str,
     version: str,
@@ -1350,16 +1552,24 @@ def lookup_pypi(
     if not isinstance(releases, dict):
         raise RegistryError(f"{url}: no releases map")
     files = releases.get(version)
+    if files is None:
+        # The lockfile may spell the version differently from the PyPI key.
+        wanted = _norm_version(version)
+        matches = [key for key in releases if isinstance(key, str) and _norm_version(key) == wanted]
+        files = releases[matches[0]] if len(matches) == 1 else None
     if not isinstance(files, list) or not files:
         raise RegistryError(f"{url}: version {version!r} not found")
     stamps = []
+    has_wheel = False
     for item in files:
         if not isinstance(item, dict):
             raise RegistryError(f"{url}: release file is not an object")
+        has_wheel = has_wheel or item.get("packagetype") == "bdist_wheel"
         stamps.append(_parse_time(item.get("upload_time_iso_8601", item.get("upload_time")), "upload time"))
     return RegistryInfo(
         ecosystem="pypi",
         name=normalized,
         version=version,
         published=min(stamps),
+        has_wheel=has_wheel,
     )

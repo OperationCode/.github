@@ -217,10 +217,10 @@ def test_yarn_v1():
     assert alias.version == "2.0.1"
 
 
-@pytest.mark.parametrize("fixture", ["yarn.berry4.lock", "yarn.berry6.lock", "yarn.berry8.lock"])
+@pytest.mark.parametrize("fixture", [f"yarn.berry{v}.lock" for v in (4, 5, 6, 7, 8)])
 def test_yarn_berry_versions_parse(fixture):
     parsed = load(fixture, "yarn.lock")
-    assert parsed.format_version in {"4", "6", "8"}
+    assert parsed.format_version in {"4", "5", "6", "7", "8"}
     assert parsed.packages
 
 
@@ -248,9 +248,10 @@ def test_yarn_berry_unknown_version():
 # --- pnpm-lock.yaml ------------------------------------------------------------
 
 
-def test_pnpm_v6():
-    parsed = load("pnpm-lock.v6.yaml", "pnpm-lock.yaml")
-    assert parsed.format_version == "6.0"
+@pytest.mark.parametrize(("fixture", "version"), [("pnpm-lock.v6.yaml", "6.0"), ("pnpm-lock.v6_1.yaml", "6.1")])
+def test_pnpm_v6(fixture, version):
+    parsed = load(fixture, "pnpm-lock.yaml")
+    assert parsed.format_version == version
     assert one(parsed, "left-pad").direct is True
     assert one(parsed, "@babel/core").version == "7.1.0"  # peer suffix stripped
     assert one(parsed, "esbuild").has_install_script is True
@@ -481,6 +482,7 @@ def test_pypi_url_uses_normalized_name():
         "_private",
         "a" * 215,
         "a\nb",
+        "a\n",
         "a\\b",
     ],
 )
@@ -490,7 +492,7 @@ def test_npm_url_rejects_bad_names(name):
 
 
 @pytest.mark.parametrize(
-    "name", ["", "a/b", "../x", "a b", "-x", "x-", "a?b", "a#b", "a%2Fb", "a" * 215, "a\nb", "@scope/x"]
+    "name", ["", "a/b", "../x", "a b", "-x", "x-", "a?b", "a#b", "a%2Fb", "a" * 215, "a\nb", "a\n", "@scope/x"]
 )
 def test_pypi_url_rejects_bad_names(name):
     with pytest.raises(RegistryError):
@@ -679,3 +681,249 @@ def test_default_fetch_refuses_other_hosts():
         deps.default_fetch("https://evil.example.com/x", 10, 1.0)
     with pytest.raises(RegistryError):
         deps.default_fetch("http://registry.npmjs.org/x", 10, 1.0)
+
+
+# --- fix round 1 ---------------------------------------------------------------
+
+
+def parse(path: str, text: str) -> deps.ParsedDeps:
+    return deps.parse_file(path, text.encode())
+
+
+def foreign_names(parsed: deps.ParsedDeps) -> set[str | None]:
+    return {i.name for i in deps.non_registry_sources(parsed) if i.source.foreign}
+
+
+UV_HEAD = 'version = 1\n[[package]]\nname = "a"\nversion = "1.0.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        'wheels = [{ url = "https://evil.com/a.whl", hash = "sha256:x" }]\n',
+        'sdist = { url = "https://evil.com/a.tar.gz", hash = "sha256:x" }\n',
+        'wheels = [{ url = "https://files.pythonhosted.org/a.whl" }, { url = "https://evil.com/b.whl" }]\n',
+    ],
+)
+def test_uv_lock_foreign_file_host_is_foreign(tail):
+    assert foreign_names(parse("uv.lock", UV_HEAD + tail)) == {"a"}
+
+
+def test_uv_lock_official_file_hosts_are_official():
+    tail = 'sdist = { url = "https://files.pythonhosted.org/a.tar.gz" }\nwheels = [{ url = "https://files.pythonhosted.org/a.whl" }]\n'
+    assert foreign_names(parse("uv.lock", UV_HEAD + tail)) == set()
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "-ihttps://evil.com/simple",
+        "-fhttps://evil.com",
+        "--index=https://evil.com/s",
+        "--extra-index https://evil.com/s",
+        "--index-url=https://evil.com/s",
+        "-i https://evil.com/s",
+        "--find-links https://evil.com/s",
+    ],
+)
+def test_requirements_index_option_forms_are_foreign(line):
+    parsed = parse("requirements.txt", f"{line}\nflask==3.0.0\n")
+    assert None in foreign_names(parsed)
+
+
+@pytest.mark.parametrize("line", ["--proxy http://x", "-v", "--use-feature=x", "--no-bin x", "--index-url"])
+def test_requirements_unknown_option_fails_closed(line):
+    with pytest.raises(DepsError):
+        parse("requirements.txt", f"{line}\n")
+
+
+def test_requirements_allowlisted_options_pass():
+    text = "--require-hashes\n--no-index\n--pre\n-r other.txt\n-rother.txt\n-c c.txt\n--trusted-host a.b\nflask==3.0.0 --hash=sha256:ab\n"
+    parsed = parse("requirements.txt", text)
+    assert parsed.global_sources == ()
+    assert [p.name for p in parsed.packages] == ["flask"]
+
+
+def test_requirements_attached_editable():
+    parsed = parse("requirements.txt", "-egit+https://github.com/a/b.git#egg=b\n")
+    assert one(parsed, "b").source.kind == "git"
+
+
+NPM_LOCK = (
+    '{"lockfileVersion": 3, "packages": {"": {"dependencies": {"a": "1"}}, '
+    '"node_modules/a": {"version": "1.0.0", "resolved": "%s"}}}'
+)
+
+
+def test_npm_tarball_path_must_match_package():
+    good = parse("package-lock.json", NPM_LOCK % "https://registry.npmjs.org/a/-/a-1.0.0.tgz")
+    assert one(good, "a").source.official
+    swapped = parse("package-lock.json", NPM_LOCK % "https://registry.npmjs.org/evil/-/evil-1.0.0.tgz")
+    assert foreign_names(swapped) == {"a"}
+
+
+def test_npm_scoped_tarball_path():
+    text = NPM_LOCK.replace('"node_modules/a"', '"node_modules/@s/n"').replace('"1.0.0"', '"1.0.0"')
+    ok_ = parse("package-lock.json", text % "https://registry.npmjs.org/@s/n/-/n-1.0.0.tgz")
+    assert one(ok_, "@s/n").source.official
+
+
+def test_npm_tarball_path_change_shows_in_delta():
+    old = parse("package-lock.json", NPM_LOCK % "https://registry.npmjs.org/a/-/a-1.0.0.tgz")
+    new = parse("package-lock.json", NPM_LOCK % "https://registry.npmjs.org/b/-/b-1.0.0.tgz")
+    assert [c.name for c in deps.compute_delta(old, new)] == ["a"]
+
+
+def test_npm_lock_entry_without_node_modules_is_classified():
+    text = '{"lockfileVersion": 3, "packages": {"": {}, "weird": {"version": "1.0.0", "resolved": "git+ssh://evil/x.git"}}}'
+    assert foreign_names(parse("package-lock.json", text)) == {"weird"}
+
+
+def test_npm_lock_workspace_member_dependencies_are_direct():
+    text = (
+        '{"lockfileVersion": 3, "packages": {"": {"workspaces": ["w"]}, "w": {"dependencies": {"a": "1"}}, '
+        '"node_modules/a": {"version": "1.0.0", "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz"}}}'
+    )
+    assert one(parse("package-lock.json", text), "a").direct is True
+
+
+def test_package_json_extra_sections_are_classified():
+    text = (
+        '{"peerDependencies": {"p": "git+https://evil/p.git"}, "overrides": {"o": "github:x/y", "n": {".": "1.0.0", "m": "https://evil/m.tgz"}}, '
+        '"resolutions": {"**/r": "file:../r"}, "pnpm": {"overrides": {"q": "https://evil/q.tgz"}}}'
+    )
+    parsed = parse("package.json", text)
+    assert foreign_names(parsed) == {"p", "o", "m", "q"}
+    assert one(parsed, "n").source.official
+
+
+def test_berry_patch_of_foreign_descriptor_is_foreign():
+    text = (
+        '__metadata:\n  version: 8\n\n'
+        '"foo@patch:foo@https://evil.example.com/x.tgz#./p.patch::locator=r":\n'
+        '  version: 1.0.0\n'
+        '  resolution: "foo@patch:foo@https://evil.example.com/x.tgz#./p.patch::version=1.0.0&hash=a"\n'
+    )
+    assert foreign_names(parse("yarn.lock", text)) == {"foo"}
+
+
+def test_duplicate_yaml_keys_are_refused():
+    with pytest.raises(DepsError, match="duplicate"):
+        parse("pnpm-lock.yaml", "lockfileVersion: '9.0'\npackages: {}\npackages: {}\n")
+    with pytest.raises(DepsError, match="duplicate"):
+        parse("yarn.lock", "__metadata:\n  version: 8\n  version: 6\n")
+
+
+def test_pyproject_global_index_options_and_poetry_sources():
+    uv = parse(
+        "pyproject.toml",
+        '[tool.uv]\nindex-url = "https://evil.com/s"\nextra-index-url = ["https://pypi.org/simple", "https://e2.com/s"]\n'
+        '[tool.uv.pip]\nfind-links = ["https://e3.com/f"]\n',
+    )
+    assert {s.host for s in uv.global_sources if s.foreign} == {"evil.com", "e2.com", "e3.com"}
+    poetry = parse("pyproject.toml", '[[tool.poetry.source]]\nname = "x"\nurl = "https://evil.com/s"\n')
+    assert [s.host for s in poetry.global_sources] == ["evil.com"]
+
+
+def test_uv_sources_keys_are_normalized():
+    text = '[project]\ndependencies = ["my-pkg"]\n[tool.uv.sources]\nMy_Pkg = { git = "https://evil.com/x.git" }\n'
+    assert foreign_names(parse("pyproject.toml", text)) == {"my-pkg"}
+
+
+def test_shrinkwrap_is_an_unsupported_dep_file():
+    assert deps.is_unsupported_dep_file("web/npm-shrinkwrap.json")
+
+
+def test_pnpm_empty_packages_and_non_mapping():
+    assert parse("pnpm-lock.yaml", "lockfileVersion: '9.0'\npackages:\n").packages == ()
+    with pytest.raises(DepsError):
+        parse("pnpm-lock.yaml", "lockfileVersion: '9.0'\npackages: []\n")
+
+
+def test_lookup_retries_http_client_errors():
+    import http.client
+
+    fetch = FakeFetch(http.client.IncompleteRead(b"x"))
+    with pytest.raises(RegistryError, match="failed after 3 attempts"):
+        deps.lookup_npm("esbuild", "0.19.0", fetch, sleep=lambda _s: None)
+    assert len(fetch.calls) == 3
+
+
+def test_pypi_has_wheel():
+    doc = {
+        "info": {"name": "x"},
+        "releases": {
+            "1.0": [{"upload_time_iso_8601": "2024-01-01T00:00:00Z", "packagetype": "sdist"}],
+            "2.0": [
+                {"upload_time_iso_8601": "2024-01-01T00:00:00Z", "packagetype": "sdist"},
+                {"upload_time_iso_8601": "2024-01-01T00:00:00Z", "packagetype": "bdist_wheel"},
+            ],
+        },
+    }
+    url = "https://pypi.org/pypi/x/json"
+    assert deps.lookup_pypi("x", "1.0", FakeFetch(ok(doc, url))).has_wheel is False
+    assert deps.lookup_pypi("x", "2.0", FakeFetch(ok(doc, url))).has_wheel is True
+    assert deps.lookup_npm("esbuild", "0.19.0", FakeFetch(ok(NPM_DOC, "https://registry.npmjs.org/esbuild"))).has_wheel is None
+
+
+def test_lookup_pypi_matches_normalized_version():
+    doc = {"info": {"name": "x"}, "releases": {"1.0": [{"upload_time_iso_8601": "2024-01-01T00:00:00Z"}]}}
+    info = deps.lookup_pypi("x", "1.0.0", FakeFetch(ok(doc, "https://pypi.org/pypi/x/json")))
+    assert info.version == "1.0.0"
+
+
+class _Resp:
+    def __init__(self, chunks, status=200, url="https://registry.npmjs.org/a"):
+        self.chunks, self.status, self.url = list(chunks), status, url
+
+    def read(self, n):
+        return self.chunks.pop(0)[:n] if self.chunks else b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _Opener:
+    def __init__(self, outcome):
+        self.outcome = outcome
+
+    def open(self, request, timeout):
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+
+def test_default_fetch_reads_body_and_caps_bytes():
+    got = deps.default_fetch("https://registry.npmjs.org/a", 10, 5.0, opener=_Opener(_Resp([b"abcd", b"efgh"])))
+    assert got.body == b"abcdefgh" and got.status == 200
+    big = deps.default_fetch("https://registry.npmjs.org/a", 4, 5.0, opener=_Opener(_Resp([b"abcdefgh"])))
+    assert len(big.body) > 4  # one byte over the cap: the caller refuses it
+
+
+def test_default_fetch_http_error_and_redirect_statuses():
+    import urllib.error
+
+    for code in (302, 404):
+        err = urllib.error.HTTPError("https://registry.npmjs.org/a", code, "x", {}, None)
+        got = deps.default_fetch("https://registry.npmjs.org/a", 10, 5.0, opener=_Opener(err))
+        assert got.status == code
+    redirect = deps.FetchResult(status=302, body=b"", url="https://registry.npmjs.org/a")
+    with pytest.raises(RegistryError, match="HTTP 302"):
+        deps.lookup_npm("a", "1.0.0", FakeFetch(redirect))
+
+
+def test_default_fetch_total_deadline_and_httplib_errors():
+    import http.client
+
+    ticks = iter([0.0, 1.0, 99.0, 99.0])
+    with pytest.raises(TimeoutError):
+        deps.default_fetch(
+            "https://registry.npmjs.org/a", 100, 5.0, opener=_Opener(_Resp([b"a", b"b"])), clock=lambda: next(ticks)
+        )
+    with pytest.raises(OSError):
+        deps.default_fetch(
+            "https://registry.npmjs.org/a", 10, 5.0, opener=_Opener(http.client.IncompleteRead(b"x"))
+        )
