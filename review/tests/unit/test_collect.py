@@ -320,6 +320,10 @@ def test_over_cap_blobs_are_unavailable():
     assert any(sha["liar.txt"] in p for p in paths)
     assert files["big.txt"]["coverage"] == "unavailable"
     assert files["liar.txt"]["coverage"] == "unavailable"
+    # Both are over the cap, whether or not they were fetched.
+    assert files["big.txt"]["coverage_reason"] == "over-cap"
+    assert files["liar.txt"]["coverage_reason"] == "over-cap"
+    assert col.envelope["payload"]["coverage"]["files_collected"] == 1
     assert "head_content" not in files["liar.txt"]
     assert files["small.txt"]["coverage"] == "full"
     blocked = {h.get("file") for h in col.envelope["payload"]["prefilter"]["hard_blocks"] if h["id"] == "incomplete-coverage"}
@@ -408,8 +412,23 @@ def test_size_estimate_counts_rendered_text():
     doc = col.envelope
     size = doc["payload"]["size"]
     assert size["limit_tokens"] == c.SIZE_GATE_TOKENS
+    # Exact: the estimate is of the final document, its size field included.
+    assert size["estimated_tokens"] == c.estimate_tokens(doc)
     rendered = render.render_bundle(doc).text
-    assert abs(size["estimated_tokens"] - len(rendered) / c.CHARS_PER_TOKEN) < 100
+    assert size["estimated_tokens"] == -(-len(rendered) // c.CHARS_PER_TOKEN)
+
+
+def test_size_gate_boundary_on_the_final_document():
+    # Limits of one digit count, so the size field renders at one length.
+    probe, _, _ = run("fork-pr", size_gate_tokens=9999)
+    tokens = probe.envelope["payload"]["size"]["estimated_tokens"]
+    assert 1000 < tokens <= 9999
+    at, _, _ = run("fork-pr", size_gate_tokens=tokens)
+    assert at.envelope["status"] == "ok"
+    assert at.envelope["payload"]["size"]["estimated_tokens"] == tokens == c.estimate_tokens(at.envelope)
+    over, _, _ = run("fork-pr", size_gate_tokens=tokens - 1)
+    assert over.envelope["status"] == "skipped-size"
+    assert over.envelope["payload"]["size"]["estimated_tokens"] == tokens
 
 
 # ---------------------------------------------------------------- envelope file
@@ -574,6 +593,54 @@ def test_pagination_fails_closed():
         cl.get_pages("/x")
 
 
+@pytest.mark.parametrize(
+    "link",
+    [
+        "<https://api.github.com/x?page=2>; rel=next",
+        '<https://api.github.com/x?page=2>; rel="prev next"',
+        '<https://api.github.com/x?page=2>;rel="NEXT"',
+        '<https://api.github.com/x?page=1>; rel="first", <https://api.github.com/x?page=2>; title="a, b; c"; rel="next"',
+    ],
+)
+def test_pagination_reads_every_next_link_form(link):
+    cl, t, _ = client((200, b"[1]", None, {"link": link}), (200, b"[2]"))
+    assert cl.get_pages("/x") == [1, 2]
+    assert t.requests[1].url == "https://api.github.com/x?page=2"
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        "",
+        "garbage",
+        "https://api.github.com/x?page=2; rel=next",
+        '<https://api.github.com/x?page=2>; rel="next" junk',
+        '<https://api.github.com/x?page=2>; rel="next",',
+        '<https://api.github.com/x?page=2>; rel="next", <https://api.github.com/x?page=3>; rel="next"',
+    ],
+)
+def test_pagination_fails_closed_on_a_bad_link_header(link):
+    # A Link header that does not parse is never read as "no next page".
+    cl, _, _ = client((200, b"[1]", None, {"link": link}))
+    with pytest.raises(c.HttpError, match="Link header|next page link"):
+        cl.get_pages("/x")
+
+
+def test_pagination_missing_page_fails():
+    nxt = {"link": "<https://api.github.com/x?page=2>; rel=next"}
+    cl, _, _ = client((200, b"[1]", None, nxt), (404, b""))
+    with pytest.raises(c.HttpError, match="HTTP 404"):
+        cl.get_pages("/x")
+
+
+def test_parse_link_header():
+    assert c.parse_link_header('<https://a/x?a,b>; rel="prev next", <https://a/y>; rel=last') == [
+        ("https://a/x?a,b", frozenset({"prev", "next"})),
+        ("https://a/y", frozenset({"last"})),
+    ]
+    assert c.parse_link_header("<https://a/x>") == [("https://a/x", frozenset())]
+
+
 def test_default_transport_refuses_other_hosts():
     req = c.HttpRequest("GET", "https://evil.example.com/x", {}, 10, 1.0)
     with pytest.raises(c.HttpError):
@@ -637,3 +704,160 @@ def test_patch_is_redacted_with_blob_context():
     redacted = render.redact_patch(patch, base, head)
     assert "B" * 64 not in redacted and "A" * 64 not in redacted
     assert "[REDACTED:" in redacted
+
+
+# ---------------------------------------------------------------- verification-only content
+
+
+def _snapshot(base: dict, head: dict) -> dict:
+    """The truncated fixture's snapshot with complete trees of these files.
+
+    Each tree maps path -> (mode, data): blob bytes or text, or for mode
+    160000 the commit SHA of the gitlink.
+    """
+    fx = load("truncated")
+    head_sha = fx["event"]["pull_request"]["head"]["sha"]
+    trees = [k for k in fx["github"] if "/git/trees/" in k]
+    keys = {"base": next(k for k in trees if head_sha not in k), "head": next(k for k in trees if head_sha in k)}
+    for side, entries in (("base", base), ("head", head)):
+        items = []
+        for path, (mode, data) in entries.items():
+            if mode == "160000":
+                items.append({"path": path, "mode": mode, "type": "commit", "sha": data})
+                continue
+            raw = data.encode() if isinstance(data, str) else data
+            sha = prefilter.git_blob_sha(raw)
+            items.append({"path": path, "mode": mode, "type": "blob", "sha": sha, "size": len(raw)})
+            fx["github"][f"{API_REPO}/git/blobs/{sha}"] = {"status": 200, "base64": base64.b64encode(raw).decode()}
+        fx["github"][keys[side]]["json"] = {"sha": "1" * 40, "tree": items, "truncated": False}
+    return fx
+
+
+def _sides(col: c.Collected) -> list:
+    return [
+        verdict.changed_file(f["path"], old_path=f["old_path"], base_raw=f.get("base_content"), head_raw=f.get("head_content"))
+        for f in col.envelope["payload"]["files"]
+    ]
+
+
+def _cite(col: c.Collected, path: str, side: str, line: int, quote: str):
+    finding = {
+        "category": "bug", "severity": "medium", "confidence": "high", "file": path, "side": side,
+        "line": line, "quote": quote, "title": "t", "explanation": "x",
+    }
+    return verdict.cite_finding("review", finding, _sides(col))
+
+
+GITLINK = "c" * 40
+PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe"
+
+
+def test_content_is_the_short_head_and_raw_text_never_renders():
+    short = "".join(f"short {i}\n" for i in range(1, 11))
+    long = "".join(f"long {i}\n" for i in range(1, render.MAX_HEAD_CONTENT_LINES + 1))
+    fx = _snapshot(
+        {"a.py": ("100644", "old = 1\nBASE_ONLY_MARKER = 1\n" + "x = 1\n" * 20)},
+        {"a.py": ("100644", "new = 1\n" + "x = 1\n" * 20), "short.py": ("100644", short), "long.py": ("100644", long)},
+    )
+    col, _, _ = run(fx)
+    files = files_by_path(col)
+    assert files["short.py"]["content"] == files["short.py"]["head_content"] == short
+    assert "content" not in files["long.py"] and files["long.py"]["head_content"] == long
+    assert files["a.py"]["base_content"].startswith("old = 1\nBASE_ONLY_MARKER")
+    text = render.render_bundle(col.envelope, nonce="fedcba9876543210").text
+    assert "head_content" not in text and "base_content" not in text
+    # Base text only where the patch shows it.
+    assert text.count("BASE_ONLY_MARKER") == 1 and "| -BASE_ONLY_MARKER = 1" in text
+    # The short head shows once (content); the long one only in its patch.
+    assert text.count("| short 1") == 2  # content and the added-lines patch
+    assert "content: (10 lines)" in text
+    assert text.count("long 2000") == 1
+
+
+def test_text_replaced_by_gitlink_keeps_base_text():
+    base_text = "def check(user):\n    if not user.admin:\n        raise PermissionError('admin only')\n"
+    col, _, _ = run(_snapshot({"dep": ("100644", base_text)}, {"dep": ("160000", GITLINK)}))
+    f = files_by_path(col)["dep"]
+    assert f["coverage"] == "binary" and f["submodule"] is True
+    assert (f["base_mode"], f["head_mode"], f["head_blob_sha"]) == ("100644", "160000", GITLINK)
+    assert f["binary"] is False
+    assert f["base_content"] == base_text and "head_content" not in f and "content" not in f
+    assert (f["additions"], f["deletions"]) == (0, 3)
+    assert f["patch"] == "@@ -1,3 +0,0 @@\n" + "".join(f"-{line}\n" for line in base_text.splitlines())
+    assert "submodule-change" in ids(col.envelope["payload"]["prefilter"]["signals"])
+    text = render.render_bundle(col.envelope, nonce="fedcba9876543210").text
+    assert "-        raise PermissionError('admin only')" in text
+    cited = _cite(col, "dep", "base", 3, "raise PermissionError('admin only')")
+    assert cited.verified and cited.inline
+
+
+def test_gitlink_replaced_by_long_text_sends_every_line():
+    n = render.MAX_HEAD_CONTENT_LINES + 5
+    head_text = "".join(f"line {i}\n" for i in range(1, n + 1))
+    col, _, _ = run(_snapshot({"dep": ("160000", GITLINK)}, {"dep": ("100644", head_text)}))
+    f = files_by_path(col)["dep"]
+    assert f["submodule"] is True and f["binary"] is False
+    assert f["base_blob_sha"] == GITLINK and f["head_content"] == head_text
+    assert "content" not in f and "base_content" not in f
+    assert (f["additions"], f["deletions"]) == (n, 0)
+    text = render.render_bundle(col.envelope, nonce="fedcba9876543210").text
+    assert f"| +line {n}" in text and "| +line 1\n" in text
+    cited = _cite(col, "dep", "head", n, f"line {n}")
+    assert cited.verified and cited.inline
+
+
+def test_text_replaced_by_binary_keeps_base_text():
+    col, _, _ = run(_snapshot({"logo.png": ("100644", "not an image\n")}, {"logo.png": ("100644", PNG)}))
+    f = files_by_path(col)["logo.png"]
+    assert f["coverage"] == "binary" and f["binary"] is False
+    assert f["base_content"] == "not an image\n" and "head_content" not in f
+    assert f["patch"] == "@@ -1 +0,0 @@\n-not an image\n"
+    assert _cite(col, "logo.png", "base", 1, "not an image").verified
+
+
+def test_binary_and_gitlink_only_files_list_size_and_sha():
+    col, _, _ = run(_snapshot({"a.png": ("100644", PNG), "sub": ("160000", GITLINK)},
+                              {"a.png": ("100644", PNG + b"\x00"), "sub": ("160000", "d" * 40)}))
+    files = files_by_path(col)
+    for f in files.values():
+        assert f["binary"] is True and "patch" not in f
+        assert not {"content", "head_content", "base_content"} & set(f)
+
+
+# ---------------------------------------------------------------- base-side dependency failures
+
+EMPTY_LOCK = json.dumps({"name": "x", "lockfileVersion": 3, "requires": True, "packages": {"": {"name": "x"}}})
+UNKNOWN_LOCK = json.dumps({"name": "x", "lockfileVersion": 99, "packages": {}})
+
+
+def _dep_blocks(col: c.Collected) -> set[tuple[str, str]]:
+    hard = col.envelope["payload"]["prefilter"]["hard_blocks"]
+    return {(h["file"], h["detail"]) for h in hard if h["id"] == "incomplete-dependency-data"}
+
+
+@pytest.mark.parametrize(
+    "base,reason",
+    [
+        ("{not json", "does not parse at the merge base"),
+        (UNKNOWN_LOCK, "unknown lockfile version at the merge base"),
+    ],
+)
+def test_base_lockfile_that_does_not_parse_is_a_hard_block(base, reason):
+    col, _, _ = run(_snapshot({"package-lock.json": ("100644", base)}, {"package-lock.json": ("100644", EMPTY_LOCK)}))
+    assert _dep_blocks(col) == {("package-lock.json", f"dependency data incomplete: {reason}")}
+    delta = col.envelope["payload"]["dependency_delta"]
+    assert delta["failures"] == [{"path": "package-lock.json", "reason": reason}]
+    assert col.envelope["payload"]["coverage"]["complete"] is True
+
+
+def test_deleted_lockfile_is_parsed_at_the_merge_base():
+    col, _, _ = run(_snapshot({"package-lock.json": ("100644", "{not json")}, {}))
+    assert _dep_blocks(col) == {("package-lock.json", "dependency data incomplete: does not parse at the merge base")}
+    col, _, _ = run(_snapshot({"package-lock.json": ("100644", EMPTY_LOCK)}, {}))
+    assert _dep_blocks(col) == set()
+
+
+def test_base_symlink_or_gitlink_lockfile_counts_as_absent():
+    for base in (("120000", "other.json"), ("160000", GITLINK)):
+        col, _, _ = run(_snapshot({"package-lock.json": base}, {"package-lock.json": ("100644", EMPTY_LOCK)}))
+        assert _dep_blocks(col) == set()

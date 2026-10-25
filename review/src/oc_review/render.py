@@ -31,7 +31,7 @@ any other key with the same generic rules, so it drops nothing:
                         author_login, author_association, labels}
     files:             [{path, old_path, status, additions, deletions,
                          head_blob_sha, base_blob_sha, binary, size, coverage,
-                         patch, patch_redaction, head_content,
+                         patch, patch_redaction, content, head_content,
                          base_content}]
     dependency_delta, prefilter: {signals, hard_blocks}, coverage, size
 
@@ -42,11 +42,11 @@ any other key with the same generic rules, so it drops nothing:
   blobs, and `patch_redaction` is `PATCH_REDACTION`. Render refuses a patch
   without it, adds the base and head line numbers and fails closed when the
   hunk counts do not match the lines.
-- `head_content` goes to Claude only for files under 2,000 lines (spec
-  "Coverage limits"). Patches are not cut; the size gate bounds them.
-- `base_content` (and `head_content` of any length) is raw blob text for the
-  citation check in verdict.py. Render never shows `base_content`
-  (`VERIFY_ONLY_FILE_KEYS`).
+- `content` is the full head text that goes to Claude, set by collect only
+  for text files under 2,000 lines (spec "Bundle"); render omits a longer one.
+  Patches are not cut; the size gate bounds them.
+- `head_content` and `base_content` are raw blob text for the citation check
+  in verdict.py only. Render never shows them (`VERIFY_ONLY_FILE_KEYS`).
 
 Prompts: `load_prompt` reads `review/prompts/<name>.md` and fills `{nonce}`.
 """
@@ -880,15 +880,15 @@ def _emit_numbered(out: list[str], label: str, text: str) -> None:
     out.extend(f"  | {n:>5} | {line}" for n, line in enumerate(lines, 1))
 
 
-def _emit_head_content(out: list[str], content: Any) -> None:
+def _emit_content(out: list[str], content: Any) -> None:
     if not isinstance(content, str):
-        _emit(out, 0, "head_content", content, 1)
+        _emit(out, 0, "content", content, 1)
         return
     n = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
     if n >= MAX_HEAD_CONTENT_LINES:
-        out.append(f"head_content: omitted, {n} lines (limit: under {MAX_HEAD_CONTENT_LINES} lines)")
+        out.append(f"content: omitted, {n} lines (limit: under {MAX_HEAD_CONTENT_LINES} lines)")
         return
-    _emit_numbered(out, "head_content", content)
+    _emit_numbered(out, "content", content)
 
 
 _HUNK_RE = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)", re.DOTALL)
@@ -951,8 +951,9 @@ def _parse_patch(patch: str) -> tuple[list[_Row], list[str]]:
 
 
 # File keys kept in the bundle for the citation check only, never sent to
-# Claude. Claude sees base lines only inside the numbered patch hunks.
-VERIFY_ONLY_FILE_KEYS = frozenset({"base_content"})
+# Claude, at any length. Claude sees head text in `content` and the patch, and
+# base lines only inside the numbered patch hunks.
+VERIFY_ONLY_FILE_KEYS = frozenset({"head_content", "base_content"})
 
 # Value of `files[].patch_redaction` when the patch came from `redact_patch`.
 PATCH_REDACTION = "blob-context"
@@ -1063,14 +1064,14 @@ def _emit_file(out: list[str], index: int, total: int, f: Any) -> None:
         return
     binary = f.get("binary") is True
     for k, v in f.items():
-        if k not in ("patch", "head_content") and k not in VERIFY_ONLY_FILE_KEYS:
+        if k not in ("patch", "content") and k not in VERIFY_ONLY_FILE_KEYS:
             _emit(out, 0, _key(k), v, 1)
     if binary:
         return
     if "patch" in f:
         _emit_patch(out, f["patch"], f.get("patch_redaction"))
-    if "head_content" in f:
-        _emit_head_content(out, f["head_content"])
+    if "content" in f:
+        _emit_content(out, f["content"])
 
 
 def _emit_pr(out: list[str], pr: Mapping[str, Any]) -> None:

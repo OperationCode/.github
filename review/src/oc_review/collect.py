@@ -18,9 +18,10 @@ Rules this module keeps:
   and network errors only) and no redirects. It talks to api.github.com only.
 - A truncated tree or a blob that cannot be read is never skipped: the
   prefilter turns it into the hard block "incomplete coverage".
-- The bundle carries `head_content` and `base_content` (raw blob text) for the
-  citation check in verdict.py. Render never sends `base_content` to Claude,
-  and sends `head_content` only for files under 2,000 lines.
+- The bundle carries `head_content` and `base_content` (raw blob text of each
+  text side) for the citation check in verdict.py only; render never sends
+  them to Claude. Claude gets the head text in `content`, for text files under
+  2,000 lines, and every changed line in the patch.
 - A `skipped-size` bundle keeps the prefilter result, the coverage record and
   the dependency delta (K-7). The producer digest is the SHA-256 of the exact
   envelope file bytes (K-5).
@@ -80,6 +81,7 @@ MAX_BLOB_READS = 500
 
 SIZE_GATE_TOKENS = 150_000
 CHARS_PER_TOKEN = 4
+SIZE_ESTIMATE_ROUNDS = 10
 SIZE_GATE_REASON = "too large for automatic review"
 
 SCHEMA_VERSION = 1
@@ -99,7 +101,13 @@ CHANGED_FILES_DIFFER = "changed-files-differ"
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
-_LINK_NEXT_RE = re.compile(r'<([^<>]+)>\s*;\s*rel="next"')
+# RFC 8288 link-value pieces: `<uri>`, then `; name=value` parameters, where a
+# value is a token or a quoted string.
+_LINK_URI_RE = re.compile(r"[ \t]*<([^<>]*)>")
+_LINK_PARAM_RE = re.compile(
+    r'[ \t]*;[ \t]*([!#$%&\'*+.^_`|~0-9A-Za-z-]+)[ \t]*(?:=[ \t]*(?:"((?:[^"\\]|\\.)*)"|([^\s;,"]+)))?'
+)
+_LINK_SEP_RE = re.compile(r"[ \t]*(,|\Z)")
 
 
 class CollectError(Exception):
@@ -253,9 +261,10 @@ class GitHubClient:
     ) -> list[Any]:
         """Every item of a paginated list endpoint, following `Link: rel="next"`.
 
-        Each page must be a JSON array. A next link to another host, or more
-        than `max_pages` pages, fails: a list that was not read completely is
-        never returned as complete.
+        Each page must be a JSON array. A Link header that does not parse, more
+        than one next link, a next link to another host, or more than
+        `max_pages` pages fails: a list that was not read completely is never
+        returned as complete.
         """
         url = self._url(path, {"per_page": 100, **(params or {})})
         items: list[Any] = []
@@ -265,14 +274,51 @@ class GitHubClient:
             if not isinstance(page, list):
                 raise HttpError(f"{path}: page is not a list")
             items.extend(page)
-            m = _LINK_NEXT_RE.search(resp.headers.get("link", ""))
-            if m is None:
+            link = resp.headers.get("link")
+            if link is None:
                 return items
-            url = m.group(1)
+            try:
+                nexts = [uri for uri, rels in parse_link_header(link) if "next" in rels]
+            except ValueError as exc:
+                raise HttpError(f"{path}: {exc}") from exc
+            if not nexts:
+                return items
+            if len(nexts) > 1:
+                raise HttpError(f"{path}: more than one next page link")
+            url = nexts[0]
             nxt = urllib.parse.urlsplit(url)
             if nxt.scheme != "https" or nxt.hostname != API_HOST or nxt.port is not None:
                 raise HttpError(f"{path}: next page link points to another host")
         raise HttpError(f"{path}: more than {max_pages} pages")
+
+
+def parse_link_header(value: str) -> list[tuple[str, frozenset[str]]]:
+    """(URI, relation types) for each link-value of a `Link` header (RFC 8288).
+
+    Relation types are lower case; `rel` takes its first occurrence. Raises
+    ValueError when the header does not parse, so a caller never mistakes a
+    malformed header for the last page.
+    """
+    out: list[tuple[str, frozenset[str]]] = []
+    pos = 0
+    while True:
+        m = _LINK_URI_RE.match(value, pos)
+        if m is None:
+            raise ValueError("Link header does not parse")
+        uri, pos = m.group(1), m.end()
+        rel: str | None = None
+        while (p := _LINK_PARAM_RE.match(value, pos)) is not None:
+            pos = p.end()
+            if p.group(1).lower() == "rel" and rel is None:
+                quoted, token = p.group(2), p.group(3)
+                rel = re.sub(r"\\(.)", r"\1", quoted) if quoted is not None else token or ""
+        sep = _LINK_SEP_RE.match(value, pos)
+        if sep is None:
+            raise ValueError("Link header does not parse")
+        out.append((uri, frozenset((rel or "").lower().split())))
+        if not sep.group(1):
+            return out
+        pos = sep.end()
 
 
 def _parse_json(body: bytes, what: str) -> Any:
@@ -506,26 +552,34 @@ def _read_blobs(
     *,
     max_blob_bytes: int,
     max_reads: int,
-) -> dict[str, bytes | None]:
-    """Blob bytes by SHA; None when a blob cannot be read.
+) -> tuple[dict[str, bytes | None], dict[str, str]]:
+    """Blob bytes by SHA (None when a blob cannot be read), and the coverage
+    reason `over-cap` by SHA for a blob that is None because of its size.
 
-    A blob whose tree entry is over the cap is not fetched. The prefilter
-    checks every blob against its SHA before it scans it.
+    A blob whose tree entry is over the cap is not fetched. Past `max_reads`
+    a blob counts as unreadable. The prefilter checks every blob against its
+    SHA before it scans it.
     """
     out: dict[str, bytes | None] = {}
+    reasons: dict[str, str] = {}
     reads = 0
     for sha in shas:
         if sha in out:
             continue
-        if sizes.get(sha, 0) > max_blob_bytes or reads >= max_reads:
+        if sizes.get(sha, 0) > max_blob_bytes:
+            out[sha], reasons[sha] = None, "over-cap"
+            continue
+        if reads >= max_reads:
             out[sha] = None
             continue
         reads += 1
         try:
             out[sha] = client.get_raw(f"{repo}/git/blobs/{sha}", max_bytes=max_blob_bytes)
+        except ResponseTooLarge:
+            out[sha], reasons[sha] = None, "over-cap"
         except HttpError:
             out[sha] = None
-    return out
+    return out, reasons
 
 
 # ---------------------------------------------------------------------------
@@ -576,8 +630,11 @@ def dependency_facts(
     """Parse each changed supported file at the merge base and the head, and
     look up every new exact registry version (`prefilter.registry_key`).
 
-    A base side that does not parse counts as absent, so every head entry is
-    new: more checks, never fewer.
+    A side that does not parse, at the head or at the merge base (a deleted
+    file too), is a `DepFailure`: the hard block "incomplete dependency data".
+    A base side that does not parse also counts as absent, so every head entry
+    is new. A base symlink or gitlink holds no dependency data, so it counts
+    as absent without a failure.
     """
     parsed: set[str] = set()
     changes: list[deps.PackageChange] = []
@@ -585,21 +642,26 @@ def dependency_facts(
     failures: list[prefilter.DepFailure] = []
     for c in diff.files:
         family = deps.family_for_path(c.path)
-        if family is None or c.head_sha is None or c.head_mode == MODE_SUBMODULE:
-            continue
-        try:
-            new = _parse_side(c.path, c.head_mode, blobs.get(c.head_sha))
-        except deps.DepsError as exc:
-            failures.append(prefilter.DepFailure(c.path, _failure_reason(exc)))
-            continue
-        parsed.add(c.path)
-        old = None
         base_path = c.old_path or c.path
-        if c.base_sha is not None and c.base_mode != MODE_SUBMODULE and deps.family_for_path(base_path) == family:
+        base_family = deps.family_for_path(base_path)
+        new: deps.ParsedDeps | None = None
+        if family is not None and c.head_sha is not None and c.head_mode != MODE_SUBMODULE:
+            try:
+                new = _parse_side(c.path, c.head_mode, blobs.get(c.head_sha))
+            except deps.DepsError as exc:
+                failures.append(prefilter.DepFailure(c.path, _failure_reason(exc)))
+            else:
+                parsed.add(c.path)
+        old: deps.ParsedDeps | None = None
+        if base_family is not None and c.base_sha is not None and c.base_mode not in (MODE_SUBMODULE, MODE_SYMLINK):
             try:
                 old = _parse_side(base_path, c.base_mode, blobs.get(c.base_sha))
-            except deps.DepsError:
-                old = None
+            except deps.DepsError as exc:
+                failures.append(prefilter.DepFailure(c.path, f"{_failure_reason(exc)} at the merge base"))
+        if new is None:
+            continue
+        if base_family != family:
+            old = None
         changes.extend(deps.compute_delta(old, new))
         old_sources = {s.normalized for s in old.global_sources} if old is not None else set()
         new_sources.extend(
@@ -712,7 +774,7 @@ def _file_entry(
         "deletions": 0,
         "base_blob_sha": change.base_sha,
         "head_blob_sha": change.head_sha,
-        "binary": cov.coverage == "binary",
+        "binary": False,
         "size": sizes.get(change.head_sha or "", sizes.get(change.base_sha or "")),
         "coverage": cov.coverage,
     }
@@ -722,20 +784,27 @@ def _file_entry(
         entry["submodule"] = True
     if change.is_symlink:
         entry["symlink"] = True
-    if cov.coverage != "full":
+    if cov.coverage == "unavailable":
         return entry
     base_text = base.text if base is not None and base.kind == "full" else None
     head_text = head.text if head is not None and head.kind == "full" else None
-    sides_text = all(s is None or s.kind == "full" for s in (base, head))
-    if sides_text and not change.is_submodule:
-        patch, adds, dels = unified_diff(base_text, head_text)
-        try:
-            entry["patch"] = render.redact_patch(patch, base_text, head_text)
-        except render.RenderError as exc:
-            raise CollectError(f"patch redaction failed: {exc}") from exc
-        entry["patch_redaction"] = render.PATCH_REDACTION
-        entry["additions"], entry["deletions"] = adds, dels
+    if base_text is None and head_text is None:
+        # Binary blobs or gitlinks only: listed with size and SHA.
+        entry["binary"] = cov.coverage == "binary"
+        return entry
+    # Each text side counts on its own. Opposite a gitlink or a binary blob,
+    # the patch adds every head line or removes every base line, so a type
+    # change never hides text from Claude or from the citation check.
+    patch, adds, dels = unified_diff(base_text, head_text)
+    try:
+        entry["patch"] = render.redact_patch(patch, base_text, head_text)
+    except render.RenderError as exc:
+        raise CollectError(f"patch redaction failed: {exc}") from exc
+    entry["patch_redaction"] = render.PATCH_REDACTION
+    entry["additions"], entry["deletions"] = adds, dels
     if head_text is not None:
+        if len(_git_lines(head_text)[0]) < render.MAX_HEAD_CONTENT_LINES:
+            entry["content"] = head_text
         entry["head_content"] = head_text
     if base_text is not None:
         entry["base_content"] = base_text
@@ -751,7 +820,7 @@ def _changed_files_signal(pr: Mapping[str, Any], diff: TreeDiff) -> dict[str, An
         level=prefilter.SIGNAL,
         detail=f"GitHub's PR view lists {shown} changed files; the reviewed comparison has {len(diff.files)}",
     )
-    return asdict(check)
+    return {**asdict(check), "lines": list(check.lines)}
 
 
 def estimate_tokens(bundle_envelope: Mapping[str, Any]) -> int:
@@ -875,7 +944,7 @@ def collect(
         # incomplete; the prefilter records the hard block.
         diff = TreeDiff((), False)
     sizes = {**base_tree.sizes, **head_tree.sizes}
-    blobs = _read_blobs(
+    blobs, unread_reasons = _read_blobs(
         client, repo, _blob_shas(diff), sizes,
         max_blob_bytes=max_blob_bytes, max_reads=max_blob_reads,
     )
@@ -892,13 +961,12 @@ def collect(
         pr_title=pr_meta["title"],
         pr_body=pr_meta["body"],
         max_blob_bytes=max_blob_bytes,
+        unread_reasons=unread_reasons,
     )
     checks = result.to_dict()
     extra = _changed_files_signal(pr, diff)
     if extra is not None:
         checks["prefilter"]["signals"].append(extra)
-    # JSON types only: `asdict` keeps tuples, which render refuses.
-    checks = json.loads(json.dumps(checks))
     delta = _delta_payload(facts)
     files = [
         _file_entry(c, cov, blobs, sizes, max_blob_bytes)
@@ -907,9 +975,18 @@ def collect(
 
     payload = {"pr": pr_meta, "files": files, "dependency_delta": delta, **checks}
     doc = {**context, "status": "ok", "payload": payload}
-    tokens = estimate_tokens(doc)
-    size: dict[str, Any] = {"estimated_tokens": tokens, "limit_tokens": size_gate_tokens}
+    size: dict[str, Any] = {"estimated_tokens": 0, "limit_tokens": size_gate_tokens}
     payload["size"] = size
+    # The estimate is of the final rendered document, its own size field
+    # included. The count can only grow with its digits, so this reaches its
+    # fixed point in a few renders.
+    for _ in range(SIZE_ESTIMATE_ROUNDS):
+        tokens = estimate_tokens(doc)
+        if tokens == size["estimated_tokens"]:
+            break
+        size["estimated_tokens"] = tokens
+    else:
+        raise CollectError("size estimate does not settle")
     reason = None
     if tokens > size_gate_tokens:
         reason = f"{SIZE_GATE_REASON}: estimated {tokens} tokens, limit {size_gate_tokens}"

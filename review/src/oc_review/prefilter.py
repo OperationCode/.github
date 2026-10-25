@@ -231,13 +231,22 @@ class PrefilterResult:
     def to_dict(self) -> dict[str, Any]:
         """JSON-ready part of the bundle payload: the `prefilter` and
         `coverage` keys of the envelope schema. Collect adds the rest."""
-        return {
+        return _json_lists({
             "prefilter": {
                 "signals": [asdict(c) for c in self.signals],
                 "hard_blocks": [asdict(c) for c in self.hard_blocks],
             },
             "coverage": {**asdict(self.coverage), "complete": self.coverage.complete},
-        }
+        })
+
+
+def _json_lists(value: Any) -> Any:
+    """`asdict` keeps tuples; the bundle (and render) take JSON lists only."""
+    if isinstance(value, dict):
+        return {k: _json_lists(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_lists(v) for v in value]
+    return value
 
 
 @dataclass(frozen=True)
@@ -974,13 +983,25 @@ def run_prefilter(
     pr_title: str = "",
     pr_body: str = "",
     max_blob_bytes: int = MAX_BLOB_BYTES,
+    unread_reasons: Mapping[str, str] | None = None,
 ) -> PrefilterResult:
     """Run every prefilter check on one comparison.
 
     `blobs` maps a blob SHA to its bytes, or None when the read failed. A blob
     SHA missing from the map counts as unreadable. Each blob is checked against
     its SHA before it is scanned. `head_paths` is every path in the head tree.
+    `unread_reasons` gives the coverage reason of a blob with no bytes when it
+    is not `unreadable`, for example `over-cap` for a blob collect did not
+    fetch because its tree size is over the cap.
     """
+    unread_reasons = unread_reasons or {}
+
+    def scan(sha: str, path: str) -> BlobScan:
+        data = blobs.get(sha)
+        if data is None and sha in unread_reasons:
+            return BlobScan("unavailable", reason=unread_reasons[sha])
+        return scan_blob(data, sha=sha, cap=max_blob_bytes, path=path)
+
     out = _Results()
     file_cov: list[FileCoverage] = []
     collected = 0
@@ -997,17 +1018,18 @@ def run_prefilter(
         if change.base_sha is not None:
             base = (
                 _GITLINK if change.base_mode == MODE_SUBMODULE
-                else scan_blob(
-                    blobs.get(change.base_sha), sha=change.base_sha, cap=max_blob_bytes,
-                    path=change.old_path or change.path,
-                )
+                else scan(change.base_sha, change.old_path or change.path)
             )
         if change.head_sha is not None:
-            head = (
-                _GITLINK if change.head_mode == MODE_SUBMODULE
-                else scan_blob(blobs.get(change.head_sha), sha=change.head_sha, cap=max_blob_bytes, path=change.path)
-            )
-        if all(s.reason not in ("unreadable", "sha-mismatch") for s in (base, head) if s is not None):
+            head = _GITLINK if change.head_mode == MODE_SUBMODULE else scan(change.head_sha, change.path)
+        # Collected: every blob side was read and matches its SHA.
+        read = [
+            sha for sha, mode in ((change.base_sha, change.base_mode), (change.head_sha, change.head_mode))
+            if sha is not None and mode != MODE_SUBMODULE
+        ]
+        if all(blobs.get(sha) is not None for sha in read) and all(
+            s.reason != "sha-mismatch" for s in (base, head) if s is not None
+        ):
             collected += 1
         cov = _file_coverage(change, base, head)
         # Ruling R-KEYBLOCK: a private key block with no END, or one that
