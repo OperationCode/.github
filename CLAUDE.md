@@ -6,7 +6,7 @@ Read [docs/claude-review-design.md](docs/claude-review-design.md) before you cha
 
 ## Rules that must not break
 
-- Never check out, install, build or execute PR content. Read it through the GitHub REST API only.
+- Never check out, install, build or execute the content of a PR under review. Read it through the GitHub REST API only. One exception: evals of PRs to this repo may run that PR's code, only after an owner approves the eval environment run.
 - The Claude call has no tools. Claude returns findings JSON only, never a verdict.
 - Only code lowers risk. Claude output can add findings, but it can never clear a prefilter hard block, a failed pass or a dependency-review failure.
 - The job that holds the Anthropic credential has no GitHub write permission. The job that writes to GitHub has no Anthropic credential.
