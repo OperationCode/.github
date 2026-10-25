@@ -201,7 +201,7 @@ Jobs pass data only through artifacts from the same run and the same run attempt
 
 - Each producer writes one envelope file. In a trusted step, it computes the SHA-256 of the file bytes (`sha256sum`). Then it uploads the file as one artifact with `actions/upload-artifact`. It sets two job outputs: the `artifact-id` and that file digest. The `artifact-digest` of the upload step is the digest of the zip. A consumer cannot recompute it from the extracted file. A workflow step may check it as an extra control. The consumer gate does not depend on it.
 - Each consumer downloads with `actions/download-artifact` by exact `artifact-ids`, never by name or pattern, and never from another run. It checks the SHA-256 of the extracted file bytes against the file digest output of the producer before it parses anything. A mismatch fails the run.
-- Downloads go to `$RUNNER_TEMP/data/<kind>/`, never into the code checkout. The consumer rejects a missing file, an extra file or a file over the size cap. An artifact holds exactly one file. The size cap is per kind: 16 MiB for a `bundle` and 1 MiB for a `pass` record. The consumer opens the file without following symbolic links and rejects anything that is not a regular file. The kind field of the envelope must match the kind the consumer expects.
+- Downloads go to `$RUNNER_TEMP/data/<kind>/`, never into the code checkout. The consumer rejects a missing file, an extra file or a file over the size cap. An artifact holds exactly one file. The size cap is per kind: 16 MiB for a `bundle` and 1 MiB for a `pass` record. The consumer opens the file without following symbolic links and rejects anything that is not a regular file. The kind field of the envelope must match the kind the consumer expects. The consumer also rejects duplicate JSON keys, `NaN` and `Infinity`, and a file that is not UTF-8.
 - Every artifact is a versioned envelope:
 
 ```
@@ -228,7 +228,7 @@ Jobs pass data only through artifacts from the same run and the same run attempt
 - For each changed file: path (and old path for renames), status (added, modified, removed, renamed), additions, deletions, head blob SHA, base blob SHA, a patch that code computes from the two blobs, annotated with base and head line numbers, and the full head content for text files under 2,000 lines. Binary files are listed with size and SHA only.
 - Dependency delta (see "Dependency delta").
 - Prefilter results: `signals[]` and `hard_blocks[]`.
-- Coverage record: files in the comparison, files collected, whether both trees were complete, and per-file coverage (`full`, `binary`, `unavailable`).
+- Coverage record: files in the comparison, files collected, whether both trees were complete, per-file coverage (`full`, `binary`, `unavailable`), and `complete`. The gate treats a record whose `complete` is not `true` as a hard block, even when the prefilter list has no "incomplete coverage" entry.
 - Size: estimated token count. The size gate is 150k input tokens. Above that, skip the LLM passes. The gate fails with the reason "too large for automatic review".
 - The size gate skips only the Claude calls. All code checks still run. A `skipped-size` bundle keeps the prefilter results, the coverage record and the dependency delta in its payload. It leaves out only the content for Claude. The gate reads the hard blocks from this payload and from the separate prefilter result, and uses both. If the prefilter result is missing, incomplete or for another snapshot, the gate fails, not waivable (K-7).
 
@@ -247,12 +247,14 @@ The review covers one immutable comparison pair: the merge base commit and the h
 
 ### Coverage limits
 
-- The recursive trees API marks a response as `truncated` when a tree is too large ([git trees](https://docs.github.com/en/rest/git/trees#get-a-tree)). A truncated tree on either side means the comparison is incomplete.
-- The prefilter scans the full head blob of every changed text file, up to a hard byte cap per file, whatever its line count. The 2,000-line limit applies only to what goes to Claude.
+- The recursive trees API marks a response as `truncated` when a tree is too large ([git trees](https://docs.github.com/en/rest/git/trees#get-a-tree)). A truncated tree on either side means the comparison is incomplete. A response with no `truncated` flag fails closed.
+- The prefilter scans the full head blob of every changed text file, up to a hard byte cap of 16 MiB per blob (the same as the cap on one dependency file), whatever its line count. The 2,000-line limit applies only to what goes to Claude. Each blob is checked against its git object SHA before the scan; a mismatch makes it `unavailable`.
 - When a blob cannot be read, cannot be decoded as text, or is over the byte cap, the file's coverage is `unavailable`.
+- A blob with a UTF-16 or UTF-32 byte order mark, valid UTF-8 that is mostly NUL bytes, or a coding declaration for a codec other than UTF-8 or ASCII cannot be decoded as text. Valid UTF-8 with a few NUL bytes is still text.
+- Coverage covers every blob a file has (head and base). If either side is `unavailable`, the file is `unavailable`. A submodule side counts as binary.
 - A blob that is not valid UTF-8 and has a NUL byte in its first 8,000 bytes is binary (the git rule) only when its path ends in a known binary extension: images (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.ico`, `.bmp`, `.tif`, `.tiff`, `.avif`), fonts (`.woff`, `.woff2`, `.ttf`, `.otf`, `.eot`), archives (`.zip`, `.gz`, `.tgz`, `.bz2`, `.xz`, `.7z`, `.tar`, `.jar`) and compiled objects (`.o`, `.a`, `.so`, `.dylib`, `.dll`, `.exe`, `.class`, `.pyc`, `.wasm`). Each side of a file is judged by its own path. Any other such blob has coverage `unavailable`, so binary bytes cannot hide source text from the scan (K-8).
 - A private key header with no matching END header after it, on either side of a file, makes that file's coverage `unavailable`, because the redaction of that block stops after 100 lines (see "Request shape", K-9).
-- The tree comparison uses path, blob SHA and file mode. A rename is only an identical blob SHA at a new path; everything else is a delete plus an add. A mode-only change (for example, a file made executable) has the same blob SHA, so the mode compare is what catches it. A file that becomes executable is a prefilter signal.
+- The tree comparison uses path, blob SHA and file mode. A rename is only an identical blob SHA at a new path; everything else is a delete plus an add. Renames pair one to one in path order, and a copy is an add. A mode-only change (for example, a file made executable) has the same blob SHA, so the mode compare is what catches it. A file that becomes executable is a prefilter signal.
 - Symlinks: record the target as text, never follow it. Submodules: record the old and new commit SHA as a signal. Deleted files: base blob only.
 - A truncated tree, an `unavailable` text file or a decode error is the hard block "incomplete coverage". An override cannot waive it, because the code did not see the content.
 - If GitHub rejects an inline comment position (its PR view can differ from the reviewed comparison), that finding goes to the summary. This never changes the gate.
@@ -261,12 +263,14 @@ The review covers one immutable comparison pair: the merge base commit and the h
 ## Dependency delta
 
 - **Supported files:** `package.json`, `package-lock.json` (lockfile v2 and v3), `yarn.lock` (v1 and berry), `pnpm-lock.yaml` (v6 and later), `pyproject.toml`, `poetry.lock`, `uv.lock`, `requirements*.txt`. The parser for each file family has fixtures for each supported version.
+- **Supported versions:** `package-lock.json` lockfile v2 and v3; `yarn.lock` v1 and berry metadata versions 4 to 8; `pnpm-lock.yaml` 6.0, 6.1 and 9.0; `poetry.lock` 1.1, 2.0 and 2.1; `uv.lock` version 1. Any other version is unknown. Pip `-r` and `-c` includes are not followed, and an unknown pip option is a parse failure. `npm-shrinkwrap.json` is not parsed; it is an unsupported dependency file.
 - **Delta:** parse each changed supported file at the merge base and at the head (both from blobs by SHA) and compare. For each added or changed package: name, old and new version, resolved source (normalized), registry publish time of the new version, `hasInstallScript` (npm lockfile v2 and v3), and for npm direct deps the `preinstall`, `install`, `postinstall` and `prepare` scripts from the registry manifest.
-- **Registry lookups:** only fixed routes built from validated names: `https://registry.npmjs.org/<encoded-name>` and `https://pypi.org/pypi/<name>/json`. No redirects to other hosts, a response byte cap, and a timeout. Never fetch a URL from the PR, including a lockfile `resolved` field.
+- **Registry lookups:** only fixed routes built from validated names: `https://registry.npmjs.org/<encoded-name>` and `https://pypi.org/pypi/<name>/json`. No redirects to other hosts, a response byte cap, and a timeout. Never fetch a URL from the PR, including a lockfile `resolved` field. The code refuses every redirect. Caps: 16 MiB for one dependency file, 32 MiB for an npm response (the full packument, for per-version publish times), 16 MiB for a PyPI response. Each lookup has a 20-second timeout and at most 2 retries, for 429, 5xx and network errors only.
+- **Official sources:** `registry.npmjs.org` and `registry.yarnpkg.com` for npm, `pypi.org` and `files.pythonhosted.org` for PyPI, over https with no port and no userinfo, and only for the ecosystem of the entry. An official npm tarball URL must have the path of that package and version. A lockfile entry with no resolved source is an unknown source (foreign), unless it is a workspace link or a bundled dependency. Local sources (file, workspace, bundled, patch) are not foreign.
 - **Failures:** a supported file that does not parse, an unknown lockfile version, or a registry lookup that still fails after retries is the hard block "incomplete dependency data". It clears on a re-run when the cause is gone.
-- **Agreement:** a manifest change with no matching lockfile change, in a repo that has a lockfile, is a signal.
+- **Agreement:** a manifest change with no matching lockfile change, in a repo that has a lockfile, is a signal. A lockfile of the same family in the same or a parent directory counts. `requirements*.txt` has no lockfile pair.
 - **Unsupported ecosystems** (for example `Gemfile.lock`, `go.sum`): a signal. The supply-chain pass still sees the diff.
-- The 72-hour rule is a delay control. It catches fresh malicious publishes while registries and scanners react. It does not detect a malicious package that is older than 72 hours.
+- The 72-hour rule is a delay control. It catches fresh malicious publishes while registries and scanners react. It does not detect a malicious package that is older than 72 hours. It applies to every new or changed exact version from the official registry: every lockfile entry, and a manifest or requirements entry that pins one exact version (an npm alias is checked under its target package). A range such as `^1.2.0` names no version, so in a repo with no lockfile a fresh version can still come in through a range. A missing registry result, or a publish time with no time zone, is "incomplete dependency data".
 
 ## Prefilter checks (no LLM)
 
@@ -275,11 +279,13 @@ Claude cannot clear these, and an override cannot waive a hard block. A hard blo
 | Check | Level |
 |---|---|
 | Unicode bidi control characters (U+202A to U+202E, U+2066 to U+2069) in any changed text file ([Trojan Source](https://trojansource.codes/)) | hard block |
+| Unicode bidi control characters (same set) in a changed file path, old or new | hard block |
 | Lockfile entry resolved from a host other than the official registry, or from a git or tarball URL | hard block |
 | New or changed package version published less than 72 hours ago | hard block |
 | Incomplete coverage (see "Coverage limits") | hard block |
 | Incomplete dependency data (see "Dependency delta") | hard block |
 | Zero-width characters (U+200B to U+200D, U+2060, U+FEFF not at file start) in changed lines | signal |
+| Invisible characters in changed lines: tag characters U+E0000 to U+E007F, variation selectors U+E0100 to U+E01EF, Hangul fillers U+115F, U+1160, U+3164, U+FFA0, U+2061 to U+2064, U+180E, U+034F, U+00AD, and the marks U+200E, U+200F, U+061C | signal |
 | Text that addresses an AI or reviewer, for example `ignore (all\|previous) instructions`, `as an AI`, `system prompt`, `you are (now)? a`, `reviewer:`, `<system>`, `</instructions>` | signal |
 | Credential-like strings (token prefixes, private key headers) in changed lines. Shown by location only, the value is redacted everywhere | signal |
 | New lockfile entry with `hasInstallScript: true`, or a direct npm dep with install lifecycle scripts | signal |
@@ -290,6 +296,16 @@ Claude cannot clear these, and an override cannot waive a hard block. A hard blo
 | Added binary files, submodule changes, files that become executable, or minified or bundled JS outside `dist/` and `build/` | signal |
 | Lines longer than 500 characters, or base64 or hex blobs longer than 200 characters, in changed lines | signal |
 | PR author has `author_association` of `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER` or `NONE` | signal (context only) |
+
+Notes on the table, where the code is more exact than a row:
+
+- "Changed lines" are the head lines that a line diff of the merge base blob to the head blob adds. When the diff needs more than a fixed work budget, every head line between the common prefix and suffix counts as changed, so the check can see more lines than git, never fewer. The bidi row reads every line of the head file.
+- The source check covers new or changed entries of every supported dependency file, manifests and requirements too (for example `foo @ git+https://...`). Entries that are already at the merge base do not block.
+- The credential row uses the same detection as redaction (see "Request shape"), so every redacted kind is also a signal.
+- The install-script rows also cover `preprepare`, `postprepare` and `prepublish`, which npm also runs on install.
+- Hex blobs include escaped hex (`\xNN`, `\uNNNN`, `%NN`, `0xNN,`). Base64 wrapped over 2 or more lines, more than 200 characters in all, also counts.
+- Path checks ignore case. They also cover `*.dockerfile`, `Containerfile*` and `GNUmakefile`, and check both paths of a rename.
+- Text that addresses an AI is matched after Unicode folding (NFKD, no marks or format characters, case folding, Cyrillic and Greek lookalikes), with comment leaders removed and lines joined, so a phrase split over lines still matches. It is also checked in paths, the PR title and the PR body.
 
 `actions/dependency-review-action` runs as a separate job with `fail-on-severity: high`. The step has no `continue-on-error`. The job also exports the step `outcome` as a job output, and the gate checks it apart from the job result (see "Reasons"). It covers known vulnerable versions. It does not prove that every new package was resolved or scanned, which is why the delta above has its own failure rules.
 
@@ -310,7 +326,8 @@ Three passes, each one call to the Messages API with no tools. Do not use `claud
 - **Structured output:** `output_config.format` with the findings JSON schema below (use `client.messages.parse()` in the Python SDK).
 - **Refusals:** security content can trip safety classifiers. Enable the server-side fallback (`fallbacks: "default"` with beta `server-side-fallback-2026-07-01`). Every attempt that produced output is billed separately ([refusals and fallback](https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback)), so the cost bound counts each fallback attempt. Record the top-level `model` field. Always check `stop_reason` before reading content. A final `refusal` or any API error makes that pass `failed`, which makes the gate fail.
 - **Retries and deadline:** at most 2 SDK retries per call, and a request deadline per call that fits inside the job timeout.
-- **Redaction:** credential-like strings in the bundle are replaced with `[REDACTED:<kind>]` before rendering. The security pass sees the marker and its location, never the value. The citation check uses this redacted text (see "Citation check").
+- **Redaction:** credential-like strings in the bundle are replaced with `[REDACTED:<kind>]` before rendering. The security pass sees the marker and its location, never the value. The citation check uses this redacted text (see "Citation check"). Credential-like strings are known token prefixes, private keys, JWTs, `user:password@` in URLs, and values after a credential name (`password = ...`, `api_key: ...`) or a `Bearer` or `Basic` scheme that pass a fixed secret test. Redaction keeps the line count, so line numbers do not move (R-LINES).
+- **Patches:** collect redacts each patch line with the context of both full blobs (a hunk alone cannot show that it sits inside a key) and marks the patch as redacted that way. Render refuses a patch without the mark, so the pass fails.
 - **Private keys:** after a private key header (PEM, OpenSSH, PGP, PuTTY, or SSH2 with four dashes), every line up to the END header with the same label is redacted. A header with no END redacts at most the 100 lines after it, so a fake header cannot hide the rest of a file from Claude. Key data that lost its header is still redacted: the key data lines before an END header that has no BEGIN, and runs of 3 or more base64 lines 64, 70 or 76 characters wide that no public PEM header (for example a certificate) explains. A base64 string that decodes to a PEM private key is redacted too (K-9).
 - **Title and body:** code renders the PR title and body inside the untrusted block like files, at the reserved paths `/.pr/title` and `/.pr/body`, with line numbers. Line numbers count lines of the redacted text, before any truncation marker. A git tree path never starts with `/`, so no repo file can have these paths (K-6).
 - **Message layout** (puts the operator instructions after the untrusted data, and lets all three passes share one cache entry):
@@ -326,7 +343,7 @@ messages:
   Mid-conversation `system` messages are supported on Claude Opus 5.5 with no beta header. They must follow a user message and be the last entry.
 
 - **Cache order:** a cache entry is available only after the first response starts ([prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)). Start the supply-chain pass first, and start the other two when its response begins to stream. The cost bound does not depend on cache hits.
-- **Delimiters:** `{nonce}` is 16 random hex characters per run. Code checks that the rendered bundle does not contain the string `untrusted_pr_{nonce}` before sending.
+- **Delimiters:** `{nonce}` is 16 random hex characters per run. Code checks that the rendered bundle does not contain the string `untrusted_pr_{nonce}` before sending. Before that, render replaces any text that reads as the delimiter name (in any case, with lookalike letters or invisible characters inside) with `[NEUTRALIZED:delimiter]`, and shows control, format and other invisible characters as `<U+XXXX>`. If the check still fails, the pass fails; render does not retry with a new nonce.
 - **SDK:** `anthropic` Python SDK 1.x.
 
 ### Grounding rules (in every system prompt)
@@ -412,7 +429,7 @@ The gate job (`oc-claude-review`, the publisher) computes one gate result for it
 |---|---|
 | any job result other than `success` (collect, analyze, dependency-review, including `cancelled` and `skipped`) | no |
 | missing, extra, duplicate or invalid artifact or envelope; digest mismatch; envelope that does not match the run or the snapshot | no |
-| fewer or more than three pass records, or any pass `failed` (API error, refusal, schema failure, `max_tokens`, timeout) | no |
+| fewer or more than three pass records, or any pass `failed` (API error, refusal, schema failure, `max_tokens`, timeout), or a pass with more findings than its limit in "Claude passes" (10, 10, 15) | no |
 | stale run (head SHA, base repository, base ref or merge base changed) | no |
 | superseded: a newer run of the central workflow exists on the head SHA at the final check | no |
 | base ref is not the repo's default branch | no |
@@ -443,7 +460,7 @@ An override is a PR comment from an authorized person:
   - the author has write or admin permission now, from `GET /repos/{owner}/{repo}/collaborators/{user}/permission` (its legacy `permission` field reports maintain as write)
   - the reason is not empty
 - If several comments are valid, any one is enough, and the summary lists all of them.
-- The publisher parses comments with a fixed pattern. No LLM reads them.
+- The publisher parses comments with a fixed pattern. No LLM reads them. The whole comment body must be the command line and nothing else. Comments from bots are ignored. Only `write` and `admin` in the legacy `permission` field count.
 - **To apply:** after posting the comment, close and reopen the PR, or re-run the newest run ("Re-run all jobs"). Neither depends on `labeled` or `ready_for_review`. A re-run of an older run exits `superseded`, so it can only block. A re-run uses the same `GITHUB_SHA` and ref ([re-run workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)), and the publisher reads the live PR state anyway. A re-run also repeats the Claude calls. The override still applies, because it covers the code at that SHA pair in that push epoch, not one set of findings.
 - **Push invalidates:** a new commit has a new head SHA, and a force push or branch restore moves the epoch, so no earlier grant matches in a new run. Nothing needs cleanup. A head that returns to an earlier SHA is covered in "Which run counts".
 - **Revoke is a gate operation, not a comment deletion.** Deleting or editing the comment changes only future runs. To revoke, delete or edit the comment, close the PR, then reopen it. A closed PR cannot merge. The reopen starts a new run, and the box blocks from the moment that run exists (V6). Without a new run, the earlier pass stays usable on that SHA with no time limit (see "Which run counts"). Role removal starts no run, so the same steps apply when an approver loses their role.
@@ -462,7 +479,7 @@ The gate record is a run of the central workflow on the PR head SHA. GitHub crea
 
 - **Fail closed.** A run is `success` only when every job succeeds. A failed, timed-out or cancelled job fails the run. On a new head SHA the box blocked while the required run was pending (T7). A new head SHA with no run blocks.
 - **Newest run decides (build prerequisite).** A reopen, a re-run, or two PRs with one head make several runs on one SHA. The docs do not say which run the rule uses. The design requires that the rule use the newest run on the head SHA, and that run's newest attempt: a queued, in-progress, cancelled, timed-out or failed newest run blocks, whatever an older run shows. V6 tests this first. If V6 shows that an older run or the last completed run can decide, building stops and the gate design changes. No extra read in the gate job can fix that order.
-- **Final check (defense in depth).** As its last step before exit 0, the gate job reads the snapshot and the override authority again, and lists the runs for the head SHA (`GET /repos/{owner}/{repo}/actions/runs?head_sha=...`). It exits non-zero if the snapshot changed, if the grant no longer holds, or if a run with the central workflow's path and a higher run ID exists (`superseded`). A same-path workflow in the target repo also matches; that can only make a run fail. This shortens the time between the authority read and the run result. It is not atomic with GitHub's record of the run's completion, and a new run can be missing from the list for a short time (V24). So safety rests on newest-run selection, not on this check. If the final check turns the result to fail, the job updates the summary before it exits, if it can.
+- **Final check (defense in depth).** As its last step before exit 0, the gate job reads the snapshot and the override authority again, and lists the runs for the head SHA (`GET /repos/{owner}/{repo}/actions/runs?head_sha=...`). It exits non-zero if the snapshot changed, if the grant no longer holds, or if a run with the central workflow's path and a higher run ID exists (`superseded`). A same-path workflow in the target repo also matches; that can only make a run fail. A run list that was not read completely, or a run with no `path`, also counts as `superseded`. This shortens the time between the authority read and the run result. It is not atomic with GitHub's record of the run's completion, and a new run can be missing from the list for a short time (V24). So safety rests on newest-run selection, not on this check. If the final check turns the result to fail, the job updates the summary before it exits, if it can.
 - **Re-runs.** "Re-run all jobs" makes a new attempt with the same run ID. Each attempt reads the live PR, comments, timeline and permissions when its gate job runs. A re-run of the newest run can pass; a re-run of an older run exits `superseded` when it sees the newer run (V6 e).
 
 **Residual risk: an earlier pass on the same SHA.** A run's result is fixed when the run ends. Under newest-run selection, a newer run on head SHA H replaces an earlier pass as soon as it exists. Nothing else does:
@@ -515,7 +532,7 @@ There is one build of the central workflow. Its gate job always applies every ru
 
 ## Publishing (code)
 
-- **Escape all untrusted text** before posting: strings from Claude and strings from the PR (title, paths, package names, URLs, prefilter evidence). Remove control characters, replace `@` with `@​` (no pings), render as text with no Markdown links, images, HTML or autolinks, and truncate to fixed limits. Redact credential-like strings.
+- **Escape all untrusted text** before posting: strings from Claude and strings from the PR (title, paths, package names, URLs, prefilter evidence). Remove control characters, replace `@` with `@​` (no pings), render as text with no Markdown links, images, HTML or autolinks, and truncate to fixed limits. Redact credential-like strings. Escaping also breaks issue references (`#123`, `GH-123`) and runs of 7 or more hex characters, so no text becomes a cross-reference or a commit link.
 - **Label model output:** each pass's text sits under a note that it is model output from untrusted input, to check before acting on it.
 - **Inline comments:** one review per run, with `event: COMMENT`, for verified and inline-eligible findings only. Skip a finding that was already posted on an earlier run (key: hash of file + side + title + quote).
 - **Summary comment:** one sticky comment, found by the hidden marker `<!-- oc-claude-review -->` and an author check (the `github-actions[bot]` identity). A comment with the marker from any other author is ignored. The author check proves only that some Actions workflow in the repo wrote it, so the summary is never a trust source for the gate (see "Summary writes"). It contains the run ID and attempt, the gate result, every reason with its waivable flag, the head SHA, merge base SHA and base ref it was computed for, the override (if any), prefilter results, coverage, the dependency delta, findings per pass, unverified findings, run cost, and a link to the workflow run.
