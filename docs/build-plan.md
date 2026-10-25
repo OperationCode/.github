@@ -56,7 +56,7 @@ Owner:
 - [ ] Owner: create a scratch source repo in the org for the V tests, separate from claude-review-test.
 - [ ] Owner: Anthropic Console: a dedicated workspace with a hard monthly spend limit and a service account. Create the production federation rule from V3 with the condition shape only; it gets its first SHA in phase 3. No API key.
 - [ ] Owner: a separate eval workspace with its own small spend limit, and a federation rule for `eval.yml` on `workflow_dispatch` in `OperationCode/.github` that also requires the claim `environment: "eval"` (spec "Auth and cost"). Needed before phase 2.
-- [ ] Owner: on `.github`, create the GitHub environment `eval`: the owner is a required reviewer, and only the `main` branch may deploy to it. Needed before phase 2.
+- [ ] Owner: on `.github`, create the GitHub environment `eval`: the owner is a required reviewer for every run, and any branch may deploy to it. Before approving a run, check that the PR does not change `eval.yml`, the eval code or the federation setup in a harmful way. The approval is the control; the residual risk is an approver who approves without reading. Needed before phase 2.
 - [ ] Owner: a test workspace with a very small spend limit for V9.
 - [ ] Owner: the test org ruleset for V6 that targets only claude-review-test.
 - [ ] Owner: a Dependabot PR in claude-review-test for V4.
@@ -124,7 +124,7 @@ Exit criteria:
 The fixture eval calls the live API and costs money. The owner runs it on request only.
 
 - [ ] Add the fixture bundles from the spec's minimum set, with expected outcomes.
-- [ ] Owner: run `eval.yml` from `main` and approve the `eval` environment, with the eval federation rule and eval workspace from phase 0. Record the results in the PR that changed the prompts or code. A release pin never moves to a SHA whose evals have not passed.
+- [ ] Owner: run `eval.yml` on the PR branch and approve the `eval` environment, with the eval federation rule and eval workspace from phase 0. Check the PR first (see phase 0). Record the results in the PR that changed the prompts or code. Passing evals gate the merge of a prompt or model change, and a release pin never moves to a SHA whose evals have not passed.
 - [ ] Fix prompts or code for each miss, then run again on request.
 
 Depends on: phase 1.
@@ -217,7 +217,7 @@ Exit criteria:
 
 ## Each release (from phase 4 on)
 
-- [ ] Run unit tests, and the fixture eval on request when prompts or the model change.
+- [ ] Run unit tests, and the fixture eval when prompts or the model change (it gates the merge of that change).
 - [ ] Owner: add the new SHA to the production federation rule.
 - [ ] Owner: move the pin of every ruleset that requires the workflow (the pilot ruleset, the org ruleset, or both), then read each back: `repository_id`, path, `sha`, no `ref`.
 - [ ] Owner: remove the previous SHA from the federation rule once open PRs have new runs (V22).
