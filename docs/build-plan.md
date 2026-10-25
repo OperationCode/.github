@@ -49,7 +49,7 @@ Tasks:
 - [x] V16: push epoch events on a fork PR.
 - [x] V18: fork head trees and blobs through the base repo's git API.
 - [x] V24: run list by head SHA from the gate job's token, and its delay.
-- [ ] V4: a Dependabot PR mints an OIDC token in a ruleset-required run. A stub analyze job is enough.
+- [x] V4: a Dependabot PR mints an OIDC token in a ruleset-required run. A stub analyze job is enough.
 
 Owner:
 
@@ -63,7 +63,7 @@ Owner:
 
 Exit criteria:
 
-- [x] V6 shows that the newest run on the head SHA decides. If not, building stops.
+- [x] V6 shows that the newest run on the head SHA decides. If not, building stops. (The queued cell is still open.)
 - [ ] V2 and V3 pass. If not, building stops.
 - [ ] V4, V5, V9, V13, V16, V18 and V24 have results in the spec. A fallback in the spec covers each one that failed.
 
