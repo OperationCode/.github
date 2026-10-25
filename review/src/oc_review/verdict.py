@@ -22,7 +22,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
 
-from oc_review import envelope
+from oc_review import envelope, render
 
 PASS = "pass"
 FAIL = "fail"
@@ -59,6 +59,20 @@ WAIVABLE: Mapping[str, bool] = MappingProxyType(
     }
 )
 
+# Finding limit per pass (spec "Claude passes"). A pass over its limit is
+# invalid (not waivable); its findings are still reported.
+PASS_MAX_FINDINGS: Mapping[str, int] = MappingProxyType(
+    {"review": 10, "security": 10, "supply-chain": 15}
+)
+
+# Bundle statuses that carry a payload with the prefilter result, coverage and
+# dependency data (K-7). Only an `ok` bundle has content for Claude.
+BUNDLE_PAYLOAD_STATUSES = frozenset({"ok", "skipped-size"})
+
+# Completeness state of the prefilter evidence.
+PREFILTER_COMPLETE = "complete"
+PREFILTER_UNAVAILABLE = "unavailable"
+
 BLOCKING_CATEGORIES = frozenset({"security", "supply-chain", "malicious", "prompt-injection"})
 BLOCKING_SEVERITIES = frozenset({"high", "critical"})
 
@@ -72,8 +86,8 @@ META_TITLE_PATH = "/.pr/title"
 META_BODY_PATH = "/.pr/body"
 META_PATHS = frozenset({META_TITLE_PATH, META_BODY_PATH})
 
-# A quote that is only a redaction marker verifies only on the cited line itself
-# (ruling R-REDACT).
+# A quote that is only a redaction marker verifies only when the cited line holds
+# that marker and no other text (ruling R-REDACT).
 _REDACTION_MARKER_RE = re.compile(r"\[REDACTED:[^\[\]\s]+\]")
 # Context lines around a change when hunks are computed from two texts.
 HUNK_CONTEXT = 3
@@ -177,6 +191,31 @@ def metadata_files(title_text: str | None, body_text: str | None) -> tuple[FileS
     )
 
 
+def _model(text: str | None) -> str | None:
+    return None if text is None else render.model_text(text)
+
+
+def changed_file(
+    path: str,
+    *,
+    old_path: str | None = None,
+    base_raw: str | None = None,
+    head_raw: str | None = None,
+) -> FileSides:
+    """One changed file from its raw blob texts (None: no blob or not available).
+
+    Each side is the text the model saw (`render.model_text`). Hunks come from
+    the raw texts; redaction keeps the line count (ruling R-LINES).
+    """
+    base_hunks, head_hunks = hunks_from_texts(base_raw, head_raw)
+    return FileSides(path, old_path, _model(base_raw), _model(head_raw), base_hunks, head_hunks)
+
+
+def metadata_files_from_raw(title: str | None, body: str | None) -> tuple[FileSides, ...]:
+    """`metadata_files` for the raw PR title and body, as the model saw them."""
+    return metadata_files(_model(title), _model(body))
+
+
 def _parse_time(value: Any) -> datetime:
     if not isinstance(value, str):
         raise ValueError("timestamp is not a string")
@@ -268,6 +307,60 @@ class RunList:
 
 
 @dataclass(frozen=True)
+class PrefilterEvidence:
+    """The prefilter result for one comparison pair, from a checked source.
+
+    `state` is `PREFILTER_COMPLETE` only when the prefilter ran over the whole
+    comparison of `head_sha` and `merge_base_sha`; any other value fails
+    closed. Hard blocks are labels for the summary: the gate never reads risk
+    or waivability from them.
+    """
+
+    state: str
+    head_sha: str | None
+    merge_base_sha: str | None
+    hard_blocks: tuple[str, ...] = ()
+    detail: str = ""
+
+    @classmethod
+    def unavailable(cls, detail: str) -> PrefilterEvidence:
+        return cls(PREFILTER_UNAVAILABLE, None, None, (), detail)
+
+
+def _hard_block_label(item: Mapping[str, Any]) -> str:
+    label = str(item["id"])
+    file = item.get("file")
+    return f"{label} in {file}" if isinstance(file, str) and file else label
+
+
+def _bundle_hard_blocks(bundle: Mapping[str, Any]) -> tuple[str, ...]:
+    """Hard block labels of a schema-valid bundle; empty when it has no payload."""
+    if bundle["status"] not in BUNDLE_PAYLOAD_STATUSES:
+        return ()
+    return tuple(_hard_block_label(b) for b in bundle["payload"]["prefilter"]["hard_blocks"])
+
+
+def prefilter_evidence_from_bundle(read: ArtifactRead) -> PrefilterEvidence:
+    """Prefilter evidence from the bundle payload (statuses `ok` and
+    `skipped-size`), bound to the bundle's comparison pair. Any other bundle
+    gives `unavailable`."""
+    if read.error is not None or read.envelope is None:
+        return PrefilterEvidence.unavailable(f"bundle: {read.error or 'no envelope'}")
+    doc = read.envelope
+    try:
+        envelope.validate_envelope(doc)
+    except envelope.EnvelopeError as exc:
+        return PrefilterEvidence.unavailable(f"bundle: {exc}")
+    if doc["kind"] != "bundle":
+        return PrefilterEvidence.unavailable(f"bundle: kind {doc['kind']}")
+    if doc["status"] not in BUNDLE_PAYLOAD_STATUSES:
+        return PrefilterEvidence.unavailable(f"bundle status {doc['status']}")
+    return PrefilterEvidence(
+        PREFILTER_COMPLETE, doc["head_sha"], doc["merge_base_sha"], _bundle_hard_blocks(doc)
+    )
+
+
+@dataclass(frozen=True)
 class GateInputs:
     context: RunContext
     job_results: Mapping[str, str]  # needs.<job>.result
@@ -275,7 +368,7 @@ class GateInputs:
     bundle: ArtifactRead
     passes: Sequence[ArtifactRead]
     revalidation: SnapshotCheck | None  # None: the publisher could not re-validate
-    hard_blocks: Sequence[str]  # prefilter hard blocks, from the bundle
+    prefilter: PrefilterEvidence | None  # None: no prefilter evidence
     files: Sequence[FileSides]  # changed files of the reviewed comparison
     overrides: OverrideInputs
 
@@ -430,10 +523,13 @@ class _FileIndex:
                 self.by_old_path[f.old_path] = f
 
     def lookup(self, path: str, side: str) -> FileSides | None:
-        found = self.by_path.get(path)
-        if found is None and side == "base":
+        if side == "base":
+            # The old path of a rename names its base blob, also when an added
+            # file reuses that path.
             found = self.by_old_path.get(path)
-        return found
+            if found is not None:
+                return found
+        return self.by_path.get(path)
 
 
 def _verify(f: FileSides | None, side: str, line: int, quote: str) -> str | None:
@@ -452,8 +548,8 @@ def _verify(f: FileSides | None, side: str, line: int, quote: str) -> str | None
     if not q:
         return "empty quote"
     if _REDACTION_MARKER_RE.fullmatch(q):
-        if q not in lines[line - 1]:
-            return "redaction marker not on the cited line"
+        if _normalize(lines[line - 1]) != q:
+            return "cited line is not only that redaction marker"
         return None
     window = lines[max(0, line - 1 - QUOTE_WINDOW) : line + QUOTE_WINDOW]
     if q not in _normalize("\n".join(window)):
@@ -666,6 +762,31 @@ def _revalidation_reasons(check: SnapshotCheck | None) -> list[Reason]:
     return out
 
 
+def _prefilter_reasons(
+    evidence: PrefilterEvidence | None,
+    bundle: Mapping[str, Any] | None,
+    snapshot: SnapshotPair | None,
+) -> list[Reason]:
+    """Union of the hard blocks in the bundle payload and in the prefilter
+    evidence; nothing here removes one. Missing, incomplete or unbound
+    evidence is itself a hard block reason (not waivable)."""
+    out = []
+    if bundle is not None:
+        out += [Reason(R_HARD_BLOCK, b) for b in _bundle_hard_blocks(bundle)]
+    if evidence is None:
+        out.append(Reason(R_HARD_BLOCK, "prefilter result missing"))
+        return out
+    out += [Reason(R_HARD_BLOCK, str(b)) for b in evidence.hard_blocks]
+    if evidence.state != PREFILTER_COMPLETE:
+        out.append(Reason(R_HARD_BLOCK, f"prefilter result unavailable: {evidence.detail or evidence.state}"))
+    elif snapshot is None or (evidence.head_sha, evidence.merge_base_sha) != (
+        snapshot.head_sha,
+        snapshot.merge_base_sha,
+    ):
+        out.append(Reason(R_HARD_BLOCK, "prefilter result is not for the bundle snapshot"))
+    return out
+
+
 def _decide(reasons: Sequence[Reason], overrides: Sequence[OverrideCandidate]) -> tuple[str, bool]:
     """(status, override_applied). Pass only with no reason, or with waivable
     reasons only and a valid override."""
@@ -732,7 +853,13 @@ def compute_gate(inputs: GateInputs) -> GateResult:
         elif status == "ok":
             if bundle_size:
                 reasons.append(Reason(R_ARTIFACT, f"pass {name} ran, bundle is skipped-size"))
-            for finding in doc["payload"]["findings"]:
+            pass_findings = doc["payload"]["findings"]
+            limit = PASS_MAX_FINDINGS[name]
+            if len(pass_findings) > limit:
+                reasons.append(
+                    Reason(R_PASS_RECORDS, f"pass {name} invalid: {len(pass_findings)} findings, limit {limit}")
+                )
+            for finding in pass_findings:
                 findings.append(cite_finding(name, finding, index))
     for name in PASS_NAMES:
         if names[name] == 0:
@@ -741,7 +868,7 @@ def compute_gate(inputs: GateInputs) -> GateResult:
             reasons.append(Reason(R_PASS_RECORDS, f"duplicate pass record {name}"))
 
     reasons += _revalidation_reasons(inputs.revalidation)
-    reasons += [Reason(R_HARD_BLOCK, str(b)) for b in inputs.hard_blocks]
+    reasons += _prefilter_reasons(inputs.prefilter, bundle, snapshot)
     reasons += [
         Reason(R_BLOCKING_FINDING, f"{f.pass_name}: {f.category} {f.severity} at {f.file}:{f.line}")
         for f in findings

@@ -75,6 +75,21 @@
       "head": null,
       "expected_base_hunks": [],
       "expected_head_hunks": []
+    },
+    {
+      "path": "lib/perms.py",
+      "old_path": "lib/perm.py",
+      "base": ["def authorize(user):", "    return user.can_write"],
+      "head": ["def authorize(user):", "    return user.can_write"],
+      "expected_base_hunks": [],
+      "expected_head_hunks": []
+    },
+    {
+      "path": "lib/perm.py",
+      "base": null,
+      "head": ["# new module at the old path", "VERSION = 2"],
+      "expected_base_hunks": [],
+      "expected_head_hunks": [[1, 2]]
     }
   ],
   "cases": [
@@ -101,6 +116,10 @@
     {"name": "added file base side", "file": "src/new.py", "side": "base", "line": 1, "quote": "import requests", "verified": false, "inline": false, "why": "no base content"},
     {"name": "removed file base", "file": "src/gone.py", "side": "base", "line": 2, "quote": "assert SECRET_CHECK", "verified": true, "inline": true},
     {"name": "removed file head side", "file": "src/gone.py", "side": "head", "line": 1, "quote": "SECRET_CHECK = True", "verified": false, "inline": false, "why": "no head content"},
-    {"name": "content unavailable", "file": "dist/big.js", "side": "head", "line": 1, "quote": "x", "verified": false, "inline": false, "why": "no head content"}
+    {"name": "content unavailable", "file": "dist/big.js", "side": "head", "line": 1, "quote": "x", "verified": false, "inline": false, "why": "no head content"},
+    {"name": "rename old path reused by an added file, base side", "file": "lib/perm.py", "side": "base", "line": 2, "quote": "return user.can_write", "verified": true, "inline": false},
+    {"name": "rename new path with its old path reused, base side", "file": "lib/perms.py", "side": "base", "line": 1, "quote": "def authorize(user):", "verified": true, "inline": false},
+    {"name": "added file at a reused old path, head side", "file": "lib/perm.py", "side": "head", "line": 2, "quote": "VERSION = 2", "verified": true, "inline": true},
+    {"name": "reused old path on base side is the rename's base", "file": "lib/perm.py", "side": "base", "line": 2, "quote": "VERSION = 2", "verified": false, "inline": false, "why": "quote not found"}
   ]
 }

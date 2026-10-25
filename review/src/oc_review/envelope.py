@@ -58,8 +58,13 @@ def validate_findings(doc: Any) -> None:
 
 
 def validate_envelope(doc: Any) -> None:
-    """Check the envelope against the schema. A `pass` record with status `ok`
-    also carries a payload that must match the findings schema."""
+    """Check the envelope against the schema.
+
+    Payload by kind and status (K-7): a `bundle` with status `ok` or
+    `skipped-size` carries the prefilter result, coverage and dependency data
+    (a skipped-size bundle omits only the content for Claude). A `pass` record
+    with status `ok` carries a payload that must match the findings schema.
+    Every other payload is null."""
     err = _first_error("envelope", doc)
     if err:
         raise EnvelopeError(f"envelope schema: {err}")

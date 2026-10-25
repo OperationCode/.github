@@ -12,6 +12,11 @@
   "merge_base_sha": "cccccccccccccccccccccccccccccccccccccccc",
   "status": "ok",
   "payload": {
-    "anything": "goes"
+    "prefilter": {
+      "signals": [],
+      "hard_blocks": []
+    },
+    "coverage": {},
+    "dependency_delta": {}
   }
 }

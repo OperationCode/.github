@@ -28,7 +28,6 @@ from oc_review.verdict import (
     WAIVABLE,
     ArtifactRead,
     Comment,
-    FileSides,
     GateInputs,
     OverrideInputs,
     RunContext,
@@ -39,6 +38,7 @@ from oc_review.verdict import (
     compute_gate,
     final_check,
     load_artifact,
+    prefilter_evidence_from_bundle,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "verdict"
@@ -67,8 +67,7 @@ def fixture_files():
     out = []
     for f in citation_fixture()["files"]:
         base, head = _join(f["base"]), _join(f["head"])
-        bh, hh = verdict.hunks_from_texts(base, head)
-        out.append(FileSides(f["path"], f.get("old_path"), base, head, bh, hh))
+        out.append(verdict.changed_file(f["path"], old_path=f.get("old_path"), base_raw=base, head_raw=head))
     return tuple(out)
 
 
@@ -124,8 +123,17 @@ def env_doc(kind, status="ok", payload=None, pass_name=None, **over):
     return doc
 
 
-def bundle(status="ok", **over):
-    payload = {} if status == "ok" else None
+def bundle_payload(hard_blocks=()):
+    """The deterministic results; an `ok` bundle also has the content for Claude."""
+    return {
+        "prefilter": {"signals": [], "hard_blocks": [{"id": b, "level": "hard_block"} for b in hard_blocks]},
+        "coverage": {"complete": True},
+        "dependency_delta": {"packages": []},
+    }
+
+
+def bundle(status="ok", hard_blocks=(), **over):
+    payload = bundle_payload(hard_blocks) if status in ("ok", "skipped-size") else None
     return ArtifactRead(envelope=env_doc("bundle", status, payload=payload, **over))
 
 
@@ -176,6 +184,7 @@ def ov_inputs(comments=(), events=(), complete=True, permissions=None):
 
 
 def gate_inputs(**over):
+    """The prefilter evidence comes from the bundle (the real transport) unless given."""
     base = dict(
         context=CTX,
         job_results={j: "success" for j in REQUIRED_JOBS},
@@ -183,11 +192,12 @@ def gate_inputs(**over):
         bundle=bundle(),
         passes=clean_passes(),
         revalidation=Reval(),
-        hard_blocks=(),
         files=FILES,
         overrides=ov_inputs(),
     )
     base.update(over)
+    if "prefilter" not in over:
+        base["prefilter"] = prefilter_evidence_from_bundle(base["bundle"])
     return GateInputs(**base)
 
 
@@ -258,10 +268,12 @@ def scenario(rows, with_override):
     inputs = gate_inputs(
         job_results=jobs,
         dependency_review_outcome="failure" if R_DEPENDENCY_REVIEW in rows else "success",
-        bundle=bundle("skipped-size" if size else "ok"),
+        bundle=bundle(
+            "skipped-size" if size else "ok",
+            hard_blocks=("bidi-control-characters",) if R_HARD_BLOCK in rows else (),
+        ),
         passes=passes,
         revalidation=reval,
-        hard_blocks=("bidi-control-characters",) if R_HARD_BLOCK in rows else (),
         overrides=overrides,
     )
     runs = NO_RUNS
@@ -380,7 +392,7 @@ def write_artifact(tmp_path, doc, name):
 
 
 def test_extra_file_in_artifact(tmp_path):
-    d, digest = write_artifact(tmp_path, env_doc("bundle", payload={}), "bundle.json")
+    d, digest = write_artifact(tmp_path, env_doc("bundle", payload=bundle_payload()), "bundle.json")
     (d / "extra.txt").write_text("x")
     read = load_artifact(d, kind="bundle", expected_name="bundle.json", expected_digest=digest)
     assert read.envelope is None and "extra file" in read.error
@@ -399,7 +411,7 @@ def test_digest_mismatch(tmp_path):
 
 
 def test_load_artifact_ok(tmp_path):
-    d, digest = write_artifact(tmp_path, env_doc("bundle", payload={}), "bundle.json")
+    d, digest = write_artifact(tmp_path, env_doc("bundle", payload=bundle_payload()), "bundle.json")
     read = load_artifact(d, kind="bundle", expected_name="bundle.json", expected_digest=digest)
     assert read.error is None
     assert gate(bundle=read).status == PASS
@@ -439,7 +451,7 @@ def test_bundle_for_another_run(field, value):
 
 def test_unread_bundle_fails_every_pass_match():
     r = gate(bundle=ArtifactRead(error="artifact directory missing"))
-    assert r.codes == {R_ARTIFACT}
+    assert r.codes == {R_ARTIFACT, R_HARD_BLOCK}
     assert r.snapshot is None
     assert r.override_command is None
 
@@ -449,7 +461,7 @@ def test_unread_bundle_fails_every_pass_match():
     [
         ArtifactRead(),
         ArtifactRead(envelope={"kind": "pass"}),
-        ArtifactRead(envelope=env_doc("bundle", payload={})),  # a bundle in a pass slot
+        ArtifactRead(envelope=env_doc("bundle", payload=bundle_payload())),  # a bundle in a pass slot
         ArtifactRead(envelope=env_doc("pass", payload={"summary": "", "findings": [{"x": 1}]}, pass_name="review")),
     ],
 )
@@ -459,7 +471,8 @@ def test_invalid_pass_envelope(read):
 
 
 def test_bundle_status_failed():
-    assert gate(bundle=bundle("failed")).codes == {R_ARTIFACT}
+    # No payload, so no prefilter evidence either.
+    assert gate(bundle=bundle("failed")).codes == {R_ARTIFACT, R_HARD_BLOCK}
 
 
 def test_pass_skipped_size_without_bundle_size():
@@ -538,7 +551,7 @@ def test_no_revalidation_is_stale():
 
 
 def test_bundle_stale_and_pass_stale():
-    assert gate(bundle=bundle("stale")).codes == {R_STALE}
+    assert gate(bundle=bundle("stale")).codes == {R_STALE, R_HARD_BLOCK}
     passes = [pass_rec("review", "stale"), pass_rec("security"), pass_rec("supply-chain")]
     assert gate(passes=passes).codes == {R_STALE}
 
@@ -592,7 +605,7 @@ def test_blocking_finding_waived_by_override():
 
 def test_override_command_only_for_waivable_only():
     assert blocking_gate(BLOCKING).override_command == override_body(reason="<reason>")
-    assert blocking_gate(BLOCKING, hard_blocks=("x",)).override_command is None
+    assert blocking_gate(BLOCKING, bundle=bundle(hard_blocks=("x",))).override_command is None
     assert gate().override_command is None
 
 
@@ -623,7 +636,7 @@ def claude_passes(findings, summary, statuses=None):
 def test_claude_output_never_clears_a_hard_block(findings, summary):
     r = gate(
         passes=claude_passes(findings, summary),
-        hard_blocks=("lockfile-resolved-from-git-url",),
+        bundle=bundle(hard_blocks=("lockfile-resolved-from-git-url",)),
         overrides=ov_inputs([override_comment()]),
     )
     assert r.status == FAIL and R_HARD_BLOCK in r.codes and r.exit_code == 1
@@ -961,7 +974,7 @@ def test_exit_code_for_every_gate_result():
         "pass": gate(),
         "pass-by-override": blocking_gate(BLOCKING, overrides=ov_inputs([override_comment()])),
         "fail-waivable": blocking_gate(BLOCKING),
-        "fail-not-waivable": gate(hard_blocks=("x",)),
+        "fail-not-waivable": gate(bundle=bundle(hard_blocks=("x",))),
         "fail-stale": gate(revalidation=None),
     }
     for name, r in results.items():

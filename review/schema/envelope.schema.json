@@ -30,12 +30,42 @@
       "else": { "not": { "required": ["pass"] } }
     },
     {
-      "if": { "properties": { "status": { "const": "ok" } }, "required": ["status"] },
-      "then": { "properties": { "payload": { "type": "object" } } },
-      "else": { "properties": { "payload": { "type": "null" } } }
+      "if": {
+        "properties": { "kind": { "const": "bundle" }, "status": { "enum": ["ok", "skipped-size"] } },
+        "required": ["kind", "status"]
+      },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/bundle_payload" } } },
+      "else": {
+        "if": {
+          "properties": { "kind": { "const": "pass" }, "status": { "const": "ok" } },
+          "required": ["kind", "status"]
+        },
+        "then": { "properties": { "payload": { "type": "object" } } },
+        "else": { "properties": { "payload": { "type": "null" } } }
+      }
     }
   ],
   "$defs": {
-    "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+    "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "bundle_payload": {
+      "type": "object",
+      "required": ["prefilter", "coverage", "dependency_delta"],
+      "properties": {
+        "prefilter": {
+          "type": "object",
+          "required": ["signals", "hard_blocks"],
+          "properties": {
+            "signals": { "type": "array" },
+            "hard_blocks": { "type": "array", "items": { "$ref": "#/$defs/hard_block" } }
+          }
+        },
+        "coverage": { "type": "object" }
+      }
+    },
+    "hard_block": {
+      "type": "object",
+      "required": ["id"],
+      "properties": { "id": { "type": "string", "minLength": 1 } }
+    }
   }
 }

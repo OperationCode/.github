@@ -11,6 +11,11 @@
   "base_tip_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "merge_base_sha": "cccccccccccccccccccccccccccccccccccccccc",
   "payload": {
-    "anything": "goes"
+    "prefilter": {
+      "signals": [],
+      "hard_blocks": []
+    },
+    "coverage": {},
+    "dependency_delta": {}
   }
 }

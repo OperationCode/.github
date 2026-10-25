@@ -28,10 +28,11 @@ def read(tmp_path, data, **kw):
 
 def padded(good_envelope, size):
     """Valid envelope JSON of exactly `size` bytes."""
-    base = json.dumps({**good_envelope, "payload": {"p": ""}}).encode()
+    payload = good_envelope["payload"]
+    base = json.dumps({**good_envelope, "payload": {**payload, "p": ""}}).encode()
     pad = size - len(base)
     assert pad >= 0
-    data = json.dumps({**good_envelope, "payload": {"p": "x" * pad}}).encode()
+    data = json.dumps({**good_envelope, "payload": {**payload, "p": "x" * pad}}).encode()
     assert len(data) == size
     return data
 
@@ -251,3 +252,40 @@ def test_pass_ok_payload_must_match_findings(tmp_path, good_envelope):
     data = write(tmp_path, bad)
     with pytest.raises(EnvelopeError, match="findings schema"):
         read(tmp_path, data, kind="pass")
+
+
+BUNDLE_PAYLOAD = {"prefilter": {"signals": [], "hard_blocks": []}, "coverage": {}, "dependency_delta": {}}
+FINDINGS_PAYLOAD = {"summary": "", "findings": []}
+
+
+@pytest.mark.parametrize(
+    "kind,status,payload",
+    [
+        ("bundle", "ok", BUNDLE_PAYLOAD),
+        # K-7: the size gate skips only the Claude calls; the deterministic results stay.
+        ("bundle", "skipped-size", BUNDLE_PAYLOAD),
+        ("bundle", "failed", None),
+        ("bundle", "stale", None),
+        ("pass", "ok", FINDINGS_PAYLOAD),
+        ("pass", "skipped-size", None),
+        ("pass", "failed", None),
+        ("pass", "stale", None),
+    ],
+)
+def test_payload_by_kind_and_status(good_envelope, kind, status, payload):
+    doc = {**good_envelope, "kind": kind, "status": status, "payload": payload}
+    if kind == "pass":
+        doc["pass"] = "review"
+    envelope.validate_envelope(doc)
+    # A payload where null belongs, or null where a payload belongs, is rejected.
+    swapped = None if payload is not None else (BUNDLE_PAYLOAD if kind == "bundle" else FINDINGS_PAYLOAD)
+    with pytest.raises(EnvelopeError, match="payload"):
+        envelope.validate_envelope({**doc, "payload": swapped})
+
+
+def test_skipped_size_bundle_payload_needs_the_deterministic_results(good_envelope):
+    for key in BUNDLE_PAYLOAD:
+        payload = {k: v for k, v in BUNDLE_PAYLOAD.items() if k != key}
+        doc = {**good_envelope, "status": "skipped-size", "payload": payload}
+        with pytest.raises(EnvelopeError, match=f"payload: \\[required\\] '{key}'"):
+            envelope.validate_envelope(doc)
