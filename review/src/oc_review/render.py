@@ -31,14 +31,16 @@ any other key with the same generic rules, so it drops nothing:
                         author_login, author_association, labels}
     files:             [{path, old_path, status, additions, deletions,
                          head_blob_sha, base_blob_sha, binary, size, coverage,
-                         patch, head_content}]
+                         patch, patch_redaction, head_content}]
     dependency_delta, prefilter: {signals, hard_blocks}, coverage, size
 
 - `pr.title` and `pr.body` are shown like files, with line numbers, at the
   reserved paths `/.pr/title` and `/.pr/body` (ruling R-META).
-- `patch` is a plain unified diff of the two blobs (`@@` hunks; an optional
-  `diff`/`---`/`+++` preamble). Render adds the base and head line numbers and
-  fails closed when the hunk counts do not match the lines.
+- `patch` is a unified diff of the two blobs (`@@` hunks; an optional
+  `diff`/`---`/`+++` preamble), passed through `redact_patch` with both full
+  blobs, and `patch_redaction` is `PATCH_REDACTION`. Render refuses a patch
+  without it, adds the base and head line numbers and fails closed when the
+  hunk counts do not match the lines.
 - `head_content` goes to Claude only for files under 2,000 lines (spec
   "Coverage limits"). Patches are not cut; the size gate bounds them.
 
@@ -47,10 +49,14 @@ Prompts: `load_prompt` reads `review/prompts/<name>.md` and fills `{nonce}`.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+import math
 import re
 import secrets
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -105,6 +111,9 @@ class RenderedBundle:
 # ---------------------------------------------------------------------------
 
 REDACTED = "[REDACTED:{kind}]"
+# Text that is already exactly one marker. Redaction leaves it as it is, so
+# redact_text(redact_text(x)) == redact_text(x).
+_MARKER_ONLY = re.compile(r"\[REDACTED:[^\[\]\s]+\]")
 
 # Credential-like strings: token prefixes with their fixed formats. Order
 # matters where one prefix contains another (sk-ant- before sk-).
@@ -123,68 +132,225 @@ _TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("npm-token", re.compile(r"\bnpm_[A-Za-z0-9]{36}\b")),
     ("pypi-token", re.compile(r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_\-]{50,}")),
     ("sendgrid-key", re.compile(r"\bSG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}\b")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")),
+    ("slack-app-token", re.compile(r"\bxapp-\d-[A-Z0-9]+-\d+-[a-f0-9]{32,}\b")),
+    ("huggingface-token", re.compile(r"\bhf_[A-Za-z0-9]{34,}\b")),
+    ("digitalocean-token", re.compile(r"\bdo[opr]_v1_[a-f0-9]{64}\b")),
+    ("vault-token", re.compile(r"\bhv[sbr]\.[A-Za-z0-9_\-]{24,}")),
+    ("grafana-token", re.compile(r"\bglsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8}\b")),
+    ("grafana-token", re.compile(r"\bglc_[A-Za-z0-9+/]{32,}={0,2}")),
+    ("shopify-token", re.compile(r"\bshp(?:at|ss|ca|pa)_[a-fA-F0-9]{32}\b")),
+    ("databricks-token", re.compile(r"\bdapi[a-f0-9]{32}(?:-\d)?\b")),
+    ("doppler-token", re.compile(r"\bdp\.(?:pt|st|sa|ct|scim|audit)\.[A-Za-z0-9]{40,}\b")),
+    ("linear-api-key", re.compile(r"\blin_api_[A-Za-z0-9]{40}\b")),
+    ("postman-api-key", re.compile(r"\bPMAK-[a-f0-9]{24}-[a-f0-9]{34}\b")),
+    ("twilio-api-key", re.compile(r"\bSK[0-9a-fA-F]{32}\b")),
+    ("google-oauth-secret", re.compile(r"\bGOCSPX-[A-Za-z0-9_\-]{28}")),
+    ("google-oauth-token", re.compile(r"\bya29\.[0-9A-Za-z_\-]{20,}")),
+    ("telegram-bot-token", re.compile(r"\b\d{8,10}:AA[A-Za-z0-9_\-]{33}\b")),
+    ("discord-webhook", re.compile(r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+")),
+    ("azure-storage-key", re.compile(r"\bAccountKey=[A-Za-z0-9+/]{86}==")),
+    ("age-secret-key", re.compile(r"\bAGE-SECRET-KEY-1[0-9A-Z]{58}\b")),
 )
 # user:password@ in a URL. Only the userinfo is replaced. The password part
 # runs to the last @ before the path, so a raw @ in a password does not leak.
 _URL_CREDENTIALS = re.compile(r"\b([A-Za-z][A-Za-z0-9+.\-]{0,31}://)[^\s/?#@:]{1,256}:[^\s/?#]{1,256}@")
 
-_PK_BEGIN = re.compile(r"-----BEGIN[A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
-_PK_END = re.compile(r"-----END[A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----")
-# A key body run: base64 of 16+ characters with at least one digit, + or /.
-_PK_BODY_RUN = re.compile(r"[A-Za-z0-9+/=]{16,}")
-# A line that can still be part of an armored key: base64, armor headers,
-# blank lines, string quotes and escapes around a key in code.
-_PK_KEYISH_LINE = re.compile(r"^[A-Za-z0-9+/=\s:,.\-'\"\\|]*$")
-# An unterminated key header redacts at most this many following lines.
-_PK_MAX_LINES = 200
+# JWT (JWS compact form): three base64url segments. The header is JSON with an
+# "alg" member, so it starts with "ey" ('{' in base64). The candidate is
+# checked by decoding (`_is_jwt`), not by segment length, so a token with short
+# claims (`e30` is `{}`) is caught. Possessive quantifiers: linear time.
+_JWT_CANDIDATE = re.compile(
+    r"(?<![A-Za-z0-9_\-])(ey[A-Za-z0-9_\-]++)\.([A-Za-z0-9_\-]*+)\.([A-Za-z0-9_\-]*+)(?![A-Za-z0-9_\-])"
+)
+# Fallback shape for a token whose header does not decode: both JSON parts
+# start with '{"'. This was the only JWT rule before.
+_JWT_SHAPE = re.compile(r"eyJ[A-Za-z0-9_\-]{10,}")
+_JWT_MAX_HEADER = 8192
 
 
-def _pk_body_sub(segment: str) -> str:
-    def repl(m: re.Match[str]) -> str:
-        run = m.group()
-        if any(c.isdigit() or c in "+/" for c in run):
-            return REDACTED.format(kind="private-key")
-        return run
+def _b64url_json(segment: str) -> Any:
+    if len(segment) > _JWT_MAX_HEADER or len(segment) % 4 == 1:
+        return None
+    try:
+        return json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (ValueError, binascii.Error):
+        return None
 
-    return _PK_BODY_RUN.sub(repl, segment)
+
+def _is_jwt(m: re.Match[str]) -> bool:
+    header, claims, signature = m.groups()
+    if len(claims) % 4 == 1 or len(signature) % 4 == 1:
+        return False
+    if _JWT_SHAPE.fullmatch(header) and _JWT_SHAPE.fullmatch(claims):
+        return True
+    h = _b64url_json(header)
+    return isinstance(h, dict) and isinstance(h.get("alg"), str)
 
 
-def _pk_line(line: str, in_key: bool) -> tuple[str, bool]:
+# A value after a credential name: `password = "..."`, `aws_secret_access_key:
+# ...`, `"api_key": "..."`, `TOKEN=...`. Only the value is replaced; the name
+# stays, so Claude sees what kind of value was there. The name holds one of
+# these words, not followed by a lower-case letter (so `tokenizer` and
+# `secretary` do not count). The value must pass `_secret_like`.
+_CRED_WORD = (
+    r"(?:passw(?:or)?d|pwd|passphrase|secret|token|api[_\-]?key|access[_\-]?key|private[_\-]?key"
+    r"|signing[_\-]?key|encryption[_\-]?key|session[_\-]?key|master[_\-]?key|auth[_\-]?key|credentials?)"
+)
+_NAME_CHARS = r"[A-Za-z0-9_.\-]"
+_ASSIGNMENT = re.compile(
+    rf"(?<!{_NAME_CHARS})(?P<name>{_NAME_CHARS}{{0,64}}?{_CRED_WORD}s?(?-i:(?![a-z])){_NAME_CHARS}{{0,64}})"
+    r"(?P<sep>[\"'`]?\]?[ \t]*(?::=|=>|=(?!=)|:(?![:/\\]))[ \t]*)"
+    r"(?:(?P<q>[\"'`])(?P<qv>[^\"'`\s]{8,4096}+)(?P=q)|(?P<uv>[^\s\"'`,;()\[\]{}<>]{8,4096}+)(?![(\[]))",
+    re.IGNORECASE,
+)
+# `Authorization: Bearer <token>` and `Basic <base64>`.
+_AUTH_SCHEME = re.compile(r"\b(?P<name>bearer|basic)(?P<sep>[ \t]+)(?P<uv>[A-Za-z0-9\-._~+/]{8,4096}+=*)", re.IGNORECASE)
+# Unquoted values that are code, not data: `self.password`, `os.environ`,
+# `DEFAULT_TOKEN_NAME`.
+_DOTTED_NAME = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+")
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Minimum Shannon entropy, in bits per character.
+_MIN_ENTROPY_QUOTED = 2.5
+_MIN_ENTROPY_UNQUOTED = 3.0
+
+
+def _entropy(s: str) -> float:
+    n = len(s)
+    return -sum(c / n * math.log2(c / n) for c in Counter(s).values())
+
+
+def _secret_like(value: str, quoted: bool) -> bool:
+    """Value test for a credential assignment. All of these must hold:
+
+    - not a reference or a template: does not start with `$ % < { [ * & @ #`,
+      and holds no `${`, `{{` or `://` (URL credentials have their own rule);
+    - a letter and at least two character classes (lower, upper, digit, other);
+    - Shannon entropy of at least 2.5 bits per character (3.0 unquoted);
+    - unquoted only: holds a digit, holds no `(`, is not a dotted name, and is
+      not an identifier with `_` shorter than 20 characters.
+    """
+    if value[0] in "$%<{[*&@#" or "${" in value or "{{" in value or "://" in value:
+        return False
+    if not quoted and (
+        not any(c.isdigit() for c in value)
+        or "(" in value
+        or _DOTTED_NAME.fullmatch(value)
+        or (_IDENTIFIER.fullmatch(value) and "_" in value and len(value) < 20)
+    ):
+        return False
+    classes = (
+        any(c.islower() for c in value)
+        + any(c.isupper() for c in value)
+        + any(c.isdigit() for c in value)
+        + any(not c.isalnum() for c in value)
+    )
+    if classes < 2 or not any(c.isalpha() for c in value):
+        return False
+    return _entropy(value) >= (_MIN_ENTROPY_QUOTED if quoted else _MIN_ENTROPY_UNQUOTED)
+
+
+def _assignment_kind(name: str) -> str:
+    flat = re.sub(r"[^a-z]", "", name.lower())
+    if "secretaccesskey" in flat or ("aws" in flat and "secret" in flat):
+        return "aws-secret-access-key"
+    return "credential-assignment"
+
+
+def _value_spans(text: str) -> list[tuple[str, int, int]]:
+    """(kind, start, end) of values after credential names and auth schemes."""
+    found = []
+    for m in _ASSIGNMENT.finditer(text):
+        group = "qv" if m.group("qv") is not None else "uv"
+        if _secret_like(m.group(group), quoted=group == "qv"):
+            found.append((_assignment_kind(m.group("name")), m.start(group), m.end(group)))
+    for m in _AUTH_SCHEME.finditer(text):
+        if _secret_like(m.group("uv"), quoted=True):
+            found.append((f"{m.group('name').lower()}-credentials", m.start("uv"), m.end("uv")))
+    return found
+
+
+def _replace_spans(text: str, spans: list[tuple[str, int, int]]) -> str:
+    out, pos = [], 0
+    for kind, start, end in sorted(spans, key=lambda s: s[1]):
+        if start < pos:  # overlaps a span already replaced
+            continue
+        out.append(text[pos:start])
+        out.append(REDACTED.format(kind=kind))
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+# Private keys. After a BEGIN header, all text up to the END header with the
+# same label is key payload, whatever it looks like: no entropy or length
+# test decides. A header with no END redacts the rest of the text (fail
+# closed). Each payload line becomes one marker (indent kept), so the line
+# count does not change (ruling R-LINES). A payload line that cannot be key
+# data (it holds characters outside base64, armor headers and the quotes and
+# escapes of a key in code) gets its own kind, so Claude can see that a key
+# block hides text. The kind says only that; it shows no part of the line.
+_PK_BEGIN = re.compile(r"-----BEGIN([A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?)-----")
+# Key data: base64 (with `\n` escapes of a one-line key) inside optional quotes
+# and concatenation of a key in code, or an armor header line.
+_PK_DATA = re.compile(
+    r"[\s\"'`+(,]*+(?:[A-Za-z0-9+/=]|\\[nr])*+[\s\"'`+),;]*+"
+    r"|(?:Proc-Type|DEK-Info|Version|Comment|Hash|Charset): .*"
+)
+# PuTTY key files: `Private-Lines: N`, then N lines of key data.
+_PUTTY_HEADER = re.compile(r"PuTTY-User-Key-File-\d+:")
+_PUTTY_PRIVATE_LINES = re.compile(r"\s*Private-Lines:\s*(\d{1,6})\s*")
+
+
+def _pk_payload(segment: str) -> str:
+    body = segment.strip()
+    if not body or _MARKER_ONLY.fullmatch(body):
+        return segment
+    kind = "private-key" if _PK_DATA.fullmatch(body) else "text-in-private-key-block"
+    return segment[: len(segment) - len(segment.lstrip())] + REDACTED.format(kind=kind)
+
+
+def _pk_line(line: str, end_tag: str | None) -> tuple[str, str | None]:
+    """Redact one line. `end_tag` is the END header awaited, or None."""
     out: list[str] = []
     pos = 0
     while True:
-        if in_key:
-            end = _PK_END.search(line, pos)
-            stop = end.start() if end else len(line)
-            out.append(_pk_body_sub(line[pos:stop]))
-            if end is None:
-                return "".join(out), True
-            out.append(end.group())
-            pos, in_key = end.end(), False
+        if end_tag is not None:
+            stop = line.find(end_tag, pos)
+            out.append(_pk_payload(line[pos : len(line) if stop < 0 else stop]))
+            if stop < 0:
+                return "".join(out), end_tag
+            out.append(end_tag)
+            pos, end_tag = stop + len(end_tag), None
         else:
             begin = _PK_BEGIN.search(line, pos)
             if begin is None:
                 out.append(line[pos:])
-                return "".join(out), False
+                return "".join(out), None
             out.append(line[pos : begin.end()])
-            pos, in_key = begin.end(), True
+            pos, end_tag = begin.end(), f"-----END{begin.group(1)}-----"
 
 
 def _redact_private_keys(text: str) -> str:
-    if "PRIVATE KEY" not in text:
+    has_pem = "PRIVATE KEY" in text
+    has_putty = _PUTTY_HEADER.search(text) is not None
+    if not (has_pem or has_putty):
         return text
     lines = text.split("\n")
-    in_key, budget = False, 0
+    end_tag: str | None = None
+    putty_left = 0
     for i, line in enumerate(lines):
-        if in_key:
-            budget -= 1
-            keyish = _PK_KEYISH_LINE.match(line) or _pk_body_sub(line) != line
-            if budget < 0 or not (keyish or _PK_END.search(line)):
-                in_key = False
-        lines[i], in_key = _pk_line(line, in_key)
-        if in_key and _PK_BEGIN.search(line):
-            budget = _PK_MAX_LINES
+        cr = "\r" if line.endswith("\r") else ""
+        body = line[: len(line) - len(cr)]
+        if putty_left > 0:
+            lines[i], putty_left = _pk_payload(body) + cr, putty_left - 1
+            continue
+        if has_pem:
+            body, end_tag = _pk_line(body, end_tag)
+            lines[i] = body + cr
+        if has_putty and end_tag is None:
+            m = _PUTTY_PRIVATE_LINES.fullmatch(body)
+            if m:
+                putty_left = int(m.group(1))
     return "\n".join(lines)
 
 
@@ -197,8 +363,11 @@ def find_credentials(text: str) -> list[tuple[str, int, int]]:
     found: list[tuple[str, int, int]] = []
     for kind, pattern in _TOKEN_PATTERNS:
         found.extend((kind, m.start(), m.end()) for m in pattern.finditer(text))
+    found.extend(("jwt", m.start(), m.end()) for m in _JWT_CANDIDATE.finditer(text) if _is_jwt(m))
     found.extend(("url-credentials", m.start(), m.end()) for m in _URL_CREDENTIALS.finditer(text))
     found.extend(("private-key", m.start(), m.end()) for m in _PK_BEGIN.finditer(text))
+    found.extend(("private-key", m.start(), m.end()) for m in _PUTTY_HEADER.finditer(text))
+    found.extend(_value_spans(text))
     return sorted(found, key=lambda f: (f[1], f[2]))
 
 
@@ -207,13 +376,20 @@ def redact_text(text: str) -> str:
 
     Keeps the line structure, so line numbers do not move. Used by render
     (before Claude sees the bundle) and by publish (before anything is posted).
+    Idempotent: a marker is never redacted again.
+
+    Order: private keys (they need the lines around them), token prefixes,
+    JWTs, URL credentials, then values after credential names (last, so a
+    value with a known prefix keeps its own kind).
     """
     if not isinstance(text, str):
         raise TypeError("redact_text takes a str")
     text = _redact_private_keys(text)
     for kind, pattern in _TOKEN_PATTERNS:
         text = pattern.sub(REDACTED.format(kind=kind), text)
-    return _URL_CREDENTIALS.sub(lambda m: m.group(1) + REDACTED.format(kind="url-credentials") + "@", text)
+    text = _JWT_CANDIDATE.sub(lambda m: REDACTED.format(kind="jwt") if _is_jwt(m) else m.group(), text)
+    text = _URL_CREDENTIALS.sub(lambda m: m.group(1) + REDACTED.format(kind="url-credentials") + "@", text)
+    return _replace_spans(text, _value_spans(text))
 
 
 # ---------------------------------------------------------------------------
@@ -409,12 +585,14 @@ _PATCH_PREAMBLE = ("diff ", "index ", "--- ", "+++ ", "new file mode ", "deleted
                    "old mode ", "new mode ", "similarity index ", "rename from ", "rename to ")
 
 
-def _annotate_patch(patch: str) -> list[str]:
-    """Unified diff -> lines with base and head line numbers (spec "Bundle").
+_Row = tuple[int | None, int | None, str]
 
+
+def _parse_patch(patch: str) -> tuple[list[_Row], list[str]]:
+    """Unified diff -> rows (base number, head number, marker) and their texts.
+
+    Marker "@" is a hunk header (its text is the section text after `@@`).
     Strict: hunk counts must match the lines, else RenderError (fail closed).
-    Content lines always start with a diff marker, so PR text cannot forge a
-    hunk header.
     """
     raw = patch.split("\n")
     if raw and raw[-1] == "":
@@ -458,13 +636,81 @@ def _annotate_patch(patch: str) -> list[str]:
         texts.append(body)
     if rem_base or rem_head:
         raise RenderError("malformed patch: hunk ends early")
-    # Clean all texts as one block, so a key that spans lines is redacted with
-    # its context. Line count is kept, so rows and texts stay aligned.
-    shown = model_lines("".join(t + "\n" for t in texts))
-    if len(shown) != len(rows):
-        raise RenderError("patch line count changed")
+    return rows, texts
+
+
+# Value of `files[].patch_redaction` when the patch came from `redact_patch`.
+PATCH_REDACTION = "blob-context"
+_NO_NEWLINE = "\\ No newline at end of file"
+
+
+def _blob_lines(text: str | None, side: str) -> tuple[list[str], list[str]] | None:
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        raise RenderError(f"{side} blob is not text")
+    raw, shown = text.split("\n"), redact_text(text).split("\n")
+    if len(raw) != len(shown):
+        raise RenderError("redaction changed the line count")
+    return raw, shown
+
+
+def _side_line(lines: tuple[list[str], list[str]] | None, n: int | None, text: str, side: str) -> str:
+    if lines is None or n is None or not 1 <= n <= len(lines[0]) or lines[0][n - 1] != text:
+        raise RenderError(f"patch line does not match the {side} blob")
+    return lines[1][n - 1]
+
+
+def redact_patch(patch: str, base_text: str | None, head_text: str | None) -> str:
+    """Redact a unified diff with the context of its two full blobs.
+
+    collect.py must call this for every patch it puts in the bundle and set
+    `patch_redaction` to `PATCH_REDACTION`; render_bundle refuses a patch
+    without it. A hunk alone cannot show that its lines are inside a private
+    key whose header is outside the hunk, so each patch line is replaced with
+    the same line of `redact_text(<whole blob>)`, which is also the text that
+    verdict.py cites (`model_text`). Removed lines come from the base blob,
+    added lines from the head blob. A context line takes the side with more
+    markers.
+
+    `base_text` is None for an added file, `head_text` for a removed one. Every
+    patch line must equal its blob line, else RenderError (fail closed).
+    Hunk section text (after the second `@@`) is dropped: it is a line of the
+    file with no line number, so it cannot be redacted with its context.
+    """
+    rows, texts = _parse_patch(patch)
+    base, head = _blob_lines(base_text, "base"), _blob_lines(head_text, "head")
     out = []
-    for (b, h, marker), text in zip(rows, shown):
+    for (b, h, marker), text in zip(rows, texts):
+        if marker.startswith("@"):
+            out.append(marker[1:].rstrip())
+        elif marker == "\\":
+            out.append(_NO_NEWLINE)
+        elif marker == "-":
+            out.append("-" + _side_line(base, b, text, "base"))
+        elif marker == "+":
+            out.append("+" + _side_line(head, h, text, "head"))
+        else:
+            from_base = _side_line(base, b, text, "base")
+            from_head = _side_line(head, h, text, "head")
+            more_base = from_base.count("[REDACTED:") > from_head.count("[REDACTED:")
+            out.append(" " + (from_base if more_base else from_head))
+    return "".join(line + "\n" for line in out)
+
+
+def _annotate_patch(patch: str) -> list[str]:
+    """Unified diff -> lines with base and head line numbers (spec "Bundle").
+
+    Content lines always start with a diff marker, so PR text cannot forge a
+    hunk header. Each line is cleaned on its own: the patch was already
+    redacted with whole-blob context (`redact_patch`), and markers are not
+    redacted again, so a line shows the same text as `model_text` of its blob.
+    """
+    rows, texts = _parse_patch(patch)
+    out = []
+    for (b, h, marker), text in zip(rows, texts):
+        shown = model_lines(text)
+        text = shown[0] if shown else ""
         nums = f"{'' if b is None else b:>5} {'' if h is None else h:>5}"
         if marker.startswith("@"):
             out.append(f"{nums} | {marker[1:]}{text}")
@@ -473,10 +719,12 @@ def _annotate_patch(patch: str) -> list[str]:
     return out
 
 
-def _emit_patch(out: list[str], patch: Any) -> None:
+def _emit_patch(out: list[str], patch: Any, redaction: Any) -> None:
     if not isinstance(patch, str):
         _emit(out, 0, "patch", patch, 1)
         return
+    if redaction != PATCH_REDACTION:
+        raise RenderError("patch was not redacted with its blob context (redact_patch)")
     lines = _annotate_patch(patch)
     out.append(f"patch: ({len(lines)} lines; columns: base line, head line)")
     out.extend(f"  | {line}" for line in lines)
@@ -494,7 +742,7 @@ def _emit_file(out: list[str], index: int, total: int, f: Any) -> None:
     if binary:
         return
     if "patch" in f:
-        _emit_patch(out, f["patch"])
+        _emit_patch(out, f["patch"], f.get("patch_redaction"))
     if "head_content" in f:
         _emit_head_content(out, f["head_content"])
 

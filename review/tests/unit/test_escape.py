@@ -52,6 +52,8 @@ def assert_inert(out: str) -> None:
     assert not re.search(r"(?i)\bwww\.", seen)
     assert not re.search(r"#\d", seen)
     assert not re.search(r"(?i)\bgh-\d", seen)
+    # 3b. No bare commit SHA, full or short: no run of 7+ hex characters.
+    assert not re.search(r"[0-9A-Fa-f]{7,}", seen), seen
     # 4. No control, format or private-use character except our ZWSP; no
     #    paragraph break; no line that starts with whitespace.
     for c in seen:
@@ -133,6 +135,39 @@ def test_text_is_kept_readable(text):
     out = unescape(p.escape_text(text, 2000, multiline=True)).replace(ZWSP, "")
     want = "".join(c for c in text if unicodedata.category(c) != "Cf")
     assert out.split() == want.split() or "[REDACTED" in out
+
+
+# Review finding 4: GitHub links a bare commit SHA (full or short).
+SHAS = [
+    "e0393187e95f47e7bd0bd02d5c7118630ad2cce1",
+    "E0393187E95F47E7BD0BD02D5C7118630AD2CCE1",
+    "e039318",
+    "42efe26",
+    "1234567",
+    "b2c3cff4a",
+]
+
+
+@pytest.mark.parametrize("sha", SHAS)
+@pytest.mark.parametrize("multiline", [False, True])
+def test_commit_sha_is_not_autolinked(sha, multiline):
+    for text in (sha, f"see {sha}.", f"user@{sha}", f"owner/repo@{sha}", f"{sha}...{sha[:7]}", f"a\n{sha}\nb"):
+        out = p.escape_text(text, 300, multiline=multiline)
+        assert_inert(out)
+        assert unescape(out).replace(ZWSP, "").split() == text.split() or not multiline
+
+
+def test_sha_exact_output():
+    out = p.escape_text("e0393187e95f47e7bd0bd02d5c7118630ad2cce1", 100)
+    assert out == ZWSP.join(["e03931", "87e95f", "47e7bd", "0bd02d", "5c7118", "630ad2", "cce1"])
+    assert p.escape_text("abcdef", 100) == "abcdef"  # 6 hex characters is not a SHA
+
+
+def test_cut_never_leaves_a_bare_sha():
+    text = "x " + "abcdef0123456789" * 4
+    for n in range(1, len(text) + 2):
+        out = p.escape_text(text, n)
+        assert_inert(out[: -len(p.TRUNCATED)] if out.endswith(p.TRUNCATED) else out)
 
 
 def test_link_exact_output():
@@ -265,6 +300,32 @@ def test_truncation_does_not_leak_a_token():
         out = unescape(p.escape_text(text, 20 + cut))
         for k in range(8, len(GH_TOKEN) - 3):
             assert GH_TOKEN[4 : 4 + k] not in out
+
+
+# Review findings 1 and 3: no cut shows any part of these secrets.
+AWS_SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+PASSWORD = "d8Q2xK7mV4nR9zT6pL3sW5yH0bC1fJ8a"
+JWT_EMPTY_CLAIMS = "eyJhbGciOiJIUzI1NiJ9.e30.ZRrHA1JJJW8opsbCGfG_HACGpVUMN_a9IV7pAx_Zmeo"
+KEY_LINES = ["MIIBVAIB", "ADANBgkq", "abcdefgh", "Zm9vYmFy", "AB=="]
+SECRET_TEXTS = [
+    (f'aws_secret_access_key = "{AWS_SECRET}"', [AWS_SECRET]),
+    (f"password: {PASSWORD}", [PASSWORD]),
+    (f"Authorization: Bearer {JWT_EMPTY_CLAIMS}", [JWT_EMPTY_CLAIMS]),
+    ("-----BEGIN PRIVATE KEY-----\n" + "\n".join(KEY_LINES) + "\n-----END PRIVATE KEY-----", KEY_LINES),
+]
+
+
+@pytest.mark.parametrize("text,secrets", SECRET_TEXTS)
+@pytest.mark.parametrize("multiline", [False, True])
+def test_truncation_never_exposes_a_secret(text, secrets, multiline):
+    for n in range(1, len(text) + 5):
+        out = unescape(p.escape_text("lead " + text + " tail", n, multiline=multiline)).replace(ZWSP, "")
+        for secret in secrets:
+            if len(secret) <= 8:
+                assert secret not in out.replace("\n", " ").split(), (n, out)
+            for k in range(8, len(secret) + 1):
+                for i in range(len(secret) - k + 1):
+                    assert secret[i : i + k] not in out, (n, out)
 
 
 # --- redaction ---------------------------------------------------------------

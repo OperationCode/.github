@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import copy
+import difflib
+import hashlib
+import hmac
 import random
 import re
 import unicodedata
@@ -45,6 +49,7 @@ def make_env(**payload_overrides):
                 "binary": False,
                 "coverage": "full",
                 "patch": "@@ -1,2 +1,2 @@\n-a = 1\n+a = 2\n b = 3\n",
+                "patch_redaction": r.PATCH_REDACTION,
                 "head_content": "a = 2\nb = 3\n",
             }
         ],
@@ -450,6 +455,23 @@ TOKENS = {
     "pypi-token": ["pypi-AgEIcHlwaS5vcmc" + "A" * 60],
     "sendgrid-key": ["SG." + "a" * 22 + "." + "b" * 43],
     "jwt": ["eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"],
+    "slack-app-token": ["xapp-1-A0123BCDEFG-1234567890123-" + "0a" * 32],
+    "huggingface-token": ["hf_" + "aB3" * 12],
+    "digitalocean-token": ["dop_v1_" + "0f" * 32],
+    "vault-token": ["hvs." + "CAESIJ" * 5],
+    "grafana-token": ["glsa_" + "Ab1" * 10 + "Zz_" + "0a1b2c3d", "glc_" + "eyJvIjoiMTIzIiwibiI6InRlc3QifQ" + "AbCd" * 3],
+    "shopify-token": ["shpat_" + "0a1B" * 8],
+    "databricks-token": ["dapi" + "0f" * 16],
+    "doppler-token": ["dp.pt." + "Ab3" * 15],
+    "linear-api-key": ["lin_api_" + "aB3d" * 10],
+    "postman-api-key": ["PMAK-" + "0a" * 12 + "-" + "1b" * 17],
+    "twilio-api-key": ["SK" + "0a1b" * 8],
+    "google-oauth-secret": ["GOCSPX-" + "aB3_" * 7],
+    "google-oauth-token": ["ya29." + "a0AfH6SM" * 4],
+    "telegram-bot-token": ["123456789:AA" + "Ab3_" * 8 + "Z"],
+    "discord-webhook": ["https://discord.com/api/webhooks/123456789012345678/" + "Ab3-" * 10],
+    "azure-storage-key": ["AccountKey=" + "Ab3+" * 21 + "Ab==" ],
+    "age-secret-key": ["AGE-SECRET-KEY-1" + "QZ9" * 19 + "Q"],
 }
 
 
@@ -510,25 +532,227 @@ def test_redact_pgp_key_with_armor_headers():
         assert line[:20] not in out
 
 
-def test_unterminated_key_stops_at_code():
-    text = "-----BEGIN RSA PRIVATE KEY-----\n" + KEY_BODY[0] + "\nreturn compute(x);\nsha = '" + "0123456789abcdef" * 2 + "'\n"
+# Review finding 1: everything between a key's BEGIN and END headers is
+# payload. No run length, digit or entropy test decides.
+
+
+def pem_body(nbytes, width, seed=1):
+    """Base64 key body from random bytes, wrapped at `width` columns."""
+    data = base64.b64encode(random.Random(seed).randbytes(nbytes)).decode()
+    return [data[i : i + width] for i in range(0, len(data), width)]
+
+
+def assert_key_gone(out, body):
+    for line in body:
+        assert line not in out.split("\n"), line
+        if len(line) >= 4:
+            assert line not in out, line
+
+
+@pytest.mark.parametrize("width", [4, 8, 16, 64])
+def test_key_body_wrapped_short_is_fully_redacted(width):
+    body = pem_body(48, width)
+    text = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(body) + "\n-----END PRIVATE KEY-----\nafter = 1\n"
     out = r.redact_text(text)
-    assert KEY_BODY[0] not in out
-    assert "return compute(x);" in out
-    assert "0123456789abcdef" * 2 in out  # key mode ended before this line
+    assert_key_gone(out, body)
+    lines = out.split("\n")
+    assert lines[1 : 1 + len(body)] == ["[REDACTED:private-key]"] * len(body)
+    assert lines[len(body) + 1] == "-----END PRIVATE KEY-----"
+    assert lines[len(body) + 2] == "after = 1"
+    assert out.count("\n") == text.count("\n")
 
 
-def test_unterminated_key_line_budget():
-    lines = ["-----BEGIN RSA PRIVATE KEY-----"] + ["abcdefgh12345678abcd"] * (r._PK_MAX_LINES + 50)
-    out = r.redact_text("\n".join(lines)).split("\n")
-    assert out[1] == "[REDACTED:private-key]"
-    assert out[r._PK_MAX_LINES] == "[REDACTED:private-key]"
-    assert out[r._PK_MAX_LINES + 1] == "abcdefgh12345678abcd"
+def test_key_alphabet_only_and_short_final_lines_are_redacted():
+    body = ["abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOP", "Zm9v", "AB==", "=Xy1"]
+    text = "-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(body) + "\n-----END RSA PRIVATE KEY-----"
+    out = r.redact_text(text)
+    assert out.split("\n")[1:-1] == ["[REDACTED:private-key]"] * len(body)
 
 
-def test_redact_keeps_words_without_digits_in_key():
-    text = "-----BEGIN RSA PRIVATE KEY-----\nabcdefghijklmnopqrstuvwxyz\n-----END RSA PRIVATE KEY-----"
-    assert "abcdefghijklmnopqrstuvwxyz" in r.redact_text(text)
+def test_key_over_200_lines_is_fully_redacted():
+    body = pem_body(3000, 8)
+    assert len(body) > 300
+    text = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "\n".join(body) + "\n-----END OPENSSH PRIVATE KEY-----\nx = 2"
+    out = r.redact_text(text)
+    assert_key_gone(out, body)
+    assert out.split("\n")[-1] == "x = 2"
+
+
+def test_unterminated_key_redacts_the_rest():
+    # Fail closed: no END header, so the rest of the text is key payload. Lines
+    # that cannot be key data get their own kind, so a fake header that hides
+    # code is visible as such; no part of the line is shown.
+    body = pem_body(48, 8)
+    text = "x = 1\n-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(body) + "\nreturn compute(x);\n\nsha = 'abc'\n"
+    out = r.redact_text(text).split("\n")
+    assert out[:2] == ["x = 1", "-----BEGIN RSA PRIVATE KEY-----"]
+    assert out[2 : 2 + len(body)] == ["[REDACTED:private-key]"] * len(body)
+    assert out[2 + len(body) :] == ["[REDACTED:text-in-private-key-block]", "", "[REDACTED:text-in-private-key-block]", ""]
+
+
+def test_key_end_must_match_begin_label():
+    body = pem_body(48, 16)
+    text = "-----BEGIN RSA PRIVATE KEY-----\n-----END EC PRIVATE KEY-----\n" + "\n".join(body) + "\n-----END RSA PRIVATE KEY-----\n"
+    out = r.redact_text(text)
+    assert_key_gone(out, body)
+    assert out.split("\n")[1] == "[REDACTED:text-in-private-key-block]"
+
+
+def test_key_in_code_keeps_indent_and_line_count():
+    body = pem_body(48, 12)
+    text = 'KEY = (\n    "-----BEGIN PRIVATE KEY-----\\n"\n' + "".join(f'    "{b}\\n"\n' for b in body) + '    "-----END PRIVATE KEY-----"\n)\n'
+    out = r.redact_text(text)
+    assert_key_gone(out, body)
+    lines = out.split("\n")
+    assert lines[1] == '    "-----BEGIN PRIVATE KEY-----[REDACTED:private-key]'
+    assert lines[2] == "    [REDACTED:private-key]"
+    assert lines[-3] == '    [REDACTED:private-key]-----END PRIVATE KEY-----"'
+    assert out.count("\n") == text.count("\n")
+
+
+def test_putty_private_lines_are_redacted():
+    private = pem_body(60, 64, seed=3)
+    text = (
+        "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none\nComment: k\nPublic-Lines: 1\nAAAAC3NzaC1lZDI1NTE5\n"
+        f"Private-Lines: {len(private)}\n" + "\n".join(private) + "\nPrivate-MAC: 00ff\n"
+    )
+    out = r.redact_text(text)
+    assert_key_gone(out, private)
+    assert "Private-MAC: 00ff" in out and "AAAAC3NzaC1lZDI1NTE5" in out
+    assert out.count("\n") == text.count("\n")
+    assert any(k == "private-key" for k, _, _ in r.find_credentials(text))
+
+
+def test_key_with_crlf_lines():
+    body = pem_body(30, 8)
+    text = "-----BEGIN PRIVATE KEY-----\r\n" + "\r\n".join(body) + "\r\n-----END PRIVATE KEY-----\r\n"
+    out = r.redact_text(text)
+    assert_key_gone(out, body)
+    assert out.split("\n")[1] == "[REDACTED:private-key]\r"
+
+
+# Review finding 3: credential assignments, AWS secret keys and JWTs.
+
+
+def b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def make_jwt(claims_b64, header=b'{"alg":"HS256","typ":"JWT"}', key=b"k"):
+    signing_input = f"{b64url(header)}.{claims_b64}"
+    return signing_input + "." + b64url(hmac.new(key, signing_input.encode(), hashlib.sha256).digest())
+
+
+JWTS = [
+    make_jwt("e30"),  # claims `{}`
+    make_jwt(b64url(b'{"a":1}')),
+    make_jwt(b64url(b'{"sub":"1234567890","name":"x"}')),
+    make_jwt("e30", header=b'{"alg":"HS256"}'),
+    make_jwt(b64url(b"[]"), header=b'{ "alg" : "RS256" }'),
+    b64url(b'{"alg":"none"}') + ".e30.",  # unsecured, empty signature
+]
+
+
+@pytest.mark.parametrize("jwt", JWTS)
+def test_jwt_detected_by_structure(jwt):
+    for text in (jwt, f"Authorization: {jwt}", f"x='{jwt}';", f"?token={jwt}&a=1"):
+        out = r.redact_text(text)
+        assert jwt not in out
+        assert jwt.split(".")[0] not in out
+        assert "[REDACTED:jwt]" in out
+    start = 5
+    assert ("jwt", start, start + len(jwt)) in r.find_credentials(f"jwt: {jwt}")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "eyes.on.you",
+        "ey.foo.bar",
+        "eyJ.a.b",  # header does not decode
+        b64url(b'{"typ":"JWT"}') + ".e30.abc",  # no alg
+        "obey.this.rule",
+        "keyJar.load.x",
+        "version 1.2.3 of eyeglass.module.py",
+    ],
+)
+def test_jwt_negatives(text):
+    assert r.redact_text(text) == text
+
+
+AWS_SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+PASSWORD = "d8Q2xK7mV4nR9zT6pL3sW5yH0bC1fJ8a"
+HEX_TOKEN = "abcdef0123456789abcdef0123456789"
+
+ASSIGNMENTS = [
+    ("aws-secret-access-key", f'aws_secret_access_key = "{AWS_SECRET}"', AWS_SECRET),
+    ("aws-secret-access-key", f"AWS_SECRET_ACCESS_KEY={AWS_SECRET}", AWS_SECRET),
+    ("aws-secret-access-key", f"  secretAccessKey: '{AWS_SECRET}',", AWS_SECRET),
+    ("aws-secret-access-key", f'"SecretAccessKey": "{AWS_SECRET}"', AWS_SECRET),
+    ("credential-assignment", f'password = "{PASSWORD}"', PASSWORD),
+    ("credential-assignment", f"db_password: {PASSWORD}", PASSWORD),
+    ("credential-assignment", f"  password: '{PASSWORD}'", PASSWORD),
+    ("credential-assignment", f'"client_secret": "{PASSWORD}",', PASSWORD),
+    ("credential-assignment", f"API_TOKEN={HEX_TOKEN}", HEX_TOKEN),
+    ("credential-assignment", f'config["api_key"] = "{PASSWORD}"', PASSWORD),
+    ("credential-assignment", f"$dbPass = 'x'; $secret := `{PASSWORD}`", PASSWORD),
+    ("credential-assignment", f"const githubToken = '{PASSWORD}';", PASSWORD),
+    ("credential-assignment", f"PRIVATE_KEY => \"{PASSWORD}\"", PASSWORD),
+    ("credential-assignment", 'passwd = "hunter22"', "hunter22"),
+    ("credential-assignment", f"f(password={PASSWORD})", PASSWORD),
+    ("bearer-credentials", f"Authorization: Bearer {PASSWORD}", PASSWORD),
+    ("basic-credentials", "Authorization: Basic dXNlcjpodW50ZXIy", "dXNlcjpodW50ZXIy"),
+]
+
+
+@pytest.mark.parametrize("kind,text,secret", ASSIGNMENTS)
+def test_credential_assignment_redacted(kind, text, secret):
+    out = r.redact_text(text)
+    assert secret not in out
+    assert f"[REDACTED:{kind}]" in out
+    start = text.index(secret)
+    assert (kind, start, start + len(secret)) in r.find_credentials(text)
+    assert r.redact_text(f"a\n{text}\nb").count("\n") == 2
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "password = get_password()",
+        "password = self.password",
+        "token = os.environ['TOKEN']",
+        "password: ${{ secrets.DB_PASSWORD }}",
+        "password: ${DB_PASSWORD}",
+        'password = "password"',
+        'password = "changeme"',
+        'password = ""',
+        'secret = "short1"',
+        'tokenizer = "bert-base-uncased-v2"',
+        "secretary = 'Jane Q. Public 2'",
+        "max_tokens = 1024",
+        "TOKEN_NAME = DEFAULT_TOKEN_NAME",
+        "api_key = API_KEY_V2",
+        'if password == "a"',
+        'token_url = "https://auth.example.com/oauth2/token"',
+        "password = '********'",
+        "password = '<your password here>'",
+        "Bearer tokens are short-lived",
+        "basic authentication",
+        'token = "aaaaaaaa1"',
+        "pwd = os.getcwd()",
+    ],
+)
+def test_credential_assignment_negatives(text):
+    assert r.redact_text(text) == text
+
+
+def test_redact_is_idempotent():
+    samples = [PRIVATE_KEY, *JWTS, *(t for _, t, _ in ASSIGNMENTS), f"x {GH_TOKEN}", "https://u:p4ss@h.example/"]
+    text = "\n".join(samples) + "\n-----BEGIN PRIVATE KEY-----\nabc\n"
+    once = r.redact_text(text)
+    assert r.redact_text(once) == once
+    for line in once.split("\n"):
+        assert r.redact_text(line) == line
 
 
 def test_redact_leaves_shas_and_plain_text():
@@ -553,7 +777,8 @@ def test_render_redacts_private_key_in_head_content_and_keeps_numbers():
     f = env["payload"]["files"][0]
     f["head_content"] = f"x = 1\n{PRIVATE_KEY}\ny = 2\n"
     added = f["head_content"].split("\n")[:-1]
-    f["patch"] = f"@@ -0,0 +1,{len(added)} @@\n" + "".join(f"+{l}\n" for l in added)
+    raw_patch = f"@@ -0,0 +1,{len(added)} @@\n" + "".join(f"+{l}\n" for l in added)
+    f["patch"] = r.redact_patch(raw_patch, None, f["head_content"])
     inner = inner_of(render(env))
     for line in KEY_BODY:
         assert line[:20] not in inner
@@ -574,7 +799,7 @@ def test_redact_before_neutralize():
 def test_large_bundle_renders():
     env = make_env()
     env["payload"]["files"] = [
-        {"path": f"f{i}.py", "status": "added", "patch": "@@ -0,0 +1,500 @@\n" + "+x = 1\n" * 500, "head_content": "x = 1\n" * 500}
+        {"path": f"f{i}.py", "status": "added", "patch": "@@ -0,0 +1,500 @@\n" + "+x = 1\n" * 500, "patch_redaction": r.PATCH_REDACTION, "head_content": "x = 1\n" * 500}
         for i in range(40)
     ]
     rb = render(env)
@@ -689,11 +914,148 @@ def test_hunk_section_text_is_cleaned():
 def test_patch_key_redaction_keeps_rows():
     lines = ["x = 1", *PRIVATE_KEY.split("\n"), "y = 2"]
     patch = f"@@ -1,{len(lines)} +1,{len(lines)} @@\n" + "".join(f" {l}\n" for l in lines)
-    inner = inner_of(render(file_env(patch)))
+    blob = "\n".join(lines) + "\n"
+    inner = inner_of(render(file_env(r.redact_patch(patch, blob, blob))))
     for b in KEY_BODY:
         assert b[:20] not in inner
     n = len(lines)
     assert f"  | {n:>5} {n:>5} |  y = 2" in inner
+
+
+# Review finding 2: a hunk inside a key has no header in it. redact_patch
+# takes each line from the redacted whole blob, and render refuses a patch
+# that did not go through it.
+
+
+def unified(base, head, n=0):
+    """A unified diff from two texts, like collect.py computes it."""
+    return "".join(
+        difflib.unified_diff(base.splitlines(keepends=True), head.splitlines(keepends=True), "a/k.py", "b/k.py", n=n)
+    )
+
+
+def key_blob(body, before="a = 1", after="b = 2"):
+    return f"{before}\n-----BEGIN PRIVATE KEY-----\n" + "\n".join(body) + f"\n-----END PRIVATE KEY-----\n{after}\n"
+
+
+def render_patch_file(base, head, n=0):
+    env = file_env(r.redact_patch(unified(base, head, n), base, head))
+    return inner_of(render(env))
+
+
+def assert_cites_marker(base, head, side, line):
+    from oc_review import verdict
+
+    files = (verdict.changed_file("k.py", base_raw=base, head_raw=head),)
+    finding = {
+        "category": "secret", "severity": "high", "confidence": "high", "file": "k.py",
+        "side": side, "line": line, "quote": "[REDACTED:private-key]", "title": "t", "explanation": "e",
+    }
+    assert verdict.cite_finding("security", finding, files).verified
+
+
+def assert_patch_matches_model_text(inner, base, head):
+    """Every patch row shows the text that model_text gives for its blob line."""
+    base_lines, head_lines = r.model_lines(base), r.model_lines(head)
+    for row in patch_block(inner)[1:]:
+        m = re.match(r"  \| +(\d*) +(\d*) \| ([ +\-])(.*)$", row)
+        if not m:
+            continue
+        b, h, marker, text = m.groups()
+        if marker in " -" and b:
+            assert text == base_lines[int(b) - 1] or marker == " "
+        if marker in " +" and h:
+            assert text == head_lines[int(h) - 1] or marker == " "
+
+
+@pytest.mark.parametrize("context", [0, 1])
+def test_patch_edit_in_middle_of_key(context):
+    body = pem_body(96, 16, seed=5)
+    new_body = list(body)
+    new_body[4] = pem_body(12, 16, seed=6)[0]
+    base, head = key_blob(body), key_blob(new_body)
+    patch = unified(base, head, context)
+    assert "BEGIN" not in patch  # the header is outside the hunk
+    inner = render_patch_file(base, head, context)
+    assert_key_gone(inner, body + new_body)
+    assert "  |     7       | -[REDACTED:private-key]" in inner
+    assert "  |           7 | +[REDACTED:private-key]" in inner
+    assert_patch_matches_model_text(inner, base, head)
+    assert_cites_marker(base, head, "base", 7)
+    assert_cites_marker(base, head, "head", 7)
+
+
+def test_patch_deleted_key_body_line():
+    body = pem_body(96, 16, seed=7)
+    base, head = key_blob(body), key_blob(body[:3] + body[4:])
+    inner = render_patch_file(base, head)
+    assert_key_gone(inner, body)
+    assert "  |     6       | -[REDACTED:private-key]" in inner
+    assert_cites_marker(base, head, "base", 6)
+
+
+def test_patch_added_key_lines_header_outside_hunk():
+    body = pem_body(48, 16, seed=8)
+    extra = pem_body(48, 16, seed=9)
+    base, head = key_blob(body), key_blob(body + extra)
+    inner = render_patch_file(base, head)
+    assert_key_gone(inner, body + extra)
+    assert inner.count("+[REDACTED:private-key]") == len(extra)
+    assert_patch_matches_model_text(inner, base, head)
+
+
+def test_patch_context_line_takes_the_redacted_side():
+    # The head drops the key headers; its old body lines stay as context.
+    body = pem_body(48, 16, seed=10)
+    base = key_blob(body)
+    head = "a = 1\n" + "\n".join(body) + "\nb = 2\n"
+    inner = render_patch_file(base, head, n=3)
+    assert_key_gone(inner, body)
+
+
+def test_patch_hunk_section_text_dropped():
+    base = "def f():\n" + "".join(f"    x{i} = {i}\n" for i in range(10))
+    head = base.replace("x9 = 9", "x9 = 90")
+    patch = unified(base, head).replace(" @@\n", f" @@ def f(): {GH_TOKEN}\n", 1)
+    out = r.redact_patch(patch, base, head)
+    assert out.splitlines()[0] == "@@ -11 +11 @@"
+    assert GH_TOKEN not in out
+
+
+@pytest.mark.parametrize("redaction", [None, "", "yes", True])
+def test_render_refuses_patch_without_blob_context(redaction):
+    env = file_env("@@ -1 +1 @@\n-a\n+b\n")
+    f = env["payload"]["files"][0]
+    if redaction is None:
+        f.pop("patch_redaction")
+    else:
+        f["patch_redaction"] = redaction
+    with pytest.raises(r.RenderError):
+        render(env)
+
+
+@pytest.mark.parametrize(
+    "patch,base,head",
+    [
+        ("@@ -1 +1 @@\n-a\n+b\n", "x\n", "b\n"),  # removed line is not the base line
+        ("@@ -1 +1 @@\n-a\n+b\n", "a\n", "c\n"),  # added line is not the head line
+        ("@@ -5 +5 @@\n-a\n+b\n", "a\n", "b\n"),  # past the end of the blob
+        ("@@ -1 +1 @@\n-a\n+b\n", None, "b\n"),  # no base blob
+        ("@@ -1 +1 @@\n-a\n+b\n", "a\n", None),  # no head blob
+        ("@@ -1,2 +1,2 @@\n x\n-a\n+b\n", "x\na\n", "y\nb\n"),  # context differs on head
+        ("@@ -1 +1 @@\n-a\n+b\n", b"a\n", "b\n"),  # not text
+    ],
+)
+def test_redact_patch_fails_closed_on_mismatch(patch, base, head):
+    with pytest.raises(r.RenderError):
+        r.redact_patch(patch, base, head)
+
+
+def test_redact_patch_keeps_rows_and_no_newline_marker():
+    base, head = "a\nb", "a\nc"
+    patch = "@@ -1,2 +1,2 @@ ctx\n a\n-b\n\\ No newline at end of file\n+c\n\\ No newline at end of file\n"
+    out = r.redact_patch(patch, base, head)
+    assert out == "@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+c\n\\ No newline at end of file\n"
 
 
 def test_patch_crlf_and_separators():

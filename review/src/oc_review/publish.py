@@ -16,7 +16,9 @@ posted. `escape_text` does these steps, in this order:
    are stripped and blank lines dropped, so the result is one paragraph.
 4. Truncate to the fixed limit (counted in characters after steps 1-3).
 5. Break pings and autolinks with a zero-width space (U+200B): after every
-   `@`, between `:` and `//`, after `www`, after `#` and `GH-` before a digit.
+   `@`, between `:` and `//`, after `www`, after `#` and `GH-` before a digit,
+   and after every 6 characters of a run of 7+ hex characters (commit SHAs).
+   This comes after the cut, so a cut cannot make a new reference.
 6. Backslash-escape every ASCII punctuation character, so no Markdown link,
    image, HTML, autolink, emphasis, heading, list, table or entity can form.
    Multi-line text joins lines with a Markdown hard break (`\\` + newline).
@@ -66,6 +68,17 @@ _PUNCT = frozenset(string.punctuation)
 _LINE_BREAKS = re.compile(r"\r\n|[\r\n\x0b\x0c\x1c-\x1e\x85  ]")
 _AT_SIGNS = ("@", "＠", "﹫")  # @, fullwidth @, small @
 _DEFANG = re.compile(r"(?<=:)(?=//)|(?<=\bwww)(?=\.)|(?<=#)(?=\d)|(?<=\bgh-)(?=\d)", re.IGNORECASE)
+# GitHub links a bare commit SHA, full or short (7+ hex characters), also in
+# `user@sha` and `owner/repo@sha` forms. Every run of 7 or more hex characters
+# gets a ZWSP after each 6, so no part is long enough. No word-boundary test:
+# GitHub's exact rule is not known, so any such run is broken.
+_HEX_RUN = re.compile(r"[0-9A-Fa-f]{7,}")
+_HEX_CHUNK = 6
+
+
+def _break_hex(m: re.Match[str]) -> str:
+    run = m.group()
+    return ZWSP.join(run[i : i + _HEX_CHUNK] for i in range(0, len(run), _HEX_CHUNK))
 
 
 def _invisible(ch: str) -> bool:
@@ -99,7 +112,7 @@ def _strip_controls(text: str) -> str:
 
 
 def _escape_line(line: str) -> str:
-    line = _DEFANG.sub(ZWSP, line)
+    line = _HEX_RUN.sub(_break_hex, _DEFANG.sub(ZWSP, line))
     out: list[str] = []
     for ch in line:
         if ch in _PUNCT:
