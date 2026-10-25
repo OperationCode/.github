@@ -55,7 +55,8 @@ Owner:
 
 - [ ] Owner: create a scratch source repo in the org for the V tests, separate from claude-review-test.
 - [ ] Owner: Anthropic Console: a dedicated workspace with a hard monthly spend limit and a service account. Create the production federation rule from V3 with the condition shape only; it gets its first SHA in phase 3. No API key.
-- [ ] Owner: a separate eval workspace with its own small spend limit, and a federation rule for `eval.yml` on `workflow_dispatch` in `OperationCode/.github` only (spec "Auth and cost"). Needed before phase 2.
+- [ ] Owner: a separate eval workspace with its own small spend limit, and a federation rule for `eval.yml` on `workflow_dispatch` in `OperationCode/.github` that also requires the claim `environment: "eval"` (spec "Auth and cost"). Needed before phase 2.
+- [ ] Owner: on `.github`, create the GitHub environment `eval`: the owner is a required reviewer, and only the `main` branch may deploy to it. Needed before phase 2.
 - [ ] Owner: a test workspace with a very small spend limit for V9.
 - [ ] Owner: the test org ruleset for V6 that targets only claude-review-test.
 - [ ] Owner: a Dependabot PR in claude-review-test for V4.
@@ -101,7 +102,7 @@ Depends on: V3, V5 (analyze); V6, V16, V24 (publish).
 - [ ] The analyze job is the only job with `id-token: write`. The gate job has no Anthropic credential.
 - [ ] A unit test parses the workflow: no `continue-on-error`, the dependency-review job exports the step `outcome`, every `uses:` is a full SHA.
 - [ ] `.github/workflows/test.yml`: unit tests on PRs to this repo.
-- [ ] `.github/workflows/eval.yml`: manual fixture evals.
+- [ ] `.github/workflows/eval.yml`: manual fixture evals. The job uses `environment: eval` and has `contents: read` and `id-token: write` only. The workflow unit test checks this.
 - [ ] V10: harden-runner in audit mode for a full run, then block mode with the measured allowlist.
 
 Depends on: V2, V4, V13, V18 (workflow); V10 needs a full run, so it runs here.
@@ -123,7 +124,7 @@ Exit criteria:
 The fixture eval calls the live API and costs money. The owner runs it on request only.
 
 - [ ] Add the fixture bundles from the spec's minimum set, with expected outcomes.
-- [ ] Owner: run `eval.yml` with the eval federation rule and eval workspace from phase 0, and record the results in the PR.
+- [ ] Owner: run `eval.yml` from `main` and approve the `eval` environment, with the eval federation rule and eval workspace from phase 0. Record the results in the PR that changed the prompts or code. A release pin never moves to a SHA whose evals have not passed.
 - [ ] Fix prompts or code for each miss, then run again on request.
 
 Depends on: phase 1.
