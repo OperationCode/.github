@@ -760,6 +760,19 @@ def test_override_older_than_push_epoch():
     assert r.status == FAIL and rejection(r) == verdict.OV_BEFORE_EPOCH
 
 
+def test_override_older_than_reopened_event():
+    events = [TimelineEvent("reopened", T0 + timedelta(hours=2))]
+    r = waivable_gate([override_comment()], events=events)
+    assert r.status == FAIL and rejection(r) == verdict.OV_BEFORE_EPOCH
+
+
+def test_override_after_reopened_event_is_accepted():
+    # Reopen, then override, then re-run: the override is newer than the epoch.
+    events = [TimelineEvent("reopened", T0 + timedelta(minutes=30))]
+    r = waivable_gate([override_comment()], events=events)
+    assert r.status == PASS
+
+
 def test_override_in_same_second_as_epoch():
     c = override_comment(created=T0 + timedelta(hours=1, microseconds=900_000))
     events = [TimelineEvent("base_ref_changed", T0 + timedelta(hours=1))]
@@ -779,7 +792,7 @@ def test_each_epoch_event_moves_the_epoch(event):
     assert rejection(waivable_gate([override_comment()], events=events)) == verdict.OV_BEFORE_EPOCH
 
 
-@pytest.mark.parametrize("event", ["reopened", "closed", "committed", "labeled", "head_ref_force_pushed_x"])
+@pytest.mark.parametrize("event", ["closed", "committed", "labeled", "head_ref_force_pushed_x"])
 def test_other_events_do_not_move_the_epoch(event):
     events = [TimelineEvent(event, T0 + timedelta(hours=3))]
     assert waivable_gate([override_comment()], events=events).status == PASS
