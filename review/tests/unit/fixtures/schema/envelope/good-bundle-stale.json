@@ -11,7 +11,5 @@
   "base_tip_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "merge_base_sha": "cccccccccccccccccccccccccccccccccccccccc",
   "status": "stale",
-  "payload": {
-    "anything": "goes"
-  }
+  "payload": null
 }

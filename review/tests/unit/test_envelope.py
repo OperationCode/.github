@@ -1,11 +1,13 @@
 import json
+import os
 
 import pytest
 
 from oc_review import envelope
 from oc_review.envelope import (
-    MAX_ENVELOPE_BYTES,
+    MAX_BYTES_BY_KIND,
     EnvelopeError,
+    check_context,
     check_digest,
     read_artifact,
     sha256_hex,
@@ -21,7 +23,7 @@ def write(tmp_path, doc, name=NAME):
 
 
 def read(tmp_path, data, **kw):
-    return read_artifact(tmp_path, expected_name=NAME, expected_digest=sha256_hex(data), **kw)
+    return read_artifact(tmp_path, **{"kind": "bundle", **kw}, expected_name=NAME, expected_digest=sha256_hex(data))
 
 
 def padded(good_envelope, size):
@@ -48,7 +50,7 @@ def test_digest_accepts_prefix_and_case(tmp_path):
 def test_digest_mismatch(tmp_path, good_envelope):
     data = write(tmp_path, good_envelope)
     with pytest.raises(EnvelopeError, match="digest mismatch"):
-        read_artifact(tmp_path, expected_name=NAME, expected_digest=sha256_hex(data + b" "))
+        read_artifact(tmp_path, kind="bundle", expected_name=NAME, expected_digest=sha256_hex(data + b" "))
 
 
 @pytest.mark.parametrize("bad", ["", "sha256:abc", "md5:" + "0" * 32, "z" * 64])
@@ -60,7 +62,7 @@ def test_digest_malformed(bad):
 def test_digest_checked_before_parse(tmp_path):
     data = write(tmp_path, b"not json")
     with pytest.raises(EnvelopeError, match="digest mismatch"):
-        read_artifact(tmp_path, expected_name=NAME, expected_digest="0" * 64)
+        read_artifact(tmp_path, kind="bundle", expected_name=NAME, expected_digest="0" * 64)
     with pytest.raises(EnvelopeError, match="invalid JSON"):
         read(tmp_path, data)
 
@@ -83,7 +85,7 @@ def test_extra_directory_counts(tmp_path, good_envelope):
 
 def test_missing_file(tmp_path):
     with pytest.raises(EnvelopeError, match="missing file"):
-        read_artifact(tmp_path, expected_name=NAME, expected_digest="0" * 64)
+        read_artifact(tmp_path, kind="bundle", expected_name=NAME, expected_digest="0" * 64)
 
 
 def test_wrong_name_single_file(tmp_path, good_envelope):
@@ -94,7 +96,7 @@ def test_wrong_name_single_file(tmp_path, good_envelope):
 
 def test_missing_directory(tmp_path):
     with pytest.raises(EnvelopeError, match="directory missing"):
-        read_artifact(tmp_path / "nope", expected_name=NAME, expected_digest="0" * 64)
+        read_artifact(tmp_path / "nope", kind="bundle", expected_name=NAME, expected_digest="0" * 64)
 
 
 def test_symlink_rejected(tmp_path, good_envelope):
@@ -119,14 +121,112 @@ def test_size_cap_at_limit_passes_and_over_fails(tmp_path, good_envelope):
         read(tmp_path, data, max_bytes=cap)
 
 
-def test_default_size_cap_value():
-    assert MAX_ENVELOPE_BYTES == 16 * 1024 * 1024
+def test_default_size_caps_per_kind():
+    assert MAX_BYTES_BY_KIND == {"bundle": 16 * 1024 * 1024, "pass": 1024 * 1024}
+
+
+def test_pass_cap_applies_by_default(tmp_path, good_envelope):
+    cap = MAX_BYTES_BY_KIND["pass"]
+    env = {**good_envelope, "kind": "pass", "pass": "review", "status": "failed", "payload": None}
+    env["head_sha"] = "a" * 40
+    base = len(json.dumps(env).encode())
+    # a pass file one byte over the cap fails, although the bundle cap would allow it
+    data = json.dumps({**env, "base_ref": "x" * (cap + 1 - base + len("main"))}).encode()
+    assert len(data) == cap + 1
+    write(tmp_path, data)
+    with pytest.raises(EnvelopeError, match="over size cap"):
+        read(tmp_path, data, kind="pass")
+
+
+def test_unknown_kind(tmp_path):
+    with pytest.raises(EnvelopeError, match="unknown kind"):
+        read_artifact(tmp_path, kind="x", expected_name=NAME, expected_digest="0" * 64)
+
+
+def test_kind_mismatch(tmp_path, good_envelope):
+    data = write(tmp_path, good_envelope)
+    with pytest.raises(EnvelopeError, match="kind mismatch"):
+        read(tmp_path, data, kind="pass")
+
+
+def test_fifo_rejected_without_blocking(tmp_path):
+    os.mkfifo(tmp_path / NAME)
+    with pytest.raises(EnvelopeError, match="not a regular file"):
+        read_artifact(tmp_path, kind="bundle", expected_name=NAME, expected_digest="0" * 64)
+
+
+def test_open_uses_nofollow(tmp_path, good_envelope, monkeypatch):
+    """A symlink swapped in after the listing is refused by the open itself."""
+    data = write(tmp_path / "..", good_envelope, name="real.json")
+    flags = []
+    real_open = os.open
+
+    def spy(path, fl, *a, **k):
+        flags.append(fl)
+        return real_open(path, fl, *a, **k)
+
+    monkeypatch.setattr(envelope.os, "open", spy)
+    d = tmp_path / "dl"
+    d.mkdir()
+    (d / NAME).write_bytes(data)
+    read(d, data)
+    assert flags and flags[0] & os.O_NOFOLLOW
+
+
+SNAP = {
+    "head_sha": "a" * 40,
+    "base_repository_id": 42,
+    "base_ref": "main",
+    "base_tip_sha": "b" * 40,
+    "merge_base_sha": "c" * 40,
+}
+CTX = {"repository_id": 42, "pr_number": 7, "run_id": 123456, "run_attempt": 1}
+
+
+def test_context_match(good_envelope):
+    check_context(good_envelope, **CTX, snapshot=SNAP)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("repository_id", 43),
+        ("pr_number", 8),
+        ("run_id", 123457),
+        ("run_attempt", 2),
+        ("head_sha", "d" * 40),
+        ("base_repository_id", 43),
+        ("base_ref", "dev"),
+        ("base_tip_sha", "d" * 40),
+        ("merge_base_sha", "d" * 40),
+    ],
+)
+def test_context_mismatch(good_envelope, field, value):
+    with pytest.raises(EnvelopeError, match=f"context mismatch: {field}$"):
+        check_context({**good_envelope, field: value}, **CTX, snapshot=SNAP)
+
+
+def test_context_mismatch_lists_all(good_envelope):
+    doc = {**good_envelope, "pr_number": 9, "run_id": 1}
+    with pytest.raises(EnvelopeError, match="pr_number, run_id"):
+        check_context(doc, **CTX, snapshot=SNAP)
+
+
+def test_context_rejects_bool_for_int(good_envelope):
+    with pytest.raises(EnvelopeError, match="run_attempt"):
+        check_context({**good_envelope, "run_attempt": True}, **{**CTX}, snapshot=SNAP)
+
+
+def test_context_snapshot_missing_field(good_envelope):
+    snap = {k: v for k, v in SNAP.items() if k != "base_ref"}
+    with pytest.raises(EnvelopeError, match="snapshot missing base_ref"):
+        check_context(good_envelope, **CTX, snapshot=snap)
 
 
 def test_size_cap_checked_before_digest(tmp_path):
     write(tmp_path, b"x" * 11)
     with pytest.raises(EnvelopeError, match="over size cap"):
-        read_artifact(tmp_path, expected_name=NAME, expected_digest="0" * 64, max_bytes=10)
+        read_artifact(tmp_path, kind="bundle", expected_name=NAME, expected_digest="0" * 64, max_bytes=10)
 
 
 @pytest.mark.parametrize(
@@ -150,4 +250,4 @@ def test_pass_ok_payload_must_match_findings(tmp_path, good_envelope):
     bad = {**good_envelope, "kind": "pass", "pass": "review", "payload": {"summary": "x"}}
     data = write(tmp_path, bad)
     with pytest.raises(EnvelopeError, match="findings schema"):
-        read(tmp_path, data)
+        read(tmp_path, data, kind="pass")

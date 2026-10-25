@@ -31,7 +31,8 @@
     },
     {
       "if": { "properties": { "status": { "const": "ok" } }, "required": ["status"] },
-      "then": { "properties": { "payload": { "type": "object" } } }
+      "then": { "properties": { "payload": { "type": "object" } } },
+      "else": { "properties": { "payload": { "type": "null" } } }
     }
   ],
   "$defs": {
