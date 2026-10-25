@@ -41,14 +41,14 @@ Use [claude-review-test](https://github.com/OperationCode/claude-review-test) as
 Tasks:
 
 - [ ] V6, first: which run counts when one head SHA has several runs. Cases (a) to (g). Use a scratch-only gate job that can pause after its final check.
-- [ ] V2: a fork PR run prints its decoded OIDC claims (never the token).
+- [x] V2: a fork PR run prints its decoded OIDC claims (never the token).
 - [ ] V3: check the intended federation rule against the WIF reference, record the final rule text in the spec, then test it on a test workspace.
 - [ ] V5: one Messages API request with a mid-conversation system message, structured output and server-side fallback.
 - [ ] V9: spend limit behavior on a test workspace with a very small limit.
-- [ ] V13: dependency review on a fork PR with no checkout and SHA refs.
-- [ ] V16: push epoch events on a fork PR.
-- [ ] V18: fork head trees and blobs through the base repo's git API.
-- [ ] V24: run list by head SHA from the gate job's token, and its delay.
+- [x] V13: dependency review on a fork PR with no checkout and SHA refs.
+- [x] V16: push epoch events on a fork PR.
+- [x] V18: fork head trees and blobs through the base repo's git API.
+- [x] V24: run list by head SHA from the gate job's token, and its delay.
 - [ ] V4: a Dependabot PR mints an OIDC token in a ruleset-required run. A stub analyze job is enough.
 
 Owner:
@@ -63,7 +63,7 @@ Owner:
 
 Exit criteria:
 
-- [ ] V6 shows that the newest run on the head SHA decides. If not, building stops.
+- [x] V6 shows that the newest run on the head SHA decides. If not, building stops.
 - [ ] V2 and V3 pass. If not, building stops.
 - [ ] V4, V5, V9, V13, V16, V18 and V24 have results in the spec. A fallback in the spec covers each one that failed.
 
