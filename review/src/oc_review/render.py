@@ -31,7 +31,8 @@ any other key with the same generic rules, so it drops nothing:
                         author_login, author_association, labels}
     files:             [{path, old_path, status, additions, deletions,
                          head_blob_sha, base_blob_sha, binary, size, coverage,
-                         patch, patch_redaction, head_content}]
+                         patch, patch_redaction, head_content,
+                         base_content}]
     dependency_delta, prefilter: {signals, hard_blocks}, coverage, size
 
 - `pr.title` and `pr.body` are shown like files, with line numbers, at the
@@ -43,6 +44,9 @@ any other key with the same generic rules, so it drops nothing:
   hunk counts do not match the lines.
 - `head_content` goes to Claude only for files under 2,000 lines (spec
   "Coverage limits"). Patches are not cut; the size gate bounds them.
+- `base_content` (and `head_content` of any length) is raw blob text for the
+  citation check in verdict.py. Render never shows `base_content`
+  (`VERIFY_ONLY_FILE_KEYS`).
 
 Prompts: `load_prompt` reads `review/prompts/<name>.md` and fills `{nonce}`.
 """
@@ -946,6 +950,10 @@ def _parse_patch(patch: str) -> tuple[list[_Row], list[str]]:
     return rows, texts
 
 
+# File keys kept in the bundle for the citation check only, never sent to
+# Claude. Claude sees base lines only inside the numbered patch hunks.
+VERIFY_ONLY_FILE_KEYS = frozenset({"base_content"})
+
 # Value of `files[].patch_redaction` when the patch came from `redact_patch`.
 PATCH_REDACTION = "blob-context"
 _NO_NEWLINE = "\\ No newline at end of file"
@@ -1055,7 +1063,7 @@ def _emit_file(out: list[str], index: int, total: int, f: Any) -> None:
         return
     binary = f.get("binary") is True
     for k, v in f.items():
-        if k not in ("patch", "head_content"):
+        if k not in ("patch", "head_content") and k not in VERIFY_ONLY_FILE_KEYS:
             _emit(out, 0, _key(k), v, 1)
     if binary:
         return

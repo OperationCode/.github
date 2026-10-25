@@ -1573,3 +1573,19 @@ def test_key_line_check_is_linear():
     # A long run of `+` after base64 and before other text must not backtrack.
     text = "-----BEGIN PRIVATE KEY-----\n" + "A" * 64 + "+" * 200_000 + "x\n-----END PRIVATE KEY-----\n"
     assert r.unterminated_private_keys(text) == [1]
+
+
+def test_verify_only_content_is_never_rendered():
+    # base_content and long head_content are kept for the citation check only.
+    env = make_env()
+    f = env["payload"]["files"][0]
+    f["base_content"] = "a = 1\nBASE_ONLY_MARKER = 1\nb = 3\n"
+    f["head_content"] = "HEAD_LONG_MARKER\n" * r.MAX_HEAD_CONTENT_LINES
+    text = r.render_bundle(env, nonce=NONCE).text
+    assert "base_content" not in text and "BASE_ONLY_MARKER" not in text
+    assert "HEAD_LONG_MARKER" not in text
+    # A binary file shows neither key either.
+    f["binary"] = True
+    f["head_content"] = "HEAD_SHORT_MARKER\n"
+    text = r.render_bundle(env, nonce=NONCE).text
+    assert "base_content" not in text and "HEAD_SHORT_MARKER" not in text
