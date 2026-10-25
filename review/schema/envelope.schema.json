@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "kind", "run_id", "run_attempt", "repository_id", "pr_number",
+    "head_sha", "base_repository_id", "base_ref", "base_tip_sha", "merge_base_sha",
+    "status", "payload"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "enum": ["bundle", "pass"] },
+    "run_id": { "type": "integer", "minimum": 1 },
+    "run_attempt": { "type": "integer", "minimum": 1 },
+    "repository_id": { "type": "integer", "minimum": 1 },
+    "pr_number": { "type": "integer", "minimum": 1 },
+    "head_sha": { "$ref": "#/$defs/sha" },
+    "base_repository_id": { "type": "integer", "minimum": 1 },
+    "base_ref": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "base_tip_sha": { "$ref": "#/$defs/sha" },
+    "merge_base_sha": { "$ref": "#/$defs/sha" },
+    "pass": { "enum": ["review", "security", "supply-chain"] },
+    "status": { "enum": ["ok", "failed", "skipped-size", "stale"] },
+    "payload": { "type": ["object", "null"] }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "pass" } }, "required": ["kind"] },
+      "then": { "required": ["pass"] },
+      "else": { "not": { "required": ["pass"] } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "ok" } }, "required": ["status"] },
+      "then": { "properties": { "payload": { "type": "object" } } }
+    }
+  ],
+  "$defs": {
+    "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+  }
+}
