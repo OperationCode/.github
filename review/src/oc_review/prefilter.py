@@ -434,8 +434,9 @@ def _added_lines(
     The common prefix and suffix are trimmed, then a Myers diff runs on the
     middle. Each base line matches at most one head line, in order, so a
     duplicate or a moved line counts as added. When the diff needs more than
-    `budget` steps (default: the run's `per_file`, else `DIFF_WORK_BUDGET`), every head line in the middle counts as added: more lines
-    than git shows, never fewer. With `run`, the file also takes from the
+    `budget` steps (default: the run's `per_file`, else `DIFF_WORK_BUDGET`),
+    every head line in the middle counts as added: more lines than git shows,
+    never fewer. With `run`, the file also takes from the
     run's budget (the left share never drops below 0), and past either limit
     stderr names the file and the limit. A file's work is bounded by its
     allowance plus one snake (at most the file's line count), not exactly by it.

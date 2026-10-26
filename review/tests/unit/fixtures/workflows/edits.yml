@@ -1,7 +1,8 @@
 # Bad workflows, written as edits of the real files in .github/workflows.
 #
 # test_workflows.py copies the real directory, replaces the first occurrence of
-# `old` with `new` in `file`, and requires a violation with the tag `expect`.
+# `old` with `new` in `file`, and requires the violation tags to equal `expect`
+# exactly (a tag, or a list of tags).
 # If `old` is no longer in the file, the test fails and the edit needs an update.
 
 # --- pinning (every workflow) ---
@@ -129,6 +130,16 @@
   old: "permissions: {}\n\njobs:"
   new: "permissions: read-all\n\njobs:"
   expect: top-permissions
+- id: analyze-github-write
+  file: claude-review.yml
+  old: "      pull-requests: read\n      id-token: write\n"
+  new: "      pull-requests: write\n      id-token: write\n"
+  expect: [credential-separation, job-permissions]
+- id: gate-id-token
+  file: claude-review.yml
+  old: "      actions: read\n"
+  new: "      actions: read\n      id-token: write\n"
+  expect: [credential-separation, job-permissions]
 - id: extra-job-id-token-with-write
   file: eval.yml
   old: "jobs:\n"
@@ -196,6 +207,16 @@
   old: "      - name: Run the three Claude passes\n        id: analyze\n"
   new: "      - name: Run the three Claude passes\n        id: analyze\n        if: always()\n"
   expect: step-if
+- id: step-if-guard-other-id
+  file: claude-review.yml
+  old: "if: needs.analyze.outputs.review-artifact-id != ''"
+  new: "if: needs.analyze.outputs.security-artifact-id != ''"
+  expect: [step-if, download]
+- id: step-if-guard-wrapped
+  file: claude-review.yml
+  old: "if: needs.collect.outputs.bundle-artifact-id != ''"
+  new: "if: ${{ needs.collect.outputs.bundle-artifact-id != '' }}"
+  expect: [step-if, download]
 - id: step-if-on-setup-uv
   file: claude-review.yml
   old: "      - name: Set up uv\n"
@@ -213,6 +234,11 @@
   expect: step-if
 
 # --- central workflow: checkout ---
+- id: checkout-pr-head
+  file: claude-review.yml
+  old: "ref: ${{ job.workflow_sha }}"
+  new: "ref: ${{ github.event.pull_request.head.sha }}"
+  expect: [checkout, forbidden-text]
 - id: checkout-other-ref
   file: claude-review.yml
   old: "ref: ${{ job.workflow_sha }}"
@@ -292,6 +318,11 @@
   expect: secrets
 
 # --- central workflow: artifacts ---
+- id: download-by-name
+  file: claude-review.yml
+  old: "artifact-ids: ${{ needs.analyze.outputs.security-artifact-id }}"
+  new: "name: oc-pass-security-a${{ github.run_attempt }}"
+  expect: [download, step-if]
 - id: download-no-digest-check
   file: claude-review.yml
   old: "          digest-mismatch: error\n"

@@ -735,6 +735,12 @@ EVAL_CASES = {
 }
 
 
+def expected_tags(case):
+    """`expect` is one tag or an exact list of tags the edit trips."""
+    expect = case["expect"]
+    return {expect} if isinstance(expect, str) else set(expect)
+
+
 @pytest.mark.parametrize("case", EDITS, ids=[c["id"] for c in EDITS])
 def test_edit_is_caught(case, tmp_path):
     directory = tmp_path / "workflows"
@@ -744,7 +750,7 @@ def test_edit_is_caught(case, tmp_path):
     assert case["old"] in text, f"edit {case['id']}: old text not in {case['file']}; update the fixture"
     path.write_text(text.replace(case["old"], case["new"], 1), encoding="utf-8")
     violations = all_violations(directory)
-    assert {tag_of(v) for v in violations} == {case["expect"]}, violations
+    assert {tag_of(v) for v in violations} == expected_tags(case), violations
 
 
 def test_eval_boundary_good_fixture_passes():
@@ -763,5 +769,5 @@ def test_every_eval_fixture_has_a_case():
 
 
 def test_every_tag_has_a_failing_fixture():
-    covered = {c["expect"] for c in EDITS} | set(EVAL_CASES.values())
+    covered = set().union(*(expected_tags(c) for c in EDITS)) | set(EVAL_CASES.values())
     assert covered == TAGS, f"no fixture for {sorted(TAGS - covered)}"
