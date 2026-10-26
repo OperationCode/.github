@@ -102,7 +102,7 @@ Depends on: V3, V5, V9 (analyze); V6, V16, V24 (publish).
 - [ ] The analyze job is the only job with `id-token: write`. The gate job has no Anthropic credential.
 - [ ] A unit test parses the workflow: no `continue-on-error`, the dependency-review job exports the step `outcome`, every `uses:` is a full SHA.
 - [ ] `.github/workflows/test.yml`: unit tests on PRs to this repo.
-- [ ] `.github/workflows/eval.yml`: manual fixture evals. The job uses `environment: eval` and has `contents: read` and `id-token: write` only. A workflow unit test reads every workflow file and fails if a workflow other than `eval.yml` uses `environment: eval`, or if a job that uses `eval` sets no explicit `permissions` or has any `write` permission other than `id-token: write`.
+- [ ] `.github/workflows/eval.yml`: manual fixture evals. The job uses `environment: eval` and has `contents: read` and `id-token: write` only. A workflow unit test reads every workflow file and fails if a workflow other than `eval.yml` uses `environment: eval`, or if a job that uses `eval` sets no explicit job-level `permissions` or has any `write` permission other than `id-token: write`. Job-level `permissions` is required even if the workflow level sets it. `write-all` at either level fails the test, and so do `read-all` and a missing job-level block, because the job must state `contents: read` and `id-token: write` itself.
 - [ ] V10: harden-runner in audit mode for a full run, then block mode with the measured allowlist.
 
 Depends on: V2, V4, V13, V18 (workflow); V10 needs a full run, so it runs here.
@@ -125,7 +125,7 @@ The fixture eval calls the live API and costs money. The owner runs it on reques
 
 - [ ] V27, before the first eval: test the eval federation rule (an approved `eval.yml` run gets a token; the deny cases in the spec get none).
 - [ ] Add the fixture bundles from the spec's minimum set, with expected outcomes.
-- [ ] Owner: run `eval.yml` on the PR branch and approve the `eval` environment, with the eval federation rule and eval workspace from phase 0. Check the PR first (see phase 0). Record the results in the PR that changed the prompts or code. Passing evals gate the merge of a prompt or model change, and a release pin never moves to a SHA whose evals have not passed. No required check enforces the merge gate, so the owner holds the merge until the evals pass.
+- [ ] Owner: run `eval.yml` on the PR branch and approve the `eval` environment, with the eval federation rule and eval workspace from phase 0. Check the PR first (see phase 0). Record the results in the PR that changed the prompts or code. Passing evals gate the merge of a prompt or model change, and a release pin moves only to a SHA whose tree has passed the evals (a merge SHA with the same tree as the tested candidate counts). No required check enforces the merge gate, so the owner holds the merge until the evals pass.
 - [ ] Fix prompts or code for each miss, then run again on request.
 
 Depends on: phase 1; V27.
@@ -141,7 +141,7 @@ Exit criteria:
 Run the spec's workflow acceptance tests under a test org ruleset that requires the central workflow from `OperationCode/.github` at the candidate release SHA and targets only claude-review-test. Only one ruleset requires the workflow there at a time.
 
 - [ ] V26 b, before the acceptance tests: after the owner sets the production rule to the candidate SHA, a run at that SHA gets a token and a run at another SHA is denied.
-- [ ] V26 c, before V22 b: release steps 1 to 4 with a scratch rule R2 on the test workspace, R1 unchanged.
+- [ ] V26 c, before V22 b: release steps 1 to 6 with a scratch rule R2 on the test workspace, R1 unchanged. Include the second exchange at the release SHA, and check that the workflows rule accepts a scratch ruleset pinned to a SHA that is only on a non-default branch of `.github`.
 - [ ] A fork PR from an account outside the org, including a draft that later becomes ready. The review starts with no approval click (V8 b).
 - [ ] V8 a: a fork PR whose own workflow has a job named `oc-claude-review` that starts before the required run.
 - [ ] V11: retarget from a non-default branch.
@@ -227,7 +227,8 @@ One federation rule allows one SHA, and every release is validated at its final 
 - [ ] Put the R2 ID in the central code. That commit is the release candidate S2.
 - [ ] Owner: set `job_workflow_ref` of R2 to S2 and read it back.
 - [ ] Validate S2, for every release: unit tests pass, the owner-approved fixture eval passes, and a run under the scratch test ruleset pinned to S2 gets a token through R2.
-- [ ] Merge. If the merge makes a new SHA, check that its tree equals S2 (`git diff` is empty, so the content and rule ID are the same), then the owner sets R2 to that SHA. If the trees differ, validate again. That SHA is the release SHA.
+- [ ] Merge. If the merge makes a new SHA, check that its tree equals S2 (`git diff` is empty, so the content and rule ID are the same), then the owner sets R2 to that SHA and reads it back. If the trees differ, treat the merge SHA as a new candidate and go back to the step that sets R2. That SHA is the release SHA.
+- [ ] Pin the scratch test ruleset to the release SHA and do one token exchange through R2. Any new candidate, for example a fix commit after a failed validation, repeats from the step that sets R2 to the candidate SHA.
 - [ ] Owner: move the pin of every ruleset that requires the workflow (the pilot ruleset, the org ruleset, or both) to the release SHA, then read each back: `repository_id`, path, `sha`, no `ref`.
 - [ ] Start a new run on each open PR (push, or close and reopen). Do not re-run old runs: after R1 is deleted, a re-run at the old SHA fails auth.
 - [ ] Owner: delete R1 only when each new run has completed at the release SHA (`job.workflow_sha`); a queued run does not count (V22).
