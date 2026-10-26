@@ -30,7 +30,6 @@ Rules this module keeps:
 from __future__ import annotations
 
 import argparse
-import difflib
 import json
 import math
 import os
@@ -41,13 +40,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from oc_review import deps, envelope, prefilter, render
+from oc_review import deps, envelope, linediff, prefilter, render
 from oc_review.snapshot import (
     MODE_SUBMODULE,
     MODE_SYMLINK,
@@ -108,10 +107,11 @@ BUNDLE_FILE_NAME = "bundle.json"
 
 # Unified diff context lines, as git.
 PATCH_CONTEXT = 3
-# Past this product of middle lengths, the patch is one hunk that removes
-# every base line and adds every head line between the common prefix and
-# suffix: a larger patch than git's, never a wrong one.
-PATCH_DIFF_BUDGET = 25_000_000
+# Past this product of middle lengths, or past the work budget of the file or
+# of the run (linediff), the patch is one hunk that removes every base line and
+# adds every head line between the common prefix and suffix: a larger patch
+# than git's, never a wrong one.
+PATCH_DIFF_BUDGET = linediff.DIFF_BUDGET
 NO_NEWLINE = "\\ No newline at end of file"
 
 # Signal added by collect (spec "Consistent snapshot"): GitHub's PR view can
@@ -155,6 +155,8 @@ class HttpRequest:
     headers: Mapping[str, str]
     max_bytes: int
     timeout: float
+    # Request body (JSON bytes) for the publisher's writes; None for a GET.
+    body: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -188,7 +190,9 @@ def default_transport(
     if parts.scheme != "https" or parts.hostname != API_HOST or parts.port is not None:
         raise HttpError("default_transport refuses a URL outside api.github.com")
     opener = opener or urllib.request.build_opener(_NoRedirect)
-    req = urllib.request.Request(request.url, method=request.method, headers=dict(request.headers))
+    req = urllib.request.Request(
+        request.url, data=request.body, method=request.method, headers=dict(request.headers)
+    )
     deadline = clock() + request.timeout
     try:
         with opener.open(req, timeout=request.timeout) as resp:
@@ -408,50 +412,8 @@ def _git_lines(text: str | None) -> tuple[list[str], bool]:
     return lines, True
 
 
-def _opcodes(a: Sequence[Any], b: Sequence[Any]) -> list[tuple[str, int, int, int, int]]:
-    pre = 0
-    while pre < len(a) and pre < len(b) and a[pre] == b[pre]:
-        pre += 1
-    suf = 0
-    while suf < len(a) - pre and suf < len(b) - pre and a[-1 - suf] == b[-1 - suf]:
-        suf += 1
-    am, bm = a[pre : len(a) - suf], b[pre : len(b) - suf]
-    codes: list[tuple[str, int, int, int, int]] = []
-    if pre:
-        codes.append(("equal", 0, pre, 0, pre))
-    if am or bm:
-        if len(am) * len(bm) <= PATCH_DIFF_BUDGET:
-            middle = difflib.SequenceMatcher(None, am, bm, autojunk=False).get_opcodes()
-        else:
-            middle = [("replace", 0, len(am), 0, len(bm))]
-        codes.extend((tag, i1 + pre, i2 + pre, j1 + pre, j2 + pre) for tag, i1, i2, j1, j2 in middle)
-    if suf:
-        codes.append(("equal", len(a) - suf, len(a), len(b) - suf, len(b)))
-    return codes
-
-
-def _hunks(
-    codes: list[tuple[str, int, int, int, int]], n: int
-) -> Iterator[list[tuple[str, int, int, int, int]]]:
-    """Group opcodes into hunks with `n` lines of context (difflib's rule)."""
-    if not any(tag != "equal" for tag, *_ in codes):
-        return
-    tag, i1, i2, j1, j2 = codes[0]
-    if tag == "equal":
-        codes[0] = (tag, max(i1, i2 - n), i2, max(j1, j2 - n), j2)
-    tag, i1, i2, j1, j2 = codes[-1]
-    if tag == "equal":
-        codes[-1] = (tag, i1, min(i2, i1 + n), j1, min(j2, j1 + n))
-    group: list[tuple[str, int, int, int, int]] = []
-    for tag, i1, i2, j1, j2 in codes:
-        if tag == "equal" and i2 - i1 > 2 * n:
-            group.append((tag, i1, min(i2, i1 + n), j1, min(j2, j1 + n)))
-            yield group
-            group = []
-            i1, j1 = max(i1, i2 - n), max(j1, j2 - n)
-        group.append((tag, i1, i2, j1, j2))
-    if group and not (len(group) == 1 and group[0][0] == "equal"):
-        yield group
+def _opcodes(a: Sequence[Any], b: Sequence[Any], work: linediff.WorkBudget | None) -> linediff.Diff:
+    return linediff.diff(a, b, PATCH_DIFF_BUDGET, work)
 
 
 def _range(start: int, stop: int) -> str:
@@ -461,14 +423,23 @@ def _range(start: int, stop: int) -> str:
     return f"{start if length == 0 else start + 1},{length}"
 
 
-def unified_diff(base_text: str | None, head_text: str | None) -> tuple[str, int, int]:
+def unified_diff(
+    base_text: str | None, head_text: str | None, work: linediff.WorkBudget | None = None
+) -> tuple[str, int, int]:
     """Unified diff of two blob texts: (patch, additions, deletions).
 
     Hunks only, no file header. A last line with no LF gets the marker
     `\\ No newline at end of file`, and counts as a different line from the
     same text with an LF. Every patch line equals its blob line, as
-    `render.redact_patch` requires.
+    `render.redact_patch` requires. `work` is the run's diff work budget.
     """
+    return _patch(base_text, head_text, work)[:3]
+
+
+def _patch(
+    base_text: str | None, head_text: str | None, work: linediff.WorkBudget | None
+) -> tuple[str, int, int, str | None]:
+    """`unified_diff`, and why the patch is coarse (None: it is exact)."""
     a, a_noeol = _git_lines(base_text)
     b, b_noeol = _git_lines(head_text)
     a_keys: list[Any] = list(a)
@@ -480,7 +451,8 @@ def unified_diff(base_text: str | None, head_text: str | None) -> tuple[str, int
     out: list[str] = []
     adds = dels = 0
     no_eol = NO_NEWLINE
-    for group in _hunks(_opcodes(a_keys, b_keys), PATCH_CONTEXT):
+    diff = _opcodes(a_keys, b_keys, work)
+    for group in linediff.hunks(diff.codes, PATCH_CONTEXT):
         out.append(f"@@ -{_range(group[0][1], group[-1][2])} +{_range(group[0][3], group[-1][4])} @@")
         for tag, i1, i2, j1, j2 in group:
             if tag == "equal":
@@ -499,7 +471,7 @@ def unified_diff(base_text: str | None, head_text: str | None) -> tuple[str, int
                 adds += 1
                 if b_noeol and j == len(b) - 1:
                     out.append(no_eol)
-    return "".join(line + "\n" for line in out), adds, dels
+    return "".join(line + "\n" for line in out), adds, dels, diff.reason
 
 
 # ---------------------------------------------------------------------------
@@ -932,6 +904,7 @@ def _file_entry(
     blobs: Mapping[str, bytes | None],
     sizes: Mapping[str, int],
     max_blob_bytes: int,
+    work: linediff.WorkBudget,
 ) -> dict[str, Any]:
     def scan(sha: str | None, mode: str | None, path: str) -> prefilter.BlobScan | None:
         if sha is None or mode == MODE_SUBMODULE:
@@ -971,7 +944,10 @@ def _file_entry(
     # Each text side counts on its own. Opposite a gitlink or a binary blob,
     # the patch adds every head line or removes every base line, so a type
     # change never hides text from Claude or from the citation check.
-    patch, adds, dels = unified_diff(base_text, head_text)
+    patch, adds, dels, coarse = _patch(base_text, head_text, work)
+    if coarse is not None:
+        # The job log says why (repr: a path is one log line).
+        print(f"collect: {change.path!r}: {coarse}; the patch is one hunk for the changed middle", file=sys.stderr)
     try:
         entry["patch"] = render.redact_patch(patch, base_text, head_text)
     except render.RenderError as exc:
@@ -1145,8 +1121,9 @@ def collect(
     if extra is not None:
         checks["prefilter"]["signals"].append(extra)
     delta = _delta_payload(facts)
+    work = linediff.WorkBudget()  # one diff work budget for every file of the run
     files = [
-        _file_entry(c, cov, blobs, sizes, max_blob_bytes)
+        _file_entry(c, cov, blobs, sizes, max_blob_bytes, work)
         for c, cov in zip(diff.files, result.coverage.files, strict=True)
     ]
 

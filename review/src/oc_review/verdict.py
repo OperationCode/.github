@@ -12,7 +12,6 @@ The publisher escapes them before it posts anything.
 
 from __future__ import annotations
 
-import difflib
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
@@ -22,7 +21,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
 
-from oc_review import envelope, render
+from oc_review import envelope, linediff, render
 
 PASS = "pass"
 FAIL = "fail"
@@ -111,6 +110,10 @@ _SHA_RE = re.compile(r"[0-9a-f]{40}")
 # Legacy `permission` field of the collaborator permission API: maintain reads as write.
 OVERRIDE_PERMISSIONS = frozenset({"admin", "write"})
 
+# Detail of the `stale` reason when the publisher had no snapshot to re-check
+# (for example, no valid bundle). It fails the gate like any stale reason.
+NOT_REVALIDATED = "snapshot not re-validated"
+
 BOT_LOGIN = "github-actions[bot]"
 STICKY_MARKER = "<!-- oc-claude-review -->"
 WORKFLOW_PATH = ".github/workflows/claude-review.yml"
@@ -179,7 +182,8 @@ class FileSides:
     `path` is the head path (the only path for a removed file). Text is the
     redacted text the model saw, or None when that side has no blob or its
     content is not available. Hunks are inclusive 1-based line ranges inside a
-    diff hunk on that side.
+    diff hunk on that side. `no_hunks_reason` says why a file has no hunks
+    because its line diff went past a budget (`linediff`).
     """
 
     path: str
@@ -188,6 +192,7 @@ class FileSides:
     head_text: str | None = None
     base_hunks: tuple[tuple[int, int], ...] = ()
     head_hunks: tuple[tuple[int, int], ...] = ()
+    no_hunks_reason: str | None = None
 
 
 def metadata_files(title_text: str | None, body_text: str | None) -> tuple[FileSides, ...]:
@@ -208,14 +213,16 @@ def changed_file(
     old_path: str | None = None,
     base_raw: str | None = None,
     head_raw: str | None = None,
+    work: linediff.WorkBudget | None = None,
 ) -> FileSides:
     """One changed file from its raw blob texts (None: no blob or not available).
 
     Each side is the text the model saw (`render.model_text`). Hunks come from
-    the raw texts; redaction keeps the line count (ruling R-LINES).
+    the raw texts; redaction keeps the line count (ruling R-LINES). `work` is
+    the run's diff work budget.
     """
-    base_hunks, head_hunks = hunks_from_texts(base_raw, head_raw)
-    return FileSides(path, old_path, _model(base_raw), _model(head_raw), base_hunks, head_hunks)
+    base_hunks, head_hunks, reason = _hunks(base_raw, head_raw, HUNK_CONTEXT, work)
+    return FileSides(path, old_path, _model(base_raw), _model(head_raw), base_hunks, head_hunks, reason)
 
 
 def metadata_files_from_raw(title: str | None, body: str | None) -> tuple[FileSides, ...]:
@@ -442,6 +449,21 @@ class OverrideCandidate:
 
 
 @dataclass(frozen=True)
+class PassInfo:
+    """One schema-valid pass record, for the summary only.
+
+    `meta` is a read-only copy of the envelope `meta` (empty when absent):
+    the failure reason, model, stop reason and token usage. The gate never
+    reads risk from it.
+    """
+
+    name: str
+    status: str
+    summary: str | None
+    meta: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
 class GateResult:
     status: str  # PASS | FAIL
     run_id: int
@@ -450,6 +472,7 @@ class GateResult:
     snapshot: SnapshotPair | None
     overrides: tuple[OverrideCandidate, ...]
     override_applied: bool
+    passes: tuple[PassInfo, ...] = ()
 
     @property
     def passed(self) -> bool:
@@ -510,23 +533,43 @@ def _normalize(text: str) -> str:
     return " ".join(text.split())
 
 
+Hunks = tuple[tuple[int, int], ...]
+
+
 def hunks_from_texts(
-    base_text: str | None, head_text: str | None, context: int = HUNK_CONTEXT
-) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]:
-    """Inclusive 1-based (base, head) hunk ranges of a unified diff of two texts."""
+    base_text: str | None,
+    head_text: str | None,
+    context: int = HUNK_CONTEXT,
+    work: linediff.WorkBudget | None = None,
+) -> tuple[Hunks, Hunks]:
+    """Inclusive 1-based (base, head) hunk ranges of a unified diff of two texts.
+
+    The diff is bounded (`linediff`): by its size and by the work budget of
+    the file and of the run (`work`, a fresh one when None). When it is past
+    a budget the exact hunks are not known, so there are none: every finding
+    in the file goes to the summary, and none is lost.
+    """
+    return _hunks(base_text, head_text, context, work)[:2]
+
+
+def _hunks(
+    base_text: str | None, head_text: str | None, context: int, work: linediff.WorkBudget | None
+) -> tuple[Hunks, Hunks, str | None]:
     a = _lines(base_text) if base_text is not None else []
     b = _lines(head_text) if head_text is not None else []
     base_hunks: list[tuple[int, int]] = []
     head_hunks: list[tuple[int, int]] = []
-    matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
-    for group in matcher.get_grouped_opcodes(context):
+    diff = linediff.diff(a, b, work=work)
+    if not diff.exact:
+        return (), (), diff.reason
+    for group in linediff.hunks(diff.codes, context):
         i1, i2 = group[0][1], group[-1][2]
         j1, j2 = group[0][3], group[-1][4]
         if i2 > i1:
             base_hunks.append((i1 + 1, i2))
         if j2 > j1:
             head_hunks.append((j1 + 1, j2))
-    return tuple(base_hunks), tuple(head_hunks)
+    return tuple(base_hunks), tuple(head_hunks), None
 
 
 class _FileIndex:
@@ -755,6 +798,35 @@ def _context_reasons(
     return []
 
 
+def _frozen(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({k: _frozen(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return tuple(_frozen(v) for v in value)
+    return value
+
+
+def _pass_info(doc: Mapping[str, Any]) -> PassInfo:
+    meta = doc.get("meta")
+    payload = doc["payload"]
+    summary = payload.get("summary") if isinstance(payload, Mapping) else None
+    return PassInfo(
+        name=doc["pass"],
+        status=doc["status"],
+        summary=summary if isinstance(summary, str) else None,
+        meta=_frozen(meta) if isinstance(meta, Mapping) else MappingProxyType({}),
+    )
+
+
+def _failed_detail(info: PassInfo) -> str:
+    """`pass X failed`, with the analyze reason from `meta` when it has one
+    (for example "workspace spend limit reached")."""
+    reason = info.meta.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        return f"pass {info.name} failed: {reason.strip()[:200]}"
+    return f"pass {info.name} failed"
+
+
 def _job_reasons(job_results: Mapping[str, str], outcome: str | None) -> list[Reason]:
     out = []
     for job in REQUIRED_JOBS:
@@ -771,7 +843,7 @@ def _job_reasons(job_results: Mapping[str, str], outcome: str | None) -> list[Re
 
 def _revalidation_reasons(check: SnapshotCheck | None) -> list[Reason]:
     if check is None:
-        return [Reason(R_STALE, "snapshot not re-validated")]
+        return [Reason(R_STALE, NOT_REVALIDATED)]
     out = [Reason(R_STALE, str(r)) for r in check.stale_reasons]
     if check.base_not_default_branch:
         out.append(Reason(R_BASE_NOT_DEFAULT, "base ref is not the default branch"))
@@ -847,6 +919,7 @@ def compute_gate(inputs: GateInputs) -> GateResult:
         )
     index = _FileIndex(inputs.files)
     findings: list[CitedFinding] = []
+    infos: list[PassInfo] = []
     names: Counter[str] = Counter()
     for i, read in enumerate(inputs.passes):
         label = f"pass record {i + 1}"
@@ -855,11 +928,13 @@ def compute_gate(inputs: GateInputs) -> GateResult:
         if doc is None:
             continue
         reasons += _context_reasons(doc, label, ctx, snap_fields)
+        info = _pass_info(doc)
+        infos.append(info)
         name = doc["pass"]
         names[name] += 1
         status = doc["status"]
         if status == "failed":
-            reasons.append(Reason(R_PASS_RECORDS, f"pass {name} failed"))
+            reasons.append(Reason(R_PASS_RECORDS, _failed_detail(info)))
         elif status == "stale":
             reasons.append(Reason(R_STALE, f"pass {name} stale"))
         elif status == "skipped-size":
@@ -902,6 +977,7 @@ def compute_gate(inputs: GateInputs) -> GateResult:
         snapshot=snapshot,
         overrides=overrides,
         override_applied=applied,
+        passes=tuple(infos),
     )
 
 
@@ -954,4 +1030,5 @@ def final_check(
         snapshot=initial.snapshot,
         overrides=candidates,
         override_applied=applied,
+        passes=initial.passes,
     )
