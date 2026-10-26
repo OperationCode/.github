@@ -23,6 +23,7 @@ import argparse
 import base64
 import binascii
 import copy
+import email.utils
 import hashlib
 import json
 import os
@@ -37,6 +38,9 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+
+import anthropic
+import httpx2
 
 from . import collect, envelope, render, snapshot
 
@@ -54,6 +58,19 @@ MAX_RETRIES = 2
 # Absolute deadline per pass, from the start of analyze. Each SDK attempt gets
 # at most the time left, so the passes end inside the 10-minute job timeout.
 DEADLINE_SECONDS = 420.0
+# The SDK's backoff when the API names no wait: INITIAL * 2**retries_taken,
+# at most MAX, less jitter. Only an upper bound is needed here.
+SDK_INITIAL_RETRY_DELAY = 0.5
+SDK_MAX_RETRY_DELAY = 8.0
+
+# The only API host. Passed to the SDK, so `ANTHROPIC_BASE_URL` cannot move the
+# calls or the token exchange.
+API_BASE_URL = "https://api.anthropic.com"
+API_HOST = "api.anthropic.com"
+TOKEN_EXCHANGE_TIMEOUT_SECONDS = 30.0
+# Headers that carry a static credential. With one of them on a request the
+# SDK skips federation (`AccessTokenAuth`), so none may be set.
+CREDENTIAL_HEADERS = frozenset({"x-api-key", "authorization"})
 
 # Production federation rule (spec "Auth and cost", "Each release").
 # Placeholders until the owner creates the rule: analyze refuses to call.
@@ -95,6 +112,9 @@ R_AUTH = "authentication failed"
 R_UNAVAILABLE = "API unavailable"
 R_DEADLINE = "deadline exceeded"
 R_RENDER = "render failed"
+R_MISSING_ENV = "missing environment variable"
+R_STATIC_CREDENTIAL = "static credential refused"
+R_API_HOST = "API host not allowed"
 R_FEDERATION_NOT_CONFIGURED = "federation not configured"
 R_OIDC_MISMATCH = "OIDC claim mismatch"
 R_OIDC_UNAVAILABLE = "OIDC token unavailable"
@@ -114,6 +134,17 @@ _SCHEMA_ERROR_RE = re.compile(r"^findings schema: (.*?: \[\w+\])")
 
 class AnalyzeError(Exception):
     """The bundle or the run context is not trusted. No record is written."""
+
+
+class CallRefused(anthropic.AnthropicError):
+    """Code refused an HTTP request to Anthropic. `reason` goes into `meta`.
+
+    An `AnthropicError` that is not a connection or status error and has no
+    `__cause__`, so the SDK raises it as is and never retries it."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class PassFailure(Exception):
@@ -283,8 +314,8 @@ def classify_error(exc: BaseException) -> str:
     The spend limit is an outage, not a request bug: HTTP 400
     `invalid_request_error` with "workspace API usage limits" (V9). The SDK does
     not retry a 400."""
-    import anthropic
-
+    if isinstance(exc, CallRefused):
+        return exc.reason
     if isinstance(exc, anthropic.APIStatusError):
         status = exc.status_code
         etype, msg = _error_body(exc)
@@ -489,18 +520,121 @@ def write_token_file(token: str, runner_temp: Path | str) -> Path:
     return Path(name)
 
 
-# client_factory(token_file) -> an object with `.beta.messages.stream(...)`.
-ClientFactory = Callable[[Path], Any]
+class GuardTransport(httpx2.BaseTransport):
+    """Every HTTP request of the Anthropic client goes through here: each
+    Messages attempt, its retries and the federation token exchange.
+
+    A request starts only before the deadline, only to the pinned API host and
+    never with an `X-Api-Key` header. Its timeouts are cut to the time left, so
+    no attempt runs past the deadline."""
+
+    def __init__(self, inner: httpx2.BaseTransport, *, deadline: float, clock: Callable[[], float]) -> None:
+        self.inner, self.deadline, self.clock = inner, deadline, clock
+
+    def handle_request(self, request: httpx2.Request) -> httpx2.Response:
+        if request.url.scheme != "https" or request.url.host != API_HOST:
+            raise CallRefused(R_API_HOST)
+        if "x-api-key" in request.headers:
+            raise CallRefused(R_STATIC_CREDENTIAL)
+        remaining = self.deadline - self.clock()
+        if remaining <= 0:
+            raise CallRefused(R_DEADLINE)
+        timeout = request.extensions.get("timeout") or {}
+        request.extensions = {
+            **request.extensions,
+            "timeout": {k: remaining if timeout.get(k) is None else min(timeout[k], remaining)
+                        for k in ("connect", "read", "write", "pool")},
+        }
+        return self.inner.handle_request(request)
+
+    def close(self) -> None:
+        self.inner.close()
 
 
-def default_client_factory(token_file: Path) -> Any:
-    """SDK client with workload identity federation.
+def retry_wait(headers: Mapping[str, str] | None, retries_taken: int) -> float:
+    """An upper bound of the wait before the SDK's next retry: the wait the API
+    names (`retry-after-ms`, `retry-after`), else the SDK's backoff."""
+    if headers is not None:
+        for name, scale in (("retry-after-ms", 0.001), ("retry-after", 1.0)):
+            try:
+                wait = float(headers.get(name)) * scale  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            if wait > 0:
+                return wait
+            break
+        else:
+            date = email.utils.parsedate_tz(headers.get("retry-after") or "")
+            wait = email.utils.mktime_tz(date) - time.time() if date is not None else 0.0
+            if wait > 0:
+                return wait
+    return min(SDK_INITIAL_RETRY_DELAY * 2.0 ** retries_taken, SDK_MAX_RETRY_DELAY)
 
-    The credentials are passed to the constructor, so the SDK reads no
-    credential from the environment or from a profile on disk: no
-    `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or profile can stand in for
-    federation. The SDK exchanges the token at `/v1/oauth/token`."""
-    import anthropic
+
+class RetryDeadline(anthropic.Middleware):
+    """Runs once per SDK attempt. When the SDK would wait past the deadline
+    before its next retry, there is no retry: the attempt's error stands."""
+
+    def __init__(self, *, deadline: float, clock: Callable[[], float]) -> None:
+        self.deadline, self.clock = deadline, clock
+
+    def _no_time(self, headers: Mapping[str, str] | None, retries_taken: int) -> bool:
+        return self.clock() + retry_wait(headers, retries_taken) >= self.deadline
+
+    def handle(self, request: Any, call_next: Any) -> Any:
+        last = request.retries_taken >= MAX_RETRIES
+        try:
+            response = call_next(request)
+        except anthropic.APIConnectionError:  # the SDK retries these, timeouts too
+            if not last and self._no_time(None, request.retries_taken):
+                raise CallRefused(R_UNAVAILABLE) from None  # no __cause__: not retried
+            raise
+        http = response.http_response
+        if not http.is_success and not last and self._no_time(http.headers, request.retries_taken):
+            # The SDK obeys this header; a status it would not retry is unchanged.
+            http.headers["x-should-retry"] = "false"
+        return response
+
+
+def check_federation_only(client: Any) -> None:
+    """Fail closed when anything but federation could authenticate the client.
+
+    `ANTHROPIC_CUSTOM_HEADERS` is read by the SDK even with explicit
+    credentials. A credential header from it would make the SDK skip the
+    token exchange, so such a header is refused."""
+    names = {str(k).lower() for k in client.default_headers}
+    if client.api_key is not None or client.auth_token is not None or names & CREDENTIAL_HEADERS:
+        raise CallRefused(R_STATIC_CREDENTIAL)
+    if str(client.base_url).rstrip("/") != API_BASE_URL:
+        raise CallRefused(R_API_HOST)
+
+
+# client_factory(token_file, deadline=, clock=) -> an object with
+# `.beta.messages.stream(...)`. Raises CallRefused.
+ClientFactory = Callable[..., Any]
+
+
+def default_client_factory(
+    token_file: Path,
+    *,
+    deadline: float,
+    clock: Callable[[], float],
+    transport: httpx2.BaseTransport | None = None,
+) -> Any:
+    """SDK client with workload identity federation only.
+
+    The credentials and the base URL are passed to the constructor, so the SDK
+    reads no credential from the environment or from a profile on disk: no
+    `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, profile or `ANTHROPIC_BASE_URL`
+    applies, and `check_federation_only` refuses credential headers. The SDK
+    exchanges the token at `/v1/oauth/token`. Both the exchange and the
+    Messages calls go through `GuardTransport` (`transport` is its inner
+    transport; tests pass a mock)."""
+
+    def http_client(timeout: float) -> httpx2.Client:
+        inner = transport if transport is not None else httpx2.HTTPTransport()
+        return httpx2.Client(transport=GuardTransport(inner, deadline=deadline, clock=clock),
+                             timeout=timeout, follow_redirects=False)
 
     ids = federation_ids()
     credentials = anthropic.WorkloadIdentityCredentials(
@@ -508,8 +642,18 @@ def default_client_factory(token_file: Path) -> Any:
         federation_rule_id=ids.rule_id,
         organization_id=ids.organization_id,
         service_account_id=ids.service_account_id,
+        http_client=http_client(TOKEN_EXCHANGE_TIMEOUT_SECONDS),
     )
-    return anthropic.Anthropic(credentials=credentials, max_retries=MAX_RETRIES, timeout=DEADLINE_SECONDS)
+    client = anthropic.Anthropic(
+        credentials=credentials,
+        base_url=API_BASE_URL,
+        max_retries=MAX_RETRIES,
+        timeout=DEADLINE_SECONDS,
+        http_client=http_client(DEADLINE_SECONDS),
+        middleware=[RetryDeadline(deadline=deadline, clock=clock)],
+    )
+    check_federation_only(client)
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -574,23 +718,31 @@ def analyze(
     bundle: Mapping[str, Any],
     event: collect.EventContext,
     *,
-    github: collect.GitHubClient,
+    github: collect.GitHubClient | None,
     mint_oidc: OidcMinter,
     job_workflow_sha: str | None,
-    runner_temp: Path | str,
+    runner_temp: Path | str | None,
     client_factory: ClientFactory = default_client_factory,
     clock: Callable[[], float] = time.monotonic,
     deadline_seconds: float = DEADLINE_SECONDS,
     nonce: str | None = None,
 ) -> dict[str, PassResult]:
     """Results for the three passes of a trusted bundle. Never raises for a
-    pass problem; every path gives three results."""
+    pass problem; every path gives three results.
+
+    `github` is None without `GITHUB_TOKEN`, and `runner_temp` is None without
+    `RUNNER_TEMP`. Only a bundle with status `ok` needs them; without them its
+    passes are `failed`."""
     deadline = clock() + deadline_seconds
     status = bundle["status"]
     if status in ("skipped-size", "stale", "failed"):
         return _all(status, f"bundle status {status}")
     if status != "ok":
         return _all("failed", R_INTERNAL)
+    if github is None:
+        return _all("failed", f"{R_MISSING_ENV}: GITHUB_TOKEN")
+    if not runner_temp:
+        return _all("failed", f"{R_MISSING_ENV}: RUNNER_TEMP")
 
     # Stale check before the calls (spec L244): head SHA and base ref only.
     # A base that is not the default branch does not stop the calls; the
@@ -632,7 +784,10 @@ def analyze(
     token_file = write_token_file(token, runner_temp)
     del token
     try:
-        client = client_factory(token_file)
+        try:
+            client = client_factory(token_file, deadline=deadline, clock=clock)
+        except CallRefused as exc:
+            return _all("failed", exc.reason)
         return run_passes(client, requests, deadline=deadline, clock=clock)
     finally:
         token_file.unlink(missing_ok=True)
@@ -758,29 +913,35 @@ def main(
     parser.add_argument("--out-dir", required=True)
     args = parser.parse_args(argv)
     env = os.environ if environ is None else environ
+    # Only what decides trust is read here. A missing call prerequisite
+    # (GITHUB_TOKEN, RUNNER_TEMP) fails the passes of a trusted bundle, with
+    # three records (D2).
     try:
         event = collect.EventContext.from_event(envelope.parse_json(Path(env["GITHUB_EVENT_PATH"]).read_bytes()))
         run_id = int(env["GITHUB_RUN_ID"])
         run_attempt = int(env["GITHUB_RUN_ATTEMPT"])
         bundle = read_trusted_bundle(args.bundle_dir, args.bundle_digest, event, run_id=run_id, run_attempt=run_attempt)
-        github_token = env["GITHUB_TOKEN"]
-        output_path = env["GITHUB_OUTPUT"]
-        runner_temp = env["RUNNER_TEMP"]
     except (AnalyzeError, collect.CollectError, envelope.EnvelopeError, KeyError, ValueError, OSError) as exc:
         print(f"analyze failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    # Without it the record digests cannot reach the gate: stop before any call.
+    output_path = env.get("GITHUB_OUTPUT")
+    if not output_path:
+        print("analyze failed: cannot write pass records: GITHUB_OUTPUT is not set", file=sys.stderr)
         return 1
 
     schema_sha256: str | None = None
     try:
         schema_sha256 = schema_digest(request_schema())
+        github_token = env.get("GITHUB_TOKEN")
         results = analyze(
             bundle,
             event,
-            github=collect.GitHubClient(github_token, github_transport, sleep=sleep),
+            github=collect.GitHubClient(github_token, github_transport, sleep=sleep) if github_token else None,
             mint_oidc=oidc_minter(env.get("ACTIONS_ID_TOKEN_REQUEST_URL"), env.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN"),
                                   oidc_transport, sleep=sleep),
             job_workflow_sha=env.get("JOB_WORKFLOW_SHA"),
-            runner_temp=runner_temp,
+            runner_temp=env.get("RUNNER_TEMP") or None,
             client_factory=client_factory,
             clock=clock,
             deadline_seconds=deadline_seconds,

@@ -178,7 +178,7 @@ class Run:
 
 
 def run_main(tmp_path, *, client=None, bundle=None, digest=None, github=None, oidc=None, env=None,
-             deadline_seconds=analyze.DEADLINE_SECONDS, factory_exc=None):
+             deadline_seconds=analyze.DEADLINE_SECONDS, factory_exc=None, real_factory=None):
     bundle = load("bundle-ok") if bundle is None else bundle
     bundle_dir = tmp_path / "data" / "bundle"
     bundle_dir.mkdir(parents=True)
@@ -206,11 +206,13 @@ def run_main(tmp_path, *, client=None, bundle=None, digest=None, github=None, oi
     oidc = oidc or FakeOidc()
     token_files = []
 
-    def factory(token_file):
+    def factory(token_file, *, deadline, clock):
         mode = stat.S_IMODE(token_file.stat().st_mode)
         token_files.append((token_file, mode, token_file.read_text()))
         if factory_exc is not None:
             raise factory_exc
+        if real_factory is not None:
+            return real_factory(token_file, deadline=deadline, clock=clock)
         return client
 
     out_dir = tmp_path / "data"
@@ -359,7 +361,7 @@ def test_default_client_has_two_retries_and_a_timeout(tmp_path, configured, monk
         monkeypatch.setenv(var, "must-not-be-used")
     token_file = tmp_path / "token"
     token_file.write_text(GOOD_JWT)
-    client = analyze.default_client_factory(token_file)
+    client = analyze.default_client_factory(token_file, deadline=1e12, clock=lambda: 0.0)
     assert client.max_retries == 2
     assert client.timeout == analyze.DEADLINE_SECONDS
     # Explicit federation credentials: no env credential stands in for them.
@@ -675,6 +677,258 @@ def test_real_sdk_5xx_after_two_retries_is_api_unavailable():
     assert len(seen) == 3
 
 
+# --- the default client: federation only, and the deadline per attempt ------------
+
+EXCHANGED = "exchanged-access-token"
+
+
+class Clock:
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+class Api:
+    """In-process Anthropic API behind the default client's GuardTransport:
+    the token exchange and the Messages calls. `messages` gives one response
+    (or exception) per Messages attempt; the last one repeats."""
+
+    def __init__(self, messages=None, *, exchange_status=200, clock=None, step=0.0):
+        self.messages = messages or [lambda: httpx2.Response(
+            200, headers={"content-type": "text/event-stream"}, content=ok_stream_body(findings_text()))]
+        self.exchange_status, self.clock, self.step = exchange_status, clock, step
+        self.requests = []
+        self.attempts = []  # (start time, read timeout) per Messages attempt
+
+    def __call__(self, request):
+        self.requests.append(request)
+        if request.url.path == "/v1/oauth/token":
+            if self.exchange_status != 200:
+                return httpx2.Response(self.exchange_status, json=error_body("authentication_error", "denied"))
+            return httpx2.Response(200, json={"access_token": EXCHANGED, "token_type": "Bearer", "expires_in": 600})
+        assert request.url.path == "/v1/messages"
+        now = self.clock() if self.clock else 0.0
+        self.attempts.append((now, request.extensions["timeout"]["read"]))
+        if self.clock:
+            self.clock.now += self.step
+        out = self.messages[min(len(self.attempts), len(self.messages)) - 1]()
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+    def messages_requests(self):
+        return [r for r in self.requests if r.url.path == "/v1/messages"]
+
+
+def default_client(tmp_path, api, *, deadline=1e12, clock=lambda: 0.0):
+    token_file = tmp_path / "token"
+    token_file.write_text(GOOD_JWT)
+    return analyze.default_client_factory(token_file, deadline=deadline, clock=clock,
+                                          transport=httpx2.MockTransport(api))
+
+
+@pytest.fixture
+def no_retry_sleep(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(anthropic._base_client.time, "sleep", sleeps.append)
+    return sleeps
+
+
+def test_default_client_authenticates_by_federation_only(tmp_path, configured, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "static-key-from-env")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "static-token-from-env")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://evil.example")
+    api = Api()
+    result = analyze.call_pass(default_client(tmp_path, api), a_request(), deadline=1e12, clock=lambda: 0.0)
+    assert result.status == "ok"
+    exchange, msg = api.requests
+    assert str(exchange.url) == "https://api.anthropic.com/v1/oauth/token"
+    body = json.loads(exchange.content)
+    assert body["assertion"] == GOOD_JWT
+    assert body["federation_rule_id"] == CONFIGURED_IDS["ANTHROPIC_FEDERATION_RULE_ID"]
+    assert body["organization_id"] == CONFIGURED_IDS["ANTHROPIC_ORGANIZATION_ID"]
+    assert body["service_account_id"] == CONFIGURED_IDS["ANTHROPIC_SERVICE_ACCOUNT_ID"]
+    assert (msg.url.scheme, msg.url.host, msg.url.path) == ("https", "api.anthropic.com", "/v1/messages")
+    assert msg.headers["authorization"] == f"Bearer {EXCHANGED}"
+    assert "x-api-key" not in msg.headers
+
+
+@pytest.mark.parametrize("header", ["X-Api-Key: static-key-from-env", "x-api-key: k",
+                                    "Authorization: Bearer static-token", "Other: 1\nauthorization: Bearer t"])
+def test_custom_credential_header_is_refused(tmp_path, configured, monkeypatch, header):
+    """Regression: the SDK reads ANTHROPIC_CUSTOM_HEADERS even with explicit
+    credentials, and a credential header there made it skip the exchange."""
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", header)
+    api = Api()
+    with pytest.raises(analyze.CallRefused) as exc:
+        default_client(tmp_path, api)
+    assert exc.value.reason == analyze.R_STATIC_CREDENTIAL
+    assert api.requests == []
+
+
+def test_custom_credential_header_gives_three_failed_records(tmp_path, configured, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Api-Key: static-key-from-env")
+    api = Api()
+
+    def factory(token_file, **kw):
+        return analyze.default_client_factory(token_file, transport=httpx2.MockTransport(api), **kw)
+
+    run = run_main(tmp_path, real_factory=factory)
+    assert_three_records(run)
+    assert set(reasons(run).values()) == {analyze.R_STATIC_CREDENTIAL}
+    assert api.requests == [] and not run.token_files[0][0].exists()
+
+
+def test_other_custom_headers_still_use_federation(tmp_path, configured, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Trace: 1")
+    api = Api()
+    analyze.call_pass(default_client(tmp_path, api), a_request(), deadline=1e12, clock=lambda: 0.0)
+    assert [r.url.path for r in api.requests] == ["/v1/oauth/token", "/v1/messages"]
+    assert api.requests[1].headers["authorization"] == f"Bearer {EXCHANGED}"
+
+
+def test_denied_exchange_cannot_be_bypassed(tmp_path, configured, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "static-key-from-env")
+    api = Api(exchange_status=401)
+    with pytest.raises(analyze.PassFailure) as exc:
+        analyze.call_pass(default_client(tmp_path, api), a_request(), deadline=1e12, clock=lambda: 0.0)
+    assert exc.value.reason == analyze.R_AUTH
+    assert api.messages_requests() == []
+
+
+@pytest.mark.parametrize(
+    "url, headers, reason",
+    [
+        ("https://evil.example/v1/messages", {}, analyze.R_API_HOST),
+        ("http://api.anthropic.com/v1/messages", {}, analyze.R_API_HOST),
+        ("https://api.anthropic.com/v1/messages", {"X-Api-Key": "k"}, analyze.R_STATIC_CREDENTIAL),
+    ],
+)
+def test_guard_transport_refuses(url, headers, reason):
+    seen = []
+    guard = analyze.GuardTransport(httpx2.MockTransport(seen.append), deadline=10.0, clock=lambda: 0.0)
+    with pytest.raises(analyze.CallRefused) as exc:
+        guard.handle_request(httpx2.Request("POST", url, headers=headers))
+    assert exc.value.reason == reason and seen == []
+
+
+def test_guard_transport_cuts_timeouts_and_refuses_at_the_deadline():
+    seen = []
+
+    def handler(request):
+        seen.append(request.extensions["timeout"])
+        return httpx2.Response(200)
+
+    clock = Clock(4.0)
+    guard = analyze.GuardTransport(httpx2.MockTransport(handler), deadline=10.0, clock=clock)
+    req = httpx2.Request("POST", "https://api.anthropic.com/v1/oauth/token",
+                         extensions={"timeout": {"connect": 30.0, "read": 30.0, "write": 2.0, "pool": None}})
+    guard.handle_request(req)
+    assert seen == [{"connect": 6.0, "read": 6.0, "write": 2.0, "pool": 6.0}]
+    clock.now = 10.0
+    with pytest.raises(analyze.CallRefused) as exc:
+        guard.handle_request(httpx2.Request("POST", "https://api.anthropic.com/v1/oauth/token"))
+    assert exc.value.reason == analyze.R_DEADLINE and len(seen) == 1
+
+
+def test_token_exchange_gets_at_most_the_time_left(tmp_path, configured):
+    api = Api()
+    clock = Clock(400.0)
+    analyze.call_pass(default_client(tmp_path, api, deadline=420.0, clock=clock), a_request(),
+                      deadline=420.0, clock=clock)
+    assert api.requests[0].extensions["timeout"]["read"] == 20.0
+
+
+def status_500(**headers):
+    return lambda: httpx2.Response(500, headers=headers, json=error_body("api_error", "x"))
+
+
+def test_retry_attempts_start_before_the_deadline_with_less_time_each(tmp_path, configured, no_retry_sleep):
+    """Regression: the SDK gave each retry the first attempt's timeout and
+    started retries after the deadline."""
+    clock = Clock()
+    api = Api([status_500(**{"retry-after-ms": "1"})], clock=clock, step=3.0)
+    with pytest.raises(analyze.PassFailure) as exc:
+        analyze.call_pass(default_client(tmp_path, api, deadline=10.0, clock=clock), a_request(),
+                          deadline=10.0, clock=clock)
+    assert exc.value.reason == analyze.R_UNAVAILABLE
+    assert api.attempts == [(0.0, 10.0), (3.0, 7.0), (6.0, 4.0)]
+    assert len(no_retry_sleep) == 2
+
+
+def test_no_retry_starts_at_or_after_the_deadline(tmp_path, configured, no_retry_sleep):
+    """The reviewer's case: each 500 takes 11 s against a 10 s deadline."""
+    clock = Clock()
+    api = Api([status_500()], clock=clock, step=11.0)
+    with pytest.raises(analyze.PassFailure) as exc:
+        analyze.call_pass(default_client(tmp_path, api, deadline=10.0, clock=clock), a_request(),
+                          deadline=10.0, clock=clock)
+    assert exc.value.reason == analyze.R_DEADLINE
+    assert api.attempts == [(0.0, 10.0)]
+    assert no_retry_sleep == []
+
+
+@pytest.mark.parametrize("headers", [{"retry-after": "60"}, {"retry-after-ms": "9500"}])
+def test_no_retry_when_the_wait_passes_the_deadline(tmp_path, configured, no_retry_sleep, headers):
+    clock = Clock()
+    api = Api([status_500(**headers)], clock=clock, step=1.0)
+    with pytest.raises(analyze.PassFailure) as exc:
+        analyze.call_pass(default_client(tmp_path, api, deadline=10.0, clock=clock), a_request(),
+                          deadline=10.0, clock=clock)
+    assert exc.value.reason == analyze.R_UNAVAILABLE
+    assert len(api.attempts) == 1 and no_retry_sleep == []
+
+
+def test_no_retry_after_a_connection_error_near_the_deadline(tmp_path, configured, no_retry_sleep):
+    clock = Clock()
+    api = Api([lambda: httpx2.ConnectError("down")], clock=clock, step=9.8)
+    with pytest.raises(analyze.PassFailure) as exc:
+        analyze.call_pass(default_client(tmp_path, api, deadline=10.0, clock=clock), a_request(),
+                          deadline=10.0, clock=clock)
+    assert exc.value.reason == analyze.R_UNAVAILABLE
+    assert len(api.attempts) == 1 and no_retry_sleep == []
+
+
+def test_connection_errors_retry_while_time_is_left(tmp_path, configured, no_retry_sleep):
+    clock = Clock()
+    api = Api([lambda: httpx2.ConnectError("down")], clock=clock, step=1.0)
+    with pytest.raises(analyze.PassFailure) as exc:
+        analyze.call_pass(default_client(tmp_path, api, deadline=10.0, clock=clock), a_request(),
+                          deadline=10.0, clock=clock)
+    assert exc.value.reason == analyze.R_UNAVAILABLE
+    assert [t for t, _ in api.attempts] == [0.0, 1.0, 2.0]
+
+
+def test_spend_limit_is_not_changed_near_the_deadline(tmp_path, configured):
+    clock = Clock()
+    spend = lambda: httpx2.Response(400, json=error_body("invalid_request_error", SPEND_MSG))  # noqa: E731
+    api = Api([spend], clock=clock, step=9.9)
+    with pytest.raises(analyze.PassFailure) as exc:
+        analyze.call_pass(default_client(tmp_path, api, deadline=10.0, clock=clock), a_request(),
+                          deadline=10.0, clock=clock)
+    assert exc.value.reason == analyze.R_SPEND_LIMIT
+
+
+def test_retry_wait_bound():
+    assert analyze.retry_wait(None, 0) == 0.5 and analyze.retry_wait(None, 1) == 1.0
+    assert analyze.retry_wait(httpx2.Headers({"retry-after-ms": "250"}), 0) == 0.25
+    assert analyze.retry_wait(httpx2.Headers({"retry-after": "7"}), 0) == 7.0
+    assert analyze.retry_wait(httpx2.Headers({"retry-after-ms": "0", "retry-after": "7"}), 1) == 1.0
+    assert 55 < analyze.retry_wait(httpx2.Headers({"retry-after": email_date(60)}), 0) <= 60
+    # The SDK's own backoff constants: the bound must follow the SDK.
+    from anthropic import _constants
+    assert (analyze.SDK_INITIAL_RETRY_DELAY, analyze.SDK_MAX_RETRY_DELAY) == (
+        _constants.INITIAL_RETRY_DELAY, _constants.MAX_RETRY_DELAY)
+
+
+def email_date(seconds_from_now):
+    import email.utils
+    import time
+    return email.utils.formatdate(time.time() + seconds_from_now, usegmt=True)
+
+
 # --- three records on every path ---------------------------------------------------
 
 
@@ -826,6 +1080,35 @@ def test_context_mismatch_exits_nonzero_without_records(tmp_path, configured, fi
 def test_missing_environment_exits_nonzero(tmp_path, configured):
     run = run_main(tmp_path, env={"GITHUB_RUN_ID": None})
     assert run.code != 0 and run.records == {}
+
+
+@pytest.mark.parametrize("var", ["GITHUB_TOKEN", "RUNNER_TEMP"])
+def test_missing_call_prerequisite_gives_three_failed_records(tmp_path, configured, var):
+    """Regression (D2): a trusted bundle always gets three records."""
+    run = run_main(tmp_path, env={var: None})
+    assert_three_records(run)
+    assert set(statuses(run).values()) == {"failed"}
+    assert set(reasons(run).values()) == {f"missing environment variable: {var}"}
+    assert run.client.calls == {} and run.github.requests == [] and run.oidc.calls == []
+    assert run.token_files == []
+
+
+@pytest.mark.parametrize("status", ["skipped-size", "stale", "failed"])
+def test_no_call_bundle_needs_no_call_prerequisite(tmp_path, configured, status):
+    bundle = load("bundle-ok")
+    bundle["status"] = status
+    p = bundle["payload"]
+    bundle["payload"] = {k: p[k] for k in ("prefilter", "coverage", "dependency_delta", "size")} \
+        if status == "skipped-size" else None
+    run = run_main(tmp_path, bundle=bundle, env={"GITHUB_TOKEN": None, "RUNNER_TEMP": None})
+    assert_three_records(run, bundle)
+    assert set(statuses(run).values()) == {status}
+
+
+def test_missing_github_output_exits_nonzero_before_any_call(tmp_path, configured):
+    run = run_main(tmp_path, env={"GITHUB_OUTPUT": None})
+    assert run.code != 0 and run.outputs == {}
+    assert run.client.calls == {} and run.github.requests == [] and run.oidc.calls == []
 
 
 def test_pass_bundle_is_not_a_bundle(tmp_path, configured):
