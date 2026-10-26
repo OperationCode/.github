@@ -107,9 +107,10 @@ BUNDLE_FILE_NAME = "bundle.json"
 
 # Unified diff context lines, as git.
 PATCH_CONTEXT = 3
-# Past this product of middle lengths (linediff), the patch is one hunk that
-# removes every base line and adds every head line between the common prefix
-# and suffix: a larger patch than git's, never a wrong one.
+# Past this product of middle lengths, or past the work budget of the file or
+# of the run (linediff), the patch is one hunk that removes every base line and
+# adds every head line between the common prefix and suffix: a larger patch
+# than git's, never a wrong one.
 PATCH_DIFF_BUDGET = linediff.DIFF_BUDGET
 NO_NEWLINE = "\\ No newline at end of file"
 
@@ -411,8 +412,8 @@ def _git_lines(text: str | None) -> tuple[list[str], bool]:
     return lines, True
 
 
-def _opcodes(a: Sequence[Any], b: Sequence[Any]) -> list[linediff.Opcode]:
-    return linediff.opcodes(a, b, PATCH_DIFF_BUDGET)[0]
+def _opcodes(a: Sequence[Any], b: Sequence[Any], work: linediff.WorkBudget | None) -> linediff.Diff:
+    return linediff.diff(a, b, PATCH_DIFF_BUDGET, work)
 
 
 def _range(start: int, stop: int) -> str:
@@ -422,14 +423,23 @@ def _range(start: int, stop: int) -> str:
     return f"{start if length == 0 else start + 1},{length}"
 
 
-def unified_diff(base_text: str | None, head_text: str | None) -> tuple[str, int, int]:
+def unified_diff(
+    base_text: str | None, head_text: str | None, work: linediff.WorkBudget | None = None
+) -> tuple[str, int, int]:
     """Unified diff of two blob texts: (patch, additions, deletions).
 
     Hunks only, no file header. A last line with no LF gets the marker
     `\\ No newline at end of file`, and counts as a different line from the
     same text with an LF. Every patch line equals its blob line, as
-    `render.redact_patch` requires.
+    `render.redact_patch` requires. `work` is the run's diff work budget.
     """
+    return _patch(base_text, head_text, work)[:3]
+
+
+def _patch(
+    base_text: str | None, head_text: str | None, work: linediff.WorkBudget | None
+) -> tuple[str, int, int, str | None]:
+    """`unified_diff`, and why the patch is coarse (None: it is exact)."""
     a, a_noeol = _git_lines(base_text)
     b, b_noeol = _git_lines(head_text)
     a_keys: list[Any] = list(a)
@@ -441,7 +451,8 @@ def unified_diff(base_text: str | None, head_text: str | None) -> tuple[str, int
     out: list[str] = []
     adds = dels = 0
     no_eol = NO_NEWLINE
-    for group in linediff.hunks(_opcodes(a_keys, b_keys), PATCH_CONTEXT):
+    diff = _opcodes(a_keys, b_keys, work)
+    for group in linediff.hunks(diff.codes, PATCH_CONTEXT):
         out.append(f"@@ -{_range(group[0][1], group[-1][2])} +{_range(group[0][3], group[-1][4])} @@")
         for tag, i1, i2, j1, j2 in group:
             if tag == "equal":
@@ -460,7 +471,7 @@ def unified_diff(base_text: str | None, head_text: str | None) -> tuple[str, int
                 adds += 1
                 if b_noeol and j == len(b) - 1:
                     out.append(no_eol)
-    return "".join(line + "\n" for line in out), adds, dels
+    return "".join(line + "\n" for line in out), adds, dels, diff.reason
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +904,7 @@ def _file_entry(
     blobs: Mapping[str, bytes | None],
     sizes: Mapping[str, int],
     max_blob_bytes: int,
+    work: linediff.WorkBudget,
 ) -> dict[str, Any]:
     def scan(sha: str | None, mode: str | None, path: str) -> prefilter.BlobScan | None:
         if sha is None or mode == MODE_SUBMODULE:
@@ -932,7 +944,10 @@ def _file_entry(
     # Each text side counts on its own. Opposite a gitlink or a binary blob,
     # the patch adds every head line or removes every base line, so a type
     # change never hides text from Claude or from the citation check.
-    patch, adds, dels = unified_diff(base_text, head_text)
+    patch, adds, dels, coarse = _patch(base_text, head_text, work)
+    if coarse is not None:
+        # The job log says why (repr: a path is one log line).
+        print(f"collect: {change.path!r}: {coarse}; the patch is one hunk for the changed middle", file=sys.stderr)
     try:
         entry["patch"] = render.redact_patch(patch, base_text, head_text)
     except render.RenderError as exc:
@@ -1106,8 +1121,9 @@ def collect(
     if extra is not None:
         checks["prefilter"]["signals"].append(extra)
     delta = _delta_payload(facts)
+    work = linediff.WorkBudget()  # one diff work budget for every file of the run
     files = [
-        _file_entry(c, cov, blobs, sizes, max_blob_bytes)
+        _file_entry(c, cov, blobs, sizes, max_blob_bytes, work)
         for c, cov in zip(diff.files, result.coverage.files, strict=True)
     ]
 

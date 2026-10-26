@@ -182,7 +182,8 @@ class FileSides:
     `path` is the head path (the only path for a removed file). Text is the
     redacted text the model saw, or None when that side has no blob or its
     content is not available. Hunks are inclusive 1-based line ranges inside a
-    diff hunk on that side.
+    diff hunk on that side. `no_hunks_reason` says why a file has no hunks
+    because its line diff went past a budget (`linediff`).
     """
 
     path: str
@@ -191,6 +192,7 @@ class FileSides:
     head_text: str | None = None
     base_hunks: tuple[tuple[int, int], ...] = ()
     head_hunks: tuple[tuple[int, int], ...] = ()
+    no_hunks_reason: str | None = None
 
 
 def metadata_files(title_text: str | None, body_text: str | None) -> tuple[FileSides, ...]:
@@ -211,14 +213,16 @@ def changed_file(
     old_path: str | None = None,
     base_raw: str | None = None,
     head_raw: str | None = None,
+    work: linediff.WorkBudget | None = None,
 ) -> FileSides:
     """One changed file from its raw blob texts (None: no blob or not available).
 
     Each side is the text the model saw (`render.model_text`). Hunks come from
-    the raw texts; redaction keeps the line count (ruling R-LINES).
+    the raw texts; redaction keeps the line count (ruling R-LINES). `work` is
+    the run's diff work budget.
     """
-    base_hunks, head_hunks = hunks_from_texts(base_raw, head_raw)
-    return FileSides(path, old_path, _model(base_raw), _model(head_raw), base_hunks, head_hunks)
+    base_hunks, head_hunks, reason = _hunks(base_raw, head_raw, HUNK_CONTEXT, work)
+    return FileSides(path, old_path, _model(base_raw), _model(head_raw), base_hunks, head_hunks, reason)
 
 
 def metadata_files_from_raw(title: str | None, body: str | None) -> tuple[FileSides, ...]:
@@ -529,30 +533,43 @@ def _normalize(text: str) -> str:
     return " ".join(text.split())
 
 
+Hunks = tuple[tuple[int, int], ...]
+
+
 def hunks_from_texts(
-    base_text: str | None, head_text: str | None, context: int = HUNK_CONTEXT
-) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]:
+    base_text: str | None,
+    head_text: str | None,
+    context: int = HUNK_CONTEXT,
+    work: linediff.WorkBudget | None = None,
+) -> tuple[Hunks, Hunks]:
     """Inclusive 1-based (base, head) hunk ranges of a unified diff of two texts.
 
-    The diff is bounded (`linediff`). When it is past the work budget the
-    exact hunks are not known, so there are none: every finding in the file
-    goes to the summary, and none is lost.
+    The diff is bounded (`linediff`): by its size and by the work budget of
+    the file and of the run (`work`, a fresh one when None). When it is past
+    a budget the exact hunks are not known, so there are none: every finding
+    in the file goes to the summary, and none is lost.
     """
+    return _hunks(base_text, head_text, context, work)[:2]
+
+
+def _hunks(
+    base_text: str | None, head_text: str | None, context: int, work: linediff.WorkBudget | None
+) -> tuple[Hunks, Hunks, str | None]:
     a = _lines(base_text) if base_text is not None else []
     b = _lines(head_text) if head_text is not None else []
     base_hunks: list[tuple[int, int]] = []
     head_hunks: list[tuple[int, int]] = []
-    codes, exact = linediff.opcodes(a, b)
-    if not exact:
-        return (), ()
-    for group in linediff.hunks(codes, context):
+    diff = linediff.diff(a, b, work=work)
+    if not diff.exact:
+        return (), (), diff.reason
+    for group in linediff.hunks(diff.codes, context):
         i1, i2 = group[0][1], group[-1][2]
         j1, j2 = group[0][3], group[-1][4]
         if i2 > i1:
             base_hunks.append((i1 + 1, i2))
         if j2 > j1:
             head_hunks.append((j1 + 1, j2))
-    return tuple(base_hunks), tuple(head_hunks)
+    return tuple(base_hunks), tuple(head_hunks), None
 
 
 class _FileIndex:

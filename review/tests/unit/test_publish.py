@@ -3,7 +3,6 @@ transport stands in for api.github.com."""
 
 from __future__ import annotations
 
-import difflib
 import io
 import json
 import re
@@ -1137,17 +1136,17 @@ def test_final_summary_update_failed_keeps_initial_full_record(tmp_path, capsys,
 # ---------------------------------------------------------------- bounded diff (inline hunks)
 
 
-class _BoundedMatcher(difflib.SequenceMatcher):
-    """Fails a test that runs a line diff past the work budget."""
+class _BoundedMatcher(linediff._CountingMatcher):
+    """Fails a test that runs a line diff past the size budget."""
 
-    def __init__(self, isjunk=None, a="", b="", autojunk=True):
+    def __init__(self, a, b, allowance):
         assert len(a) * len(b) <= linediff.DIFF_BUDGET, (len(a), len(b))
-        super().__init__(isjunk, a, b, autojunk)
+        super().__init__(a, b, allowance)
 
 
 @pytest.fixture
 def bounded_diff(monkeypatch):
-    monkeypatch.setattr(difflib, "SequenceMatcher", _BoundedMatcher)
+    monkeypatch.setattr(linediff, "_CountingMatcher", _BoundedMatcher)
 
 
 def _one_file(base: str, head: str) -> dict:
@@ -1194,6 +1193,39 @@ def test_diff_past_budget_sends_findings_to_summary(tmp_path, bounded_diff):
     assert "Bad first line" in s and "Low last line" in s  # every finding kept
     assert r.code == 1 and "blocking-finding" in reason_codes(s)  # and it still blocks
     _reached_the_end(r)
+
+
+def test_low_entropy_file_past_the_work_budget_reaches_the_end(tmp_path):
+    n = 2_000
+    base = "a\n" * n
+    head = "c\n" + "".join("a\n" if i % 2 == 0 else "b\n" for i in range(1, n - 1)) + "d\n"
+    f = verdict.changed_file("big.txt", base_raw=base, head_raw=head)
+    assert (f.base_hunks, f.head_hunks, f.no_hunks_reason) == ((), (), linediff.PAST_FILE_WORK_BUDGET)
+    low = finding(file="big.txt", line=n, quote="d", title="Low last line")
+    r = run(tmp_path, bundle=_one_file(base, head), passes=clean_passes(review=[low]))
+    assert r.gh.bodies("POST", "/reviews") == []  # no exact hunk, so nothing inline
+    assert "Low last line" in r.summary
+    _reached_the_end(r)
+
+
+def test_hunk_work_budget_is_shared_by_the_run(monkeypatch, capsys):
+    base = "c\n" + "".join("a\n" if i % 2 == 0 else "b\n" for i in range(1, 299)) + "d\n"
+    head = "e\n" + "".join("a\n" if (i // 2) % 2 == 0 else "b\n" for i in range(1, 299)) + "f\n"
+    probe = linediff.WorkBudget()
+    exact = verdict.hunks_from_texts(base, head, work=probe)
+    steps = linediff.RUN_WORK_BUDGET - probe.left
+    assert exact != ((), ()) and 0 < steps < linediff.FILE_WORK_BUDGET
+    monkeypatch.setattr(linediff, "RUN_WORK_BUDGET", steps + steps // 2)
+    doc = bundle_doc(files=[{"path": p, "old_path": None, "status": "modified", "base_content": base,
+                             "head_content": head} for p in ("a.txt", "b.txt", "c.txt")])
+    by_path = {f.path: f for f in publish.bundle_files(verdict.ArtifactRead(doc))}
+    a = by_path["a.txt"]
+    assert ((a.base_hunks, a.head_hunks), a.no_hunks_reason) == (exact, None)
+    for p in ("b.txt", "c.txt"):
+        f = by_path[p]
+        assert (f.base_hunks, f.head_hunks, f.no_hunks_reason) == ((), (), linediff.PAST_RUN_WORK_BUDGET)
+    err = capsys.readouterr().err
+    assert "'b.txt'" in err and "'c.txt'" in err and "'a.txt'" not in err
 
 
 def test_collect_patch_past_budget_is_one_middle_hunk(bounded_diff):

@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from oc_review import collect as c
-from oc_review import deps, envelope, prefilter, render, verdict
+from oc_review import deps, envelope, linediff, prefilter, render, verdict
 
 FIXTURES = Path(__file__).parent / "fixtures" / "collect"
 API_REPO = "/repos/OperationCode/back-end"
@@ -697,6 +697,40 @@ def test_unified_diff_budget_fallback_is_still_correct(monkeypatch):
     patch, adds, dels = c.unified_diff(base, head)
     assert apply_patch(base, patch) == head
     assert (adds, dels) == (21, 21)
+
+
+# Low entropy ("a"/"b" lines): about 2.5 million counted diff steps.
+LOW_BASE = "c\n" + "".join("a\n" if i % 2 == 0 else "b\n" for i in range(1, 299)) + "d\n"
+LOW_HEAD = "e\n" + "".join("a\n" if (i // 2) % 2 == 0 else "b\n" for i in range(1, 299)) + "f\n"
+
+
+def test_low_entropy_patch_past_the_file_work_budget_is_one_hunk():
+    n = 2_000
+    base = "".join("a\n" for _ in range(n))
+    head = "c\n" + "".join("a\n" if i % 2 == 0 else "b\n" for i in range(1, n - 1)) + "d\n"
+    patch, adds, dels = c.unified_diff(base, head)
+    assert (adds, dels) == (n, n)
+    assert patch.startswith(f"@@ -1,{n} +1,{n} @@\n")
+    assert apply_patch(base, patch) == head
+
+
+def test_patch_work_budget_is_shared_by_the_run(monkeypatch, capsys):
+    probe = linediff.WorkBudget()
+    exact = c.unified_diff(LOW_BASE, LOW_HEAD, probe)[0]
+    steps = linediff.RUN_WORK_BUDGET - probe.left
+    assert 0 < steps < linediff.FILE_WORK_BUDGET
+    monkeypatch.setattr(linediff, "RUN_WORK_BUDGET", steps + steps // 2)
+    paths = ["a.txt", "b.txt", "c.txt"]
+    col, _, _ = run(_snapshot({p: ("100644", LOW_BASE) for p in paths}, {p: ("100644", LOW_HEAD) for p in paths}))
+    files = col.envelope["payload"]["files"]
+    # The first file spends most of the run's work; the rest are one hunk.
+    assert [f["patch"] == exact for f in files] == [True, False, False]
+    for f in files:
+        assert apply_patch(LOW_BASE, f["patch"]) == LOW_HEAD
+    assert files[2]["patch"].startswith("@@ -1,300 +1,300 @@\n")
+    err = capsys.readouterr().err
+    assert err.count(linediff.PAST_RUN_WORK_BUDGET) == 2
+    assert repr(files[1]["path"]) in err and repr(files[2]["path"]) in err
 
 
 def test_patch_is_redacted_with_blob_context():

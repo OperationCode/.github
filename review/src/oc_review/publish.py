@@ -54,7 +54,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from oc_review import collect, envelope, snapshot, verdict
+from oc_review import collect, envelope, linediff, snapshot, verdict
 from oc_review.render import redact_text
 
 ZWSP = "​"
@@ -460,18 +460,22 @@ def bundle_files(read: verdict.ArtifactRead) -> tuple[verdict.FileSides, ...]:
     if payload is None:
         return ()
     out: list[verdict.FileSides] = []
+    work = linediff.WorkBudget()  # one diff work budget for every file of the run
     files = payload.get("files")
     for entry in files if isinstance(files, list) else ():
         if not isinstance(entry, Mapping) or not isinstance(entry.get("path"), str):
             continue
-        out.append(
-            verdict.changed_file(
-                entry["path"],
-                old_path=_opt_str(entry.get("old_path")),
-                base_raw=_opt_str(entry.get("base_content")),
-                head_raw=_opt_str(entry.get("head_content")),
-            )
+        f = verdict.changed_file(
+            entry["path"],
+            old_path=_opt_str(entry.get("old_path")),
+            base_raw=_opt_str(entry.get("base_content")),
+            head_raw=_opt_str(entry.get("head_content")),
+            work=work,
         )
+        if f.no_hunks_reason is not None:
+            # The job log says why (repr: a path is one log line).
+            print(f"publish: {f.path!r}: {f.no_hunks_reason}; its findings go to the summary", file=sys.stderr)
+        out.append(f)
     pr = payload.get("pr")
     if isinstance(pr, Mapping):
         out.extend(verdict.metadata_files_from_raw(_opt_str(pr.get("title")), _opt_str(pr.get("body"))))
