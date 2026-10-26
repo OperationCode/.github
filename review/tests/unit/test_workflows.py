@@ -10,6 +10,8 @@ for the eval environment rules (V27).
 
 import re
 import shutil
+import subprocess
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,7 +41,13 @@ USES_LINE_RE = re.compile(r"^\s*(?:-\s+)?uses:\s*(\S+)(.*)$")
 VERSION_COMMENT_RE = re.compile(r"#\s*v\d+\.\d+\.\d+\b")
 NEEDS_ID_RE = re.compile(r"\$\{\{ needs\.([a-z-]+)\.outputs\.([a-z-]+-artifact-id) \}\}")
 STEP_ARTIFACT_ID_RE = re.compile(r"\$\{\{ steps\.([A-Za-z0-9_-]+)\.outputs\.artifact-id \}\}")
+# The `secrets` context in any form: secrets.X, secrets['X'], secrets [ 'X' ],
+# toJSON(secrets), and the `secrets:` key of a job. Expressions ignore case.
+SECRETS_RE = re.compile(r"(?<![\w.-])secrets(?![\w-])", re.IGNORECASE)
 
+# timeout-minutes per job, by workflow file (spec "Workflow details", plan 2.1).
+TIMEOUT_MINUTES = {"claude-review.yml": 10, "test.yml": 10, "eval.yml": 30}
+DEFAULT_TIMEOUT_MINUTES = 10
 # Central workflow (spec "Architecture", "Workflow details").
 COLLECT, ANALYZE, DEPENDENCY_REVIEW, GATE = "collect", "analyze", "dependency-review", "oc-claude-review"
 CENTRAL_PERMISSIONS = {
@@ -57,7 +65,7 @@ CENTRAL_NEEDS = {
 CENTRAL_REPOSITORY = "OperationCode/.github"
 JOB_WORKFLOW_SHA = "${{ job.workflow_sha }}"
 # Never the target repo's default branch commit, the run's workflow ref, or any PR ref.
-FORBIDDEN_TEXT = ("github.sha", "github.workflow_sha", "pull_request.head", "github.head_ref", "refs/pull/", "secrets.")
+FORBIDDEN_TEXT = ("github.sha", "github.workflow_sha", "pull_request.head", "github.head_ref", "refs/pull/")
 # Artifact id output -> (producer upload path, gate download path), under runner.temp.
 ARTIFACTS = {
     (COLLECT, "bundle-artifact-id"): ("data/bundle/bundle.json", "data/bundle"),
@@ -80,6 +88,20 @@ PUBLISH_ENV = {
     "SUPPLY_CHAIN_DIGEST": "${{ needs.analyze.outputs.supply-chain-digest }}",
     "DEPENDENCY_REVIEW_OUTCOME": "${{ needs.dependency-review.outputs.outcome }}",
 }
+PUBLISH_STEP_ENV = {**PUBLISH_ENV, "PYTHONPATH": "${{ github.workspace }}/central/review/src"}
+GATE_JOB_ENV = {"UV_PYTHON_DOWNLOADS": "never", "UV_PYTHON": "python3.12"}
+# The exit code of publish is the gate. With no `shell:` the runner uses
+# `bash -e {0}`, so this script exits with the exit code of publish.
+PUBLISH_RUN = (
+    "printf '%s' \"$NEEDS_JSON\" > \"$RUNNER_TEMP/needs.json\"\n"
+    "uv run --no-sync --project central/review python -m oc_review.publish"
+    " --data-dir \"$RUNNER_TEMP/data\" --needs-json \"$RUNNER_TEMP/needs.json\"\n"
+)
+DEFAULT_SHELL = ("bash", "-e")
+
+# test.yml triggers (plan 2.1, O11): every PR with no filter, so the required
+# check never stays pending, and pushes to main.
+TEST_TRIGGER_PUSH = {"branches": ["main"]}
 
 EVAL_JOB_PERMISSIONS = {"contents": "read", "id-token": "write"}
 
@@ -88,7 +110,8 @@ TAGS = frozenset({
     "anthropic-env", "harden-runner", "unpinned-uses", "version-comment", "cache", "setup-uv",
     "run-expression", "trigger", "concurrency", "job-permissions", "job-if", "step-if", "environment",
     "checkout", "forbidden-text", "download", "upload", "job-outputs", "needs", "dependency-review",
-    "analyze-env", "publish-env", "test-workflow", "eval-environment", "eval-permissions", "eval-trigger",
+    "analyze-env", "publish-env", "publish-run", "secrets", "test-workflow", "eval-environment",
+    "eval-permissions", "eval-trigger",
 })
 
 
@@ -188,6 +211,19 @@ def needs(job: dict) -> set[str]:
     return {str(x) for x in n} if isinstance(n, list) else set()
 
 
+def strings(node: Any) -> Iterator[str]:
+    """Every string key and string value in a parsed document (no comments)."""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for k, v in node.items():
+            yield from strings(k)
+            yield from strings(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from strings(v)
+
+
 def is_false(value: Any) -> bool:
     return value is False or value == "false"
 
@@ -241,10 +277,15 @@ def common_violations(wf: Workflow) -> list[str]:
         r.add("workflow", "anthropic-env", "no ANTHROPIC_* variable")
     if not jobs(doc):
         r.add("workflow", "jobs", "no jobs")
+    used = [s for s in strings(doc) if SECRETS_RE.search(s)]
+    if used:
+        r.add("workflow", "secrets", f"no secrets context in any form, got {used!r}")
+    want_timeout = TIMEOUT_MINUTES.get(wf.name, DEFAULT_TIMEOUT_MINUTES)
     parsed_uses = 0
     for name, job in jobs(doc).items():
-        if not isinstance(job.get("timeout-minutes"), int):
-            r.add(name, "timeout", "every job sets timeout-minutes")
+        timeout = job.get("timeout-minutes")
+        if type(timeout) is not int or timeout != want_timeout:
+            r.add(name, "timeout", f"timeout-minutes must be {want_timeout}, got {timeout!r}")
         if "continue-on-error" in job:
             r.add(name, "continue-on-error", "not allowed on a job")
         perms = effective_permissions(doc, job)
@@ -442,8 +483,21 @@ def central_violations(wf: Workflow) -> list[str]:
     found = step_running(gate, "oc_review.publish")
     if found is None or found[0] != len(steps(gate)) - 1:
         r.add(GATE, "publish-env", "publish is the last step of the gate job (its exit code is the gate)")
-    elif any(env(found[1]).get(k) != v for k, v in PUBLISH_ENV.items()):
-        r.add(GATE, "publish-env", f"the publish step sets {PUBLISH_ENV}")
+    else:
+        step = found[1]
+        if env(step) != PUBLISH_STEP_ENV:
+            r.add(GATE, "publish-env", f"the publish step env is exactly {PUBLISH_STEP_ENV}")
+        if step.get("run") != PUBLISH_RUN:
+            r.add(GATE, "publish-run", "the publish script is exactly PUBLISH_RUN, so its exit code is the gate")
+        if "shell" in step:
+            r.add(GATE, "publish-run", f"the publish step uses the default shell, got {step['shell']!r}")
+    # Nothing may change the shell or the environment that runs publish.
+    if "defaults" in doc or "defaults" in gate:
+        r.add(GATE, "publish-run", "no defaults: in the workflow or the gate job")
+    if "env" in doc:
+        r.add("workflow", "publish-run", "no workflow env:")
+    if env(gate) != GATE_JOB_ENV:
+        r.add(GATE, "publish-run", f"the gate job env is exactly {GATE_JOB_ENV}")
     return r.items
 
 
@@ -459,13 +513,16 @@ def read_only(perms: Any) -> bool:
 
 def ci_workflow_violations(wf: Workflow) -> list[str]:
     r = Report(wf.name)
-    t = triggers(wf.doc)
-    if "pull_request" not in t or t - {"pull_request", "push"}:
-        r.add("workflow", "test-workflow", f"pull_request (and push) only, got {sorted(t)}")
+    on = raw_on(wf.doc)
+    if (
+        not isinstance(on, dict)
+        or set(on) != {"pull_request", "push"}
+        or on["pull_request"] not in (None, {})
+        or on["push"] != TEST_TRIGGER_PUSH
+    ):
+        r.add("workflow", "test-workflow", f"pull_request with no filter and push to {TEST_TRIGGER_PUSH}, got {on!r}")
     if not read_only(wf.doc.get("permissions")):
         r.add("workflow", "test-workflow", "read-only token")
-    if "secrets." in wf.text:
-        r.add("workflow", "test-workflow", "no secrets")
     for name, job in jobs(wf.doc).items():
         if not read_only(effective_permissions(wf.doc, job)):
             r.add(name, "test-workflow", "read-only token, no id-token")
@@ -588,6 +645,58 @@ def test_only_eval_yml_uses_the_eval_environment():
         if "environment" in job and (environment_name(job["environment"]) or EVAL_ENVIRONMENT).strip().casefold() == EVAL_ENVIRONMENT
     ]
     assert users == [(EVAL, "fixture-evals")]
+
+
+def run_publish_script(script: str, tmp_path: Path, publish_exit: int) -> tuple[int, str]:
+    """Run a publish script as the runner does (`bash -e`), with a stub `uv`
+    that records its arguments and exits with `publish_exit`. No network."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / "uv"
+    stub.write_text('#!/bin/sh\nprintf "%s " "$@" > "$RUNNER_TEMP/uv-args"\nexit "$PUBLISH_EXIT"\n', encoding="utf-8")
+    stub.chmod(0o755)
+    path = tmp_path / "step.sh"
+    path.write_text(script, encoding="utf-8")
+    proc = subprocess.run(
+        [*DEFAULT_SHELL, str(path)],
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin", "RUNNER_TEMP": str(tmp_path), "NEEDS_JSON": "{}",
+             "PUBLISH_EXIT": str(publish_exit)},
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    args = tmp_path / "uv-args"
+    return proc.returncode, args.read_text(encoding="utf-8") if args.exists() else ""
+
+
+def test_publish_step_runs_the_real_script():
+    found = step_running(jobs(central().doc)[GATE], "oc_review.publish")
+    assert found is not None
+    assert found[1]["run"] == PUBLISH_RUN
+    assert "shell" not in found[1]
+
+
+@pytest.mark.parametrize("publish_exit", [0, 1, 3])
+def test_publish_exit_code_is_the_step_exit_code(publish_exit, tmp_path):
+    code, args = run_publish_script(PUBLISH_RUN, tmp_path, publish_exit)
+    assert code == publish_exit
+    assert "-m oc_review.publish" in args
+    assert (tmp_path / "needs.json").read_text(encoding="utf-8") == "{}"
+
+
+# Scripts that hide the publish exit code. The stub check above fails on each,
+# and the exact PUBLISH_RUN check rejects each (edits.yml publish-* cases).
+HIDDEN_EXIT_SCRIPTS = {
+    "true-or": PUBLISH_RUN.replace("uv run", "true || uv run"),
+    "or-true": PUBLISH_RUN.replace('needs.json"\n', 'needs.json" || true\n'),
+    "exit-trap": "trap 'exit 0' EXIT\n" + PUBLISH_RUN,
+}
+
+
+@pytest.mark.parametrize("case", sorted(HIDDEN_EXIT_SCRIPTS))
+def test_publish_stub_check_fails_on_hidden_exit(case, tmp_path):
+    script = HIDDEN_EXIT_SCRIPTS[case]
+    assert script != PUBLISH_RUN
+    code, _ = run_publish_script(script, tmp_path, 3)
+    assert code == 0
 
 
 @pytest.mark.release

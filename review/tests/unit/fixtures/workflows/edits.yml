@@ -67,6 +67,31 @@
   old: "    timeout-minutes: 10\n"
   new: ""
   expect: timeout
+- id: timeout-too-long
+  file: claude-review.yml
+  old: "    timeout-minutes: 10\n"
+  new: "    timeout-minutes: 360\n"
+  expect: timeout
+- id: timeout-boolean
+  file: eval.yml
+  old: "    timeout-minutes: 30\n"
+  new: "    timeout-minutes: true\n"
+  expect: timeout
+- id: timeout-eval-wrong
+  file: eval.yml
+  old: "    timeout-minutes: 30\n"
+  new: "    timeout-minutes: 10\n"
+  expect: timeout
+- id: timeout-test-wrong
+  file: test.yml
+  old: "    timeout-minutes: 10\n"
+  new: "    timeout-minutes: 30\n"
+  expect: timeout
+- id: timeout-expression
+  file: test.yml
+  old: "    timeout-minutes: 10\n"
+  new: "    timeout-minutes: ${{ 360 }}\n"
+  expect: timeout
 - id: run-expression
   file: claude-review.yml
   old: "--bundle-digest \"$BUNDLE_DIGEST\""
@@ -223,11 +248,53 @@
   old: "JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}"
   new: "JOB_WORKFLOW_SHA: ${{ github.workflow_sha }}"
   expect: forbidden-text
+
+# --- secrets context, every form (every workflow) ---
 - id: secrets-reference
   file: claude-review.yml
   old: "GITHUB_TOKEN: ${{ github.token }}"
   new: "GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}"
-  expect: forbidden-text
+  expect: secrets
+- id: secrets-bracket-central
+  file: claude-review.yml
+  old: "GITHUB_TOKEN: ${{ github.token }}"
+  new: "GITHUB_TOKEN: ${{ secrets['GITHUB_TOKEN'] }}"
+  expect: secrets
+- id: secrets-tojson-central-input
+  file: claude-review.yml
+  old: "          show-openssf-scorecard: false\n"
+  new: "          show-openssf-scorecard: false\n          config-file: ${{ toJSON(secrets) }}\n"
+  expect: secrets
+- id: secrets-bracket-test-workflow-env
+  file: test.yml
+  old: "permissions: {}\n\njobs:"
+  new: "permissions: {}\n\nenv:\n  CI_SECRET: ${{ secrets['TOKEN'] }}\n\njobs:"
+  expect: secrets
+- id: secrets-spaced-bracket-test-job-env
+  file: test.yml
+  old: "      UV_PYTHON: python3.12\n"
+  new: "      UV_PYTHON: python3.12\n      CI_SECRET: ${{ secrets [ 'TOKEN' ] }}\n"
+  expect: secrets
+- id: secrets-tojson-test-step-input
+  file: test.yml
+  old: "          persist-credentials: false\n"
+  new: "          persist-credentials: false\n          token: ${{ toJSON(secrets) }}\n"
+  expect: secrets
+- id: secrets-uppercase-test-step-env
+  file: test.yml
+  old: "        working-directory: review\n        run: uv run --locked pytest tests/unit\n"
+  new: "        working-directory: review\n        env:\n          TOKEN: ${{ SECRETS.TOKEN }}\n        run: uv run --locked pytest tests/unit\n"
+  expect: secrets
+- id: secrets-inherit-test-job
+  file: test.yml
+  old: "    timeout-minutes: 10\n"
+  new: "    timeout-minutes: 10\n    secrets: inherit\n"
+  expect: secrets
+- id: secrets-bracket-eval-step-env
+  file: eval.yml
+  old: "          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}\n"
+  new: "          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}\n          TOKEN: ${{ secrets['TOKEN'] }}\n"
+  expect: secrets
 
 # --- central workflow: artifacts ---
 - id: download-by-name
@@ -322,14 +389,106 @@
 - id: publish-not-last
   file: claude-review.yml
   old: "--needs-json \"$RUNNER_TEMP/needs.json\"\n"
-  new: "--needs-json \"$RUNNER_TEMP/needs.json\" || true\n      - name: After\n        run: echo done\n"
+  new: "--needs-json \"$RUNNER_TEMP/needs.json\"\n      - name: After\n        run: echo done\n"
   expect: publish-env
+- id: publish-step-env-extra
+  file: claude-review.yml
+  old: "          PYTHONPATH: ${{ github.workspace }}/central/review/src\n        run: |\n"
+  new: "          PYTHONPATH: ${{ github.workspace }}/central/review/src\n          BASH_ENV: /tmp/exit-zero.sh\n        run: |\n"
+  expect: publish-env
+
+# --- central workflow: the publish exit code is the gate ---
+- id: publish-true-or
+  file: claude-review.yml
+  old: "          uv run --no-sync --project central/review python -m oc_review.publish"
+  new: "          true || uv run --no-sync --project central/review python -m oc_review.publish"
+  expect: publish-run
+- id: publish-or-true
+  file: claude-review.yml
+  old: "--needs-json \"$RUNNER_TEMP/needs.json\"\n"
+  new: "--needs-json \"$RUNNER_TEMP/needs.json\" || true\n"
+  expect: publish-run
+- id: publish-exit-trap
+  file: claude-review.yml
+  old: "          printf '%s' \"$NEEDS_JSON\""
+  new: "          trap 'exit 0' EXIT\n          printf '%s' \"$NEEDS_JSON\""
+  expect: publish-run
+- id: publish-shell
+  file: claude-review.yml
+  old: "      - name: Compute the gate and write the PR comments\n"
+  new: "      - name: Compute the gate and write the PR comments\n        shell: bash -c 'bash {0}; exit 0'\n"
+  expect: publish-run
+- id: publish-job-defaults
+  file: claude-review.yml
+  old: "    if: always()\n"
+  new: "    if: always()\n    defaults:\n      run:\n        shell: bash -c 'bash {0}; exit 0'\n"
+  expect: publish-run
+- id: publish-workflow-defaults
+  file: claude-review.yml
+  old: "permissions: {}\n\njobs:"
+  new: "permissions: {}\n\ndefaults:\n  run:\n    shell: bash -c 'bash {0}; exit 0'\n\njobs:"
+  expect: publish-run
+- id: publish-workflow-env
+  file: claude-review.yml
+  old: "permissions: {}\n\njobs:"
+  new: "permissions: {}\n\nenv:\n  BASH_ENV: /tmp/exit-zero.sh\n\njobs:"
+  expect: publish-run
+- id: publish-gate-job-env
+  file: claude-review.yml
+  old: "      actions: read\n    env:\n"
+  new: "      actions: read\n    env:\n      BASH_ENV: /tmp/exit-zero.sh\n"
+  expect: publish-run
 
 # --- test.yml (decision O11) ---
 - id: test-pull-request-target
   file: test.yml
   old: "  pull_request:\n"
   new: "  pull_request_target:\n"
+  expect: test-workflow
+- id: test-pr-paths
+  file: test.yml
+  old: "  pull_request:\n"
+  new: "  pull_request:\n    paths: [\"review/**\"]\n"
+  expect: test-workflow
+- id: test-pr-branches
+  file: test.yml
+  old: "  pull_request:\n"
+  new: "  pull_request:\n    branches: [main]\n"
+  expect: test-workflow
+- id: test-pr-types
+  file: test.yml
+  old: "  pull_request:\n"
+  new: "  pull_request:\n    types: [opened]\n"
+  expect: test-workflow
+- id: test-push-missing
+  file: test.yml
+  old: "  push:\n    branches: [main]\n"
+  new: ""
+  expect: test-workflow
+- id: test-push-wrong-branch
+  file: test.yml
+  old: "branches: [main]"
+  new: "branches: [develop]"
+  expect: test-workflow
+- id: test-push-extra-branch
+  file: test.yml
+  old: "branches: [main]"
+  new: "branches: [main, develop]"
+  expect: test-workflow
+- id: test-push-unfiltered
+  file: test.yml
+  old: "  push:\n    branches: [main]\n"
+  new: "  push:\n"
+  expect: test-workflow
+- id: test-push-paths
+  file: test.yml
+  old: "    branches: [main]\n"
+  new: "    branches: [main]\n    paths: [\"review/**\"]\n"
+  expect: test-workflow
+- id: test-extra-event
+  file: test.yml
+  old: "  push:\n"
+  new: "  workflow_dispatch:\n  push:\n"
   expect: test-workflow
 - id: test-id-token
   file: test.yml
@@ -345,7 +504,7 @@
   file: test.yml
   old: "        working-directory: review\n        run: uv run --locked pytest tests/unit\n"
   new: "        working-directory: review\n        env:\n          TOKEN: ${{ secrets.TOKEN }}\n        run: uv run --locked pytest tests/unit\n"
-  expect: test-workflow
+  expect: secrets
 - id: test-environment
   file: test.yml
   old: "    timeout-minutes: 10\n"

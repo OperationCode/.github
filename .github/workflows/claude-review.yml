@@ -11,6 +11,9 @@
 #   write; the gate job writes comments and has no id-token
 # - no job if: except always() on the gate job; the only step if: is the
 #   non-empty artifact id check on each gate job download
+# - the last gate step runs publish in a fixed script with the default shell
+#   (bash -e) and no defaults: or extra env:, so its exit code is the gate
+# - no secrets context in any form
 # - every action pinned by full commit SHA (tag and release date in the comment)
 # - no ${{ }} inside run: scripts; values reach scripts through env:
 #
