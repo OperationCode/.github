@@ -610,7 +610,8 @@ def check_federation_only(client: Any) -> None:
 
 
 # client_factory(token_file, deadline=, clock=) -> an object with
-# `.beta.messages.stream(...)`. Raises CallRefused.
+# `.beta.messages.stream(...)`. Raises CallRefused. When `analyze` gets explicit
+# federation IDs (the eval runner), it also passes `federation=` to the factory.
 ClientFactory = Callable[..., Any]
 
 
@@ -620,6 +621,7 @@ def default_client_factory(
     deadline: float,
     clock: Callable[[], float],
     transport: httpx2.BaseTransport | None = None,
+    federation: FederationIds | None = None,
 ) -> Any:
     """SDK client with workload identity federation only.
 
@@ -636,7 +638,7 @@ def default_client_factory(
         return httpx2.Client(transport=GuardTransport(inner, deadline=deadline, clock=clock),
                              timeout=timeout, follow_redirects=False)
 
-    ids = federation_ids()
+    ids = federation or federation_ids()
     credentials = anthropic.WorkloadIdentityCredentials(
         identity_token_provider=anthropic.IdentityTokenFile(token_file),
         federation_rule_id=ids.rule_id,
@@ -726,9 +728,13 @@ def analyze(
     clock: Callable[[], float] = time.monotonic,
     deadline_seconds: float = DEADLINE_SECONDS,
     nonce: str | None = None,
+    federation: FederationIds | None = None,
 ) -> dict[str, PassResult]:
     """Results for the three passes of a trusted bundle. Never raises for a
     pass problem; every path gives three results.
+
+    `federation` is the Anthropic federation IDs. None (the review path) means
+    the production constants of this module. The eval runner passes its own.
 
     `github` is None without `GITHUB_TOKEN`, and `runner_temp` is None without
     `RUNNER_TEMP`. Only a bundle with status `ok` needs them; without them its
@@ -771,7 +777,7 @@ def analyze(
         for name in PASS_NAMES
     }
 
-    ids = federation_ids()
+    ids = federation or federation_ids()
     if not ids_valid(ids) or ids_are_placeholders(ids):
         return _all("failed", R_FEDERATION_NOT_CONFIGURED)
     try:
@@ -785,7 +791,10 @@ def analyze(
     del token
     try:
         try:
-            client = client_factory(token_file, deadline=deadline, clock=clock)
+            if federation is None:
+                client = client_factory(token_file, deadline=deadline, clock=clock)
+            else:
+                client = client_factory(token_file, deadline=deadline, clock=clock, federation=federation)
         except CallRefused as exc:
             return _all("failed", exc.reason)
         return run_passes(client, requests, deadline=deadline, clock=clock)

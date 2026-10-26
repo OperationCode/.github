@@ -789,6 +789,66 @@ class TestChangedLines:
         head = pf._Lines("top\n" + "".join(f"b{i}\n" for i in range(50)) + "end\n")
         assert pf._added_lines(head, base, budget=10) == list(range(2, 52))
 
+    def test_run_budget_is_shared_by_files(self, capsys):
+        base = pf._Lines("top\n" + "".join(f"a{i}\n" for i in range(300)) + "end\n")
+        head = pf._Lines("top\n" + "".join(f"b{i}\n" for i in range(300)) + "end\n")
+        budget = pf.DiffBudget(total=150_000, per_file=100_000)
+        results = [pf._added_lines(head, base, budget=100_000, run=budget, path=f"f{i}.txt") for i in range(6)]
+        assert all(r == list(range(2, 302)) for r in results)  # exact result is the same: all added
+        assert budget.left >= 0
+        err = capsys.readouterr().err
+        assert pf.PAST_RUN_DIFF_BUDGET in err
+
+    def test_run_budget_never_goes_negative_and_caps_steps(self):
+        base = pf._Lines("".join(f"a{i}\n" for i in range(400)))
+        head = pf._Lines("".join(f"b{i}\n" for i in range(400)))
+        budget = pf.DiffBudget(total=250_000, per_file=100_000)
+        for i in range(10):
+            pf._added_lines(head, base, budget=100_000, run=budget, path=f"f{i}")
+            assert budget.left >= 0
+        assert budget.left == 0
+
+    def test_past_run_budget_every_middle_line_is_added(self):
+        budget = pf.DiffBudget(total=0, per_file=1_000)
+        base = pf._Lines("top\nx0\nkeep\nx1\nend\n")
+        head = pf._Lines("top\ny0\nkeep\ny1\nend\n")
+        # exact: the shared line is not added; with no budget left the middle 2..4 counts
+        assert pf._added_lines(head, base, run=pf.DiffBudget(), path="x") == [2, 4]
+        assert pf._added_lines(head, base, run=budget, path="x") == [2, 3, 4]
+
+    def test_run_budget_across_many_files_in_run_prefilter(self, capsys):
+        rows = 300
+        changes = [
+            change(
+                f"f{i}.txt",
+                "".join(f"b{j}\n" for j in range(rows)) + "x\u200b\n",
+                "".join(f"a{j}\n" for j in range(rows)),
+            )
+            for i in range(8)
+        ]
+        budget = pf.DiffBudget(total=200_000, per_file=100_000)
+        start = time.monotonic()
+        r = run(*changes, diff_budget=budget)
+        assert time.monotonic() - start < 10
+        assert 0 <= budget.left < 100_000
+        assert len(checks(r, pf.ZERO_WIDTH)) == 8  # coarse diff still sees every added line
+        assert pf.PAST_RUN_DIFF_BUDGET in capsys.readouterr().err
+        assert r.coverage.complete
+
+    def test_budget_never_clears_a_block(self):
+        bidi = "\u202e"
+        base = "".join(f"a{j}\n" for j in range(300))
+        head = "".join(f"b{j}\n" for j in range(299)) + f"x{bidi}\n"
+        exact = run(change("a.txt", head, base))
+        coarse = run(change("a.txt", head, base), diff_budget=pf.DiffBudget(total=0))
+        assert ids(exact, pf.HARD_BLOCK) == ids(coarse, pf.HARD_BLOCK)
+        assert ids(exact, pf.SIGNAL) == ids(coarse, pf.SIGNAL)
+
+    def test_default_run_budget_is_40_million(self):
+        assert pf.RUN_DIFF_WORK_BUDGET == 40_000_000
+        assert pf.DIFF_WORK_BUDGET == 2_000_000
+        assert pf.DiffBudget().left == pf.RUN_DIFF_WORK_BUDGET
+
     def test_large_rewrite_is_bounded(self):
         base = "".join(f"a{i}\n" for i in range(200_000))
         head = "".join(f"b{i}\n" for i in range(200_000))

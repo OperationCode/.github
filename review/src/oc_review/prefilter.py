@@ -23,6 +23,7 @@ import codecs
 import hashlib
 import json
 import re
+import sys
 import tomllib
 import unicodedata
 from array import array
@@ -59,6 +60,22 @@ BLOB_RUN_CHARS = 200
 # Steps the line diff may take for one file. Past it, every head line between
 # the common prefix and suffix counts as changed.
 DIFF_WORK_BUDGET = 2_000_000
+# Steps the line diffs of all files of one `run_prefilter` call may take
+# together. Measured on an Apple M-series core: about 7 s of diff time.
+RUN_DIFF_WORK_BUDGET = 40_000_000
+
+PAST_FILE_DIFF_BUDGET = "line diff past the per-file work budget"
+PAST_RUN_DIFF_BUDGET = "line diff past the run work budget"
+
+
+class DiffBudget:
+    """Line diff work left for one `run_prefilter` call. Every file takes from
+    it: a file gets `min(per_file, left)` steps, and is charged the steps it
+    used, or everything it was allowed when it went past its allowance."""
+
+    def __init__(self, total: int = RUN_DIFF_WORK_BUDGET, per_file: int = DIFF_WORK_BUDGET) -> None:
+        self.left = total
+        self.per_file = per_file
 
 Level = Literal["hard_block", "signal"]
 CoverageKind = Literal["full", "binary", "unavailable"]
@@ -405,14 +422,21 @@ class _Lines:
         return bisect.bisect_right(self.starts, offset)
 
 
-def _added_lines(head: _Lines, base: _Lines | None, budget: int = DIFF_WORK_BUDGET) -> list[int]:
+def _added_lines(
+    head: _Lines,
+    base: _Lines | None,
+    budget: int = DIFF_WORK_BUDGET,
+    run: DiffBudget | None = None,
+    path: str = "",
+) -> list[int]:
     """1-based head line numbers that a line diff of base to head adds.
 
     The common prefix and suffix are trimmed, then a Myers diff runs on the
     middle. Each base line matches at most one head line, in order, so a
     duplicate or a moved line counts as added. When the diff needs more than
     `budget` steps, every head line in the middle counts as added: more lines
-    than git shows, never fewer.
+    than git shows, never fewer. With `run`, the file also takes from the
+    run's budget, and past either limit stderr names the file and the limit.
     """
     if base is None:
         return list(range(1, len(head.lines) + 1))
@@ -426,17 +450,27 @@ def _added_lines(head: _Lines, base: _Lines | None, budget: int = DIFF_WORK_BUDG
     while suf < len(a) - pre and suf < len(b) - pre and a[-1 - suf] == b[-1 - suf]:
         suf += 1
     a, b = a[pre : len(a) - suf], b[pre : len(b) - suf]
-    middle = _myers_inserts(a, b, budget)
+    allowed = budget if run is None else max(0, min(budget, run.left))
+    steps = [0]
+    middle = _myers_inserts(a, b, allowed, steps)
+    if run is not None:
+        run.left -= allowed if middle is None else steps[0]
     if middle is None:
+        run_limited = run is not None and allowed < budget
+        limit = PAST_RUN_DIFF_BUDGET if run_limited else PAST_FILE_DIFF_BUDGET
+        print(f"prefilter: {path or '(file)'}: {limit}; every changed line counts as added", file=sys.stderr)
         middle = list(range(len(b)))
     return [pre + j + 1 for j in middle]
 
 
-def _myers_inserts(a: Sequence[int], b: Sequence[int], budget: int) -> list[int] | None:
+def _myers_inserts(
+    a: Sequence[int], b: Sequence[int], budget: int, steps: list[int] | None = None
+) -> list[int] | None:
     """0-based indexes of `b` that a shortest edit script from `a` inserts.
 
     Myers' O((N+M)D) greedy algorithm. `trace[d][i]` is the furthest x on
     diagonal k = 2i - d after d edits. None when the work passes `budget`.
+    `steps[0]` gets the work counted.
     """
     n, m = len(a), len(b)
     if not n or not m:
@@ -461,6 +495,8 @@ def _myers_inserts(a: Sequence[int], b: Sequence[int], budget: int) -> list[int]
                 y += 1
             work += 1 + x - start
             cur[i] = x
+            if steps is not None:
+                steps[0] = work
             if x >= n and y >= m:
                 trace.append(cur)
                 return _myers_backtrack(trace, n, m)
@@ -753,7 +789,10 @@ def _build_system(text: str | None) -> Any:
         return "<unparseable>"
 
 
-def _check_file(out: _Results, change: ChangedFile, base: BlobScan | None, head: BlobScan | None) -> None:
+def _check_file(
+    out: _Results, change: ChangedFile, base: BlobScan | None, head: BlobScan | None,
+    run: DiffBudget | None = None,
+) -> None:
     path = change.path
     paths = [p for p in (change.path, change.old_path) if p]
 
@@ -813,7 +852,7 @@ def _check_file(out: _Results, change: ChangedFile, base: BlobScan | None, head:
         return
     head_lines = _Lines(head_text)
     base_lines = _Lines(base_text) if base_text is not None else None
-    added = _added_lines(head_lines, base_lines)
+    added = _added_lines(head_lines, base_lines, run=run, path=path)
     _check_text(out, path, head_lines, added)
     if (
         path.lower().endswith(_JS_SUFFIXES)
@@ -993,6 +1032,7 @@ def run_prefilter(
     pr_body: str = "",
     max_blob_bytes: int = MAX_BLOB_BYTES,
     unread_reasons: Mapping[str, str] | None = None,
+    diff_budget: DiffBudget | None = None,
 ) -> PrefilterResult:
     """Run every prefilter check on one comparison.
 
@@ -1001,9 +1041,11 @@ def run_prefilter(
     its SHA before it is scanned. `head_paths` is every path in the head tree.
     `unread_reasons` gives the coverage reason of a blob with no bytes when it
     is not `unreadable`, for example `over-cap` for a blob collect did not
-    fetch because its tree size is over the cap.
+    fetch because its tree size is over the cap. `diff_budget` is the run's
+    line diff work (a fresh `DiffBudget` when None): every file takes from it.
     """
     unread_reasons = unread_reasons or {}
+    diff_budget = DiffBudget() if diff_budget is None else diff_budget
 
     def scan(sha: str, path: str) -> BlobScan:
         data = blobs.get(sha)
@@ -1049,7 +1091,7 @@ def run_prefilter(
         ):
             cov = FileCoverage(change.path, "unavailable", "unterminated-private-key")
         file_cov.append(cov)
-        _check_file(out, change, base, head)
+        _check_file(out, change, base, head, diff_budget)
 
     coverage = Coverage(
         trees_complete=diff.complete,

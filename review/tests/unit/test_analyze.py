@@ -1170,3 +1170,70 @@ def test_uv_lock_has_hashes_for_anthropic_and_its_deps():
             dists = p.get("wheels", []) + ([p["sdist"]] if "sdist" in p else [])
             assert dists, p["name"]
             assert all(re.fullmatch(r"sha256:[0-9a-f]{64}", d.get("hash", "")) for d in dists), p["name"]
+
+
+# --- the federation-ID parameter (the eval runner passes its own IDs) -----------------
+
+
+def _analyze_direct(tmp_path, factory, **kw):
+    runner_temp = tmp_path / "rt"
+    runner_temp.mkdir()
+    event = collect.EventContext.from_event(load("event"))
+    return analyze.analyze(
+        load("bundle-ok"), event, github=collect.GitHubClient("ghs_t", FakeGitHub(), sleep=lambda s: None),
+        mint_oidc=lambda: GOOD_JWT, job_workflow_sha=JOB_SHA, runner_temp=runner_temp,
+        client_factory=factory, **kw,
+    )
+
+
+def test_federation_parameter_reaches_the_client_factory(tmp_path):
+    other = analyze.FederationIds(*CONFIGURED_IDS.values())
+    seen = []
+
+    def factory(token_file, *, deadline, clock, federation):
+        seen.append(federation)
+        return FakeClient()
+
+    results = _analyze_direct(tmp_path, factory, federation=other)
+    assert seen == [other]  # module constants are still placeholders: only the parameter can pass
+    assert {r.status for r in results.values()} == {"ok"}
+
+
+def test_federation_parameter_placeholders_refuse_to_call(tmp_path):
+    placeholder = analyze.FederationIds("fdrl_000000000000000000000000", CONFIGURED_IDS["ANTHROPIC_ORGANIZATION_ID"],
+                                        CONFIGURED_IDS["ANTHROPIC_SERVICE_ACCOUNT_ID"])
+    results = _analyze_direct(tmp_path, lambda *a, **k: pytest.fail("no client"), federation=placeholder)
+    assert {r.reason for r in results.values()} == {analyze.R_FEDERATION_NOT_CONFIGURED}
+
+
+def test_default_federation_path_does_not_pass_the_parameter(tmp_path, configured):
+    calls = []
+
+    def factory(token_file, *, deadline, clock):  # no `federation` kwarg: the default path never passes one
+        calls.append(1)
+        return FakeClient()
+
+    results = _analyze_direct(tmp_path, factory)
+    assert calls == [1] and {r.status for r in results.values()} == {"ok"}
+
+
+def test_default_client_factory_uses_the_federation_parameter(tmp_path, configured):
+    token_file = tmp_path / "tok"
+    token_file.write_text(GOOD_JWT)
+    other = analyze.FederationIds("fdrl_ZyXwVuTsRqPoNmLkJiHgFeDc", "9bc920f9-1111-4222-8333-444455556666",
+                                  "svac_ZyXwVuTsRqPoNmLkJiHgFeDc")
+    seen = {}
+
+    def api(request):
+        if request.url.path == "/v1/oauth/token":
+            seen.update(json.loads(request.content))
+            return httpx2.Response(200, json={"access_token": "t", "token_type": "Bearer", "expires_in": 600})
+        return httpx2.Response(500)
+
+    client = analyze.default_client_factory(token_file, deadline=1e12, clock=lambda: 0.0,
+                                            transport=httpx2.MockTransport(api), federation=other)
+    try:
+        client.beta.messages.create(model="m", max_tokens=1, messages=[{"role": "user", "content": "x"}])
+    except Exception:  # noqa: BLE001 - the Messages call is not the point
+        pass
+    assert seen["federation_rule_id"] == other.rule_id
