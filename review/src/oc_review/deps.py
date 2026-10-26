@@ -1468,7 +1468,10 @@ def _parse_time(value: Any, what: str) -> datetime:
     # guess UTC.
     if stamp.tzinfo is None:
         raise RegistryError(f"{what} has no time zone")
-    return stamp.astimezone(UTC)
+    try:
+        return stamp.astimezone(UTC)
+    except OverflowError as exc:  # e.g. year 1 with a positive offset
+        raise RegistryError(f"{what} is out of range in UTC") from exc
 
 
 def _fetch_json(

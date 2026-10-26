@@ -84,7 +84,7 @@ Python lives in `review/`, managed with `uv`. Unit tests make no network or API 
 - [ ] `collect.py`: GitHub REST reads into the bundle envelope. Tests use recorded responses, no network. Depends on V18 (fork objects through the base repo).
 - [ ] `render.py`: bundle to prompt text with nonce delimiters and redaction. Test that the rendered text cannot contain `untrusted_pr_{nonce}`.
 - [ ] Prompts: `system.md`, `review.md`, `security.md`, `supply-chain.md`. A unit test fails if any prompt file loses its `<grounding_rules>` block.
-- [ ] `verdict.py`: citation check, inline eligibility, gate reasons, override checks. The full gate matrix from the spec's "Testing" section. The push epoch part depends on V16 (it may add `reopened`).
+- [ ] `verdict.py`: citation check, inline eligibility, gate reasons, override checks. The full gate matrix from the spec's "Testing" section. The push epoch includes `reopened` (V16, spec K-12).
 - [ ] Sanitizer and escaping for every untrusted string that the publisher posts.
 
 Depends on: none for most tasks; V18 for `collect.py`, V16 for the push epoch in `verdict.py`.

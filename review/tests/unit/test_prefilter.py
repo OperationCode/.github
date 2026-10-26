@@ -326,6 +326,26 @@ class TestCoverage:
         }
         envelope.validate_envelope(doc)
 
+    def test_to_dict_has_lists_not_tuples(self):
+        r = run(change("a.py", "x\n‮\ny\n‮\n"), change("b.py", "x = 1\n"))
+        doc = r.to_dict()
+        assert doc == json.loads(json.dumps(doc))
+        assert doc["prefilter"]["hard_blocks"][0]["lines"] == [2, 4]
+        assert isinstance(doc["coverage"]["files"], list)
+
+    def test_unread_reason_names_an_unfetched_blob(self):
+        a, blobs = change("a.txt", "big\n")
+        b, b_blobs = change("b.txt", "lost\n")
+        sha_a, sha_b = a.head_sha, b.head_sha
+        r = run((a, {sha_a: None}), (b, {sha_b: None}), unread_reasons={sha_a: "over-cap"})
+        assert [(f.path, f.reason) for f in r.coverage.files] == [("a.txt", "over-cap"), ("b.txt", "unreadable")]
+        # Neither blob was read, so neither file counts as collected.
+        assert r.coverage.files_collected == 0
+        assert {c.file for c in r.hard_blocks if c.id == pf.INCOMPLETE_COVERAGE} == {"a.txt", "b.txt"}
+        # A reason applies only to a blob with no bytes.
+        r = run((a, blobs), unread_reasons={sha_a: "over-cap"})
+        assert r.coverage.files[0].coverage == "full" and r.coverage.files_collected == 1
+
 
 # ---------------------------------------------------------------------------
 # Row: bidi control characters (hard block)
@@ -655,6 +675,17 @@ class TestIncompleteDependencyData:
         r = dep_run(failures=[pf.DepFailure("yarn.lock", "unknown lockfile version")], parsed=())
         [c] = checks(r, pf.INCOMPLETE_DEP_DATA)
         assert c.level == pf.HARD_BLOCK and c.file == "yarn.lock"
+
+    def test_base_failure_is_only_a_signal(self):
+        facts = pf.DependencyFacts(
+            parsed_paths=frozenset({"package-lock.json"}),
+            base_failures=[pf.DepFailure("package-lock.json", "unknown lockfile version at the merge base")],
+        )
+        r = run(dependencies=facts)
+        assert not r.hard_blocks
+        [c] = checks(r, pf.BASE_DEP_UNPARSED)
+        assert c.level == pf.SIGNAL and c.file == "package-lock.json"
+        assert c.detail == "base side counts as empty: unknown lockfile version at the merge base"
 
     def test_changed_supported_file_not_parsed_blocks(self):
         r = run(change("package.json", "{}\n"), dependencies=pf.DependencyFacts())

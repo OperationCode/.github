@@ -92,10 +92,17 @@ _REDACTION_MARKER_RE = re.compile(r"\[REDACTED:[^\[\]\s]+\]")
 # Context lines around a change when hunks are computed from two texts.
 HUNK_CONTEXT = 3
 
-# Timeline events that move the push epoch (spec "Override"). V16 may add
-# "reopened"; change only this constant.
+# Timeline events that move the push epoch (spec "Override", K-12). V16 showed
+# a branch reset while the PR is closed leaves only "reopened"; change only
+# this constant.
 PUSH_EPOCH_EVENTS = frozenset(
-    {"head_ref_force_pushed", "head_ref_deleted", "head_ref_restored", "base_ref_changed"}
+    {
+        "head_ref_force_pushed",
+        "head_ref_deleted",
+        "head_ref_restored",
+        "base_ref_changed",
+        "reopened",
+    }
 )
 
 OVERRIDE_PREFIX = "/oc-review"

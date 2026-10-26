@@ -269,9 +269,17 @@ def test_push_epoch_newest_event():
         TimelineEvent("head_ref_force_pushed", T0),
         TimelineEvent("committed", None),
         TimelineEvent("base_ref_changed", T0 + timedelta(minutes=5)),
-        TimelineEvent("reopened", T0 + timedelta(hours=1)),
+        TimelineEvent("closed", T0 + timedelta(hours=1)),
     )
     assert push_epoch(Timeline(events, True)) == (T0 + timedelta(minutes=5), True)
+
+
+def test_push_epoch_includes_reopened():
+    events = (
+        TimelineEvent("base_ref_changed", T0),
+        TimelineEvent("reopened", T0 + timedelta(hours=1)),
+    )
+    assert push_epoch(Timeline(events, True)) == (T0 + timedelta(hours=1), True)
 
 
 def test_push_epoch_none_without_events():
@@ -288,6 +296,7 @@ def test_push_epoch_event_set_is_one_constant():
         "head_ref_deleted",
         "head_ref_restored",
         "base_ref_changed",
+        "reopened",
     }
 
 
