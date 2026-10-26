@@ -824,6 +824,11 @@ class TestChangedLines:
         assert pf._added_lines(head, base, run=pf.DiffBudget(), path="x") == [2, 4]
         assert pf._added_lines(head, base, run=budget, path="x") == [2, 3, 4]
 
+    def test_per_file_limit_of_the_budget_object_is_used(self):
+        base = pf._Lines("top\nx0\nkeep\nx1\nend\n")
+        head = pf._Lines("top\ny0\nkeep\ny1\nend\n")
+        assert pf._added_lines(head, base, run=pf.DiffBudget(total=1_000, per_file=0), path="x") == [2, 3, 4]
+
     @staticmethod
     def _shared_line_change(i):
         # the shared line carries a zero-width char: only a coarse diff counts it as added

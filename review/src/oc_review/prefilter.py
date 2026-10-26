@@ -425,7 +425,7 @@ class _Lines:
 def _added_lines(
     head: _Lines,
     base: _Lines | None,
-    budget: int = DIFF_WORK_BUDGET,
+    budget: int | None = None,
     run: DiffBudget | None = None,
     path: str = "",
 ) -> list[int]:
@@ -434,7 +434,7 @@ def _added_lines(
     The common prefix and suffix are trimmed, then a Myers diff runs on the
     middle. Each base line matches at most one head line, in order, so a
     duplicate or a moved line counts as added. When the diff needs more than
-    `budget` steps, every head line in the middle counts as added: more lines
+    `budget` steps (default: the run's `per_file`, else `DIFF_WORK_BUDGET`), every head line in the middle counts as added: more lines
     than git shows, never fewer. With `run`, the file also takes from the
     run's budget (the left share never drops below 0), and past either limit
     stderr names the file and the limit. A file's work is bounded by its
@@ -452,6 +452,8 @@ def _added_lines(
     while suf < len(a) - pre and suf < len(b) - pre and a[-1 - suf] == b[-1 - suf]:
         suf += 1
     a, b = a[pre : len(a) - suf], b[pre : len(b) - suf]
+    if budget is None:
+        budget = DIFF_WORK_BUDGET if run is None else run.per_file
     allowed = budget if run is None else max(0, min(budget, run.left))
     steps = [0]
     middle = _myers_inserts(a, b, allowed, steps)

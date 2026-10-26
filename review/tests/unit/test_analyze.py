@@ -420,8 +420,8 @@ def test_stop_reason_other_than_end_turn_fails(tmp_path, configured, stop):
         ('{"summary": "a", "summary": "b", "findings": []}', analyze.R_BAD_JSON),
         ('{"summary": "a", "findings": [], "x": NaN}', analyze.R_BAD_JSON),
         ("", analyze.R_BAD_JSON),
-        (findings_text(title="t" * 121), f"{analyze.R_SCHEMA}: findings/0/title: [maxLength]"),
-        (findings_text(16), f"{analyze.R_SCHEMA}: findings: [maxItems]"),
+        (findings_text(title="t" * 121), f"{analyze.R_SCHEMA}: 'findings'/0/'title': [maxLength]"),
+        (findings_text(16), f"{analyze.R_SCHEMA}: 'findings': [maxItems]"),
         ('{"summary": "a"}', f"{analyze.R_SCHEMA}: <root>: [required]"),
     ],
 )

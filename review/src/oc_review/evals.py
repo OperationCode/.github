@@ -128,6 +128,25 @@ def compare(expected: Mapping[str, Any], gate: verdict.GateResult, bundle: Mappi
     return out
 
 
+EXPECTED_KEYS = frozenset({"gate", "findings", "hard_blocks"})
+
+
+def _check_expected(expected: Any) -> None:
+    """Reject an expectation that would silently skip a check: an unknown key or a wrong type."""
+    if not isinstance(expected, dict):
+        raise EvalError("expected.json: must be a JSON object")
+    unknown = sorted(map(repr, set(expected) - EXPECTED_KEYS))
+    if unknown:
+        raise EvalError(f"expected.json: unknown keys {', '.join(unknown)}; allowed: gate, findings, hard_blocks")
+    if expected.get("gate") not in (None, verdict.PASS, verdict.FAIL):
+        raise EvalError("expected.json: gate must be pass or fail")
+    if not isinstance(expected.get("findings", []), list):
+        raise EvalError("expected.json: findings must be a list")
+    hb = expected.get("hard_blocks", [])
+    if not isinstance(hb, list) or not all(isinstance(x, str) for x in hb):
+        raise EvalError("expected.json: hard_blocks must be a list of check IDs")
+
+
 def run_case(
     case_dir: Path,
     out_dir: Path,
@@ -150,8 +169,7 @@ def run_case(
         raise EvalError(f"bundle.json: {exc}") from exc
     if bundle["kind"] != "bundle" or bundle["status"] != "ok":
         raise EvalError("bundle.json must be a bundle envelope with status ok")
-    if not isinstance(expected, dict) or expected.get("gate") not in (None, verdict.PASS, verdict.FAIL):
-        raise EvalError("expected.json: gate must be pass or fail")
+    _check_expected(expected)
 
     event = collect.EventContext(EVAL_REPOSITORY, bundle["repository_id"], bundle["pr_number"], bundle["head_sha"])
     github = collect.GitHubClient("eval-token", pr_transport(bundle), retries=0, sleep=lambda s: None)

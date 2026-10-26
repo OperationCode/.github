@@ -744,7 +744,7 @@ def test_edit_is_caught(case, tmp_path):
     assert case["old"] in text, f"edit {case['id']}: old text not in {case['file']}; update the fixture"
     path.write_text(text.replace(case["old"], case["new"], 1), encoding="utf-8")
     violations = all_violations(directory)
-    assert case["expect"] in {tag_of(v) for v in violations}, violations
+    assert {tag_of(v) for v in violations} == {case["expect"]}, violations
 
 
 def test_eval_boundary_good_fixture_passes():

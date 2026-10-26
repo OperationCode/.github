@@ -16,9 +16,9 @@
   new: "actions/upload-artifact@cf430e0"
   expect: unpinned-uses
 - id: uses-local-action
-  file: claude-review.yml
-  old: "uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294"
-  new: "uses: ./.github/actions/dependency-review"
+  file: eval.yml
+  old: "uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884"
+  new: "uses: ./.github/actions/setup-uv"
   expect: unpinned-uses
 - id: uses-docker
   file: eval.yml
@@ -129,15 +129,15 @@
   old: "permissions: {}\n\njobs:"
   new: "permissions: read-all\n\njobs:"
   expect: top-permissions
-- id: analyze-github-write
-  file: claude-review.yml
-  old: "      pull-requests: read\n      id-token: write\n"
-  new: "      pull-requests: write\n      id-token: write\n"
+- id: extra-job-id-token-with-write
+  file: eval.yml
+  old: "jobs:\n"
+  new: "jobs:\n  extra:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    permissions:\n      contents: write\n      id-token: write\n    steps:\n      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19\n        with:\n          egress-policy: audit\n      - run: echo hi\n"
   expect: credential-separation
-- id: gate-id-token
-  file: claude-review.yml
-  old: "      actions: read\n"
-  new: "      actions: read\n      id-token: write\n"
+- id: extra-job-write-all
+  file: eval.yml
+  old: "jobs:\n"
+  new: "jobs:\n  extra:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    permissions: write-all\n    steps:\n      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19\n        with:\n          egress-policy: audit\n      - run: echo hi\n"
   expect: credential-separation
 - id: collect-id-token
   file: claude-review.yml
@@ -164,10 +164,10 @@
   old: "    if: always()\n"
   new: "    if: always()\n    concurrency: gate\n"
   expect: concurrency
-- id: job-renamed
+- id: job-added
   file: claude-review.yml
   old: "  oc-claude-review:\n"
-  new: "  gate:\n"
+  new: "  extra:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    permissions:\n      contents: read\n    steps:\n      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19\n        with:\n          egress-policy: audit\n      - run: echo hi\n  oc-claude-review:\n"
   expect: jobs
 - id: gate-needs-short
   file: claude-review.yml
@@ -179,11 +179,6 @@
   old: "  collect:\n    runs-on: ubuntu-24.04\n"
   new: "  collect:\n    runs-on: ubuntu-24.04\n    environment: production\n"
   expect: environment
-- id: eval-environment-in-central
-  file: claude-review.yml
-  old: "  oc-claude-review:\n    needs: [collect, analyze, dependency-review]\n"
-  new: "  oc-claude-review:\n    needs: [collect, analyze, dependency-review]\n    environment: eval\n"
-  expect: eval-environment
 
 # --- central workflow: if ---
 - id: job-if-on-analyze
@@ -201,15 +196,15 @@
   old: "      - name: Run the three Claude passes\n        id: analyze\n"
   new: "      - name: Run the three Claude passes\n        id: analyze\n        if: always()\n"
   expect: step-if
-- id: step-if-guard-other-id
+- id: step-if-on-setup-uv
   file: claude-review.yml
-  old: "if: needs.analyze.outputs.review-artifact-id != ''"
-  new: "if: needs.analyze.outputs.security-artifact-id != ''"
+  old: "      - name: Set up uv\n"
+  new: "      - name: Set up uv\n        if: always()\n"
   expect: step-if
-- id: step-if-guard-wrapped
+- id: step-if-wrapped
   file: claude-review.yml
-  old: "if: needs.collect.outputs.bundle-artifact-id != ''"
-  new: "if: ${{ needs.collect.outputs.bundle-artifact-id != '' }}"
+  old: "      - name: Install the locked Python deps\n"
+  new: "      - name: Install the locked Python deps\n        if: ${{ always() }}\n"
   expect: step-if
 - id: step-if-on-publish
   file: claude-review.yml
@@ -218,10 +213,10 @@
   expect: step-if
 
 # --- central workflow: checkout ---
-- id: checkout-pr-head
+- id: checkout-other-ref
   file: claude-review.yml
   old: "ref: ${{ job.workflow_sha }}"
-  new: "ref: ${{ github.event.pull_request.head.sha }}"
+  new: "ref: main"
   expect: checkout
 - id: checkout-target-repo
   file: claude-review.yml
@@ -240,13 +235,13 @@
   expect: checkout
 - id: github-sha
   file: claude-review.yml
-  old: "JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}"
-  new: "JOB_WORKFLOW_SHA: ${{ github.sha }}"
+  old: "# BLOCK-MODE ALLOWLIST (L8): placeholder until V10 measures it."
+  new: "# github.sha"
   expect: forbidden-text
 - id: github-workflow-sha
   file: claude-review.yml
-  old: "JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}"
-  new: "JOB_WORKFLOW_SHA: ${{ github.workflow_sha }}"
+  old: "# BLOCK-MODE ALLOWLIST (L8): placeholder until V10 measures it."
+  new: "# github.workflow_sha"
   expect: forbidden-text
 
 # --- secrets context, every form (every workflow) ---
@@ -297,10 +292,10 @@
   expect: secrets
 
 # --- central workflow: artifacts ---
-- id: download-by-name
+- id: download-no-digest-check
   file: claude-review.yml
-  old: "artifact-ids: ${{ needs.analyze.outputs.security-artifact-id }}"
-  new: "name: oc-pass-security-a${{ github.run_attempt }}"
+  old: "          digest-mismatch: error\n"
+  new: ""
   expect: download
 - id: download-other-run
   file: claude-review.yml
@@ -517,10 +512,10 @@
   old: "on: workflow_dispatch\n"
   new: "on: [workflow_dispatch, workflow_call]\n"
   expect: eval-trigger
-- id: eval-pull-requests-write
+- id: eval-id-token-missing
   file: eval.yml
   old: "      id-token: write\n"
-  new: "      id-token: write\n      pull-requests: write\n"
+  new: ""
   expect: eval-permissions
 - id: eval-job-permissions-removed
   file: eval.yml

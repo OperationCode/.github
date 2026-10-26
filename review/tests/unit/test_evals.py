@@ -237,6 +237,21 @@ def test_bad_gate_value_is_a_failed_case(tmp_path):
     assert not r["matched"] and "gate must be pass or fail" in r["mismatches"][0]
 
 
+@pytest.mark.parametrize("expected", [
+    {"finding": [{"category": "security", "severity": "high"}]},
+    {"findings": "security"},
+    {"hard_blocks": [1]},
+    {"gate": "pass", "evil\nkey": 1},
+])
+def test_invalid_expectation_is_a_failed_case_before_any_call(tmp_path, expected):
+    make_case(tmp_path / "fixtures", expected=expected)
+    seen = []
+    assert run(tmp_path, FakeClient(), seen=seen) == 1
+    [r] = result_lines(tmp_path)
+    assert not r["matched"] and r["mismatches"][0].startswith("EvalError: expected.json:")
+    assert seen == []
+
+
 def test_results_are_written_per_case(tmp_path, monkeypatch):
     fx = tmp_path / "fixtures"
     make_case(fx, "a-good")
