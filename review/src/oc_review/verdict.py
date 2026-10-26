@@ -12,7 +12,6 @@ The publisher escapes them before it posts anything.
 
 from __future__ import annotations
 
-import difflib
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
@@ -22,7 +21,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
 
-from oc_review import envelope, render
+from oc_review import envelope, linediff, render
 
 PASS = "pass"
 FAIL = "fail"
@@ -533,13 +532,20 @@ def _normalize(text: str) -> str:
 def hunks_from_texts(
     base_text: str | None, head_text: str | None, context: int = HUNK_CONTEXT
 ) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]:
-    """Inclusive 1-based (base, head) hunk ranges of a unified diff of two texts."""
+    """Inclusive 1-based (base, head) hunk ranges of a unified diff of two texts.
+
+    The diff is bounded (`linediff`). When it is past the work budget the
+    exact hunks are not known, so there are none: every finding in the file
+    goes to the summary, and none is lost.
+    """
     a = _lines(base_text) if base_text is not None else []
     b = _lines(head_text) if head_text is not None else []
     base_hunks: list[tuple[int, int]] = []
     head_hunks: list[tuple[int, int]] = []
-    matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
-    for group in matcher.get_grouped_opcodes(context):
+    codes, exact = linediff.opcodes(a, b)
+    if not exact:
+        return (), ()
+    for group in linediff.hunks(codes, context):
         i1, i2 = group[0][1], group[-1][2]
         j1, j2 = group[0][3], group[-1][4]
         if i2 > i1:

@@ -1136,7 +1136,9 @@ def _step_summary_record(
 ) -> str:
     """One JSON line: run, result, reason codes and token counts per pass (D6).
     Only integers and fixed names, so no fence escape is needed. A failed
-    publication makes the result `fail` and adds `publish_error`."""
+    publication makes the result `fail` and adds `publish_error`. A stale
+    run (`stale` in the codes) is `fail` too: stale is never waivable, and an
+    early stale exit can hold a gate result computed before the run went stale."""
     passes: dict[str, Any] = {}
     for info in result.passes if result is not None else ():
         model = info.meta.get("model")
@@ -1148,7 +1150,7 @@ def _step_summary_record(
     record: dict[str, Any] = {
         "run_id": ctx.run_id,
         "run_attempt": ctx.run_attempt,
-        "result": result.status if result is not None and publish_error is None else verdict.FAIL,
+        "result": verdict.FAIL if result is None or publish_error is not None or verdict.R_STALE in codes else result.status,
         "reasons": sorted(set(codes)),
         "passes": passes,
     }
@@ -1438,7 +1440,12 @@ def publish(
         if summary.cut:
             full = full_record(ctx, final, bundle_doc)
             log_full_record(full)
-        write_summary(api, ctx, comments, summary.body, written.comment_id)
+        updated = write_summary(api, ctx, comments, summary.body, written.comment_id)
+        # The step summary carries the full record of the comment as it stands:
+        # none when the final summary was not cut, the initial one when the
+        # update failed.
+        if not summary.cut and updated.ok:
+            full = None
 
     # d) exit code
     append_step_summary(step_summary, ctx, final, full=full, publish_error=publish_error)

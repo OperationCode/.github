@@ -3,6 +3,7 @@ transport stands in for api.github.com."""
 
 from __future__ import annotations
 
+import difflib
 import io
 import json
 import re
@@ -14,7 +15,7 @@ from typing import Any, Callable
 
 import pytest
 
-from oc_review import collect, envelope, publish, verdict
+from oc_review import collect, envelope, linediff, publish, verdict
 from oc_review.collect import HttpRequest, HttpResponse
 from oc_review.publish import GitHubApi, PublishContext
 
@@ -1050,6 +1051,157 @@ def test_spend_limit_reason_from_meta(tmp_path):
     text = json.dumps(rec).lower()
     for word in ("cost", "usd", "price", "$", "dollar", "eur"):
         assert word not in text
+
+
+# ---------------------------------------------------------------- stale result record
+
+
+def _stale_after(point):
+    """A hook that makes the run stale at one point after the initial gate."""
+
+    def hook(gh, req):
+        path = urllib.parse.urlsplit(req.url).path
+        if point == "review" and req.method == "GET" and path == f"{API}/pulls/{PR}/comments":
+            gh.head = OTHER
+        if point == "summary" and req.method == "POST" and path.endswith("/reviews"):
+            gh.head = OTHER
+        if point == "review-read-error" and req.method == "GET" and path == f"{API}/pulls/{PR}/comments":
+            gh.fail.add(("GET", f"{API}/pulls/{PR}", "1"))
+        if point == "summary-read-error" and req.method == "POST" and path.endswith("/reviews"):
+            gh.fail.add(("GET", f"{API}/pulls/{PR}", "1"))
+
+    return hook
+
+
+@pytest.mark.parametrize("point", ["review", "summary", "review-read-error", "summary-read-error"])
+def test_stale_exit_records_fail_not_the_earlier_pass(tmp_path, point):
+    # A low inline finding: the initial gate result is pass.
+    r = run(tmp_path, FakeGitHub(after=_stale_after(point)), passes=clean_passes(review=[finding()]))
+    assert r.code == 1
+    assert r.gh.summary_bodies() == []
+    assert r.record["result"] == "fail"
+    assert "stale" in r.record["reasons"]
+
+
+def test_stale_reason_code_alone_records_fail():
+    passed = verdict.GateResult(verdict.PASS, RUN_ID, (), (), None, (), False)
+    assert json.loads(publish._step_summary_record(CTX, passed, []))["result"] == "pass"
+    assert json.loads(publish._step_summary_record(CTX, passed, ["stale"]))["result"] == "fail"
+
+
+# ---------------------------------------------------------------- full record after the final render
+
+
+def _final_render_uncut(monkeypatch):
+    """The first summary is cut; the final one (after the final check) fits."""
+    real = publish.render_summary
+    calls = []
+
+    def render(*args, **kw):
+        calls.append(1)
+        if len(calls) > 1:
+            kw["limit"] = 10**9
+        return real(*args, **kw)
+
+    monkeypatch.setattr(publish, "render_summary", render)
+
+
+def test_final_summary_not_cut_drops_initial_full_record(tmp_path, capsys, monkeypatch):
+    _final_render_uncut(monkeypatch)
+    gh = FakeGitHub(runs=[{"id": RUN_ID, "path": WORKFLOW}, {"id": RUN_ID + 5, "path": WORKFLOW}])
+    r = run(tmp_path, gh, bundle=bundle_doc(delta=dep_delta(700)))
+    first, last = r.gh.summary_bodies()
+    assert publish.TRUNCATED_NOTE in first and publish.TRUNCATED_NOTE not in last
+    assert r.code == 1 and r.record["result"] == "fail"
+    # The comment as it stands is not cut, so the step summary has no full record.
+    assert "Full record (the summary comment was cut)" not in r.step and '"pkg699"' not in r.step
+    assert "gate job log" not in r.step
+
+
+def test_final_summary_update_failed_keeps_initial_full_record(tmp_path, capsys, monkeypatch):
+    _final_render_uncut(monkeypatch)
+    gh = FakeGitHub(runs=[{"id": RUN_ID, "path": WORKFLOW}, {"id": RUN_ID + 5, "path": WORKFLOW}])
+
+    def refuse_update(gh, req):
+        if req.method == "POST" and urllib.parse.urlsplit(req.url).path == f"{API}/issues/{PR}/comments":
+            gh.fail.add(("PATCH", f"{API}/issues/comments/{gh.next_id}", "1"))
+
+    gh.after = refuse_update
+    r = run(tmp_path, gh, bundle=bundle_doc(delta=dep_delta(700)))
+    assert r.code == 1
+    assert r.gh.paths("PATCH")  # the update was tried and refused
+    # The comment still holds the cut first summary, so its full record stays.
+    assert "Full record (the summary comment was cut)" in r.step and '"pkg699"' in r.step
+
+
+# ---------------------------------------------------------------- bounded diff (inline hunks)
+
+
+class _BoundedMatcher(difflib.SequenceMatcher):
+    """Fails a test that runs a line diff past the work budget."""
+
+    def __init__(self, isjunk=None, a="", b="", autojunk=True):
+        assert len(a) * len(b) <= linediff.DIFF_BUDGET, (len(a), len(b))
+        super().__init__(isjunk, a, b, autojunk)
+
+
+@pytest.fixture
+def bounded_diff(monkeypatch):
+    monkeypatch.setattr(difflib, "SequenceMatcher", _BoundedMatcher)
+
+
+def _one_file(base: str, head: str) -> dict:
+    return bundle_doc(files=[{"path": "big.txt", "old_path": None, "status": "modified",
+                              "base_content": base, "head_content": head}])
+
+
+def _reached_the_end(r: Run) -> None:
+    assert r.gh.summary_bodies()  # the summary was posted
+    assert r.gh.paths().count(f"{API}/actions/runs") == 1  # and the final check ran
+    assert r.record["run_id"] == RUN_ID
+
+
+def test_large_common_prefix_gets_exact_inline_hunk(tmp_path, bounded_diff):
+    base = "x\n" * 100_000
+    head = base + "y\n"
+    f = verdict.changed_file("big.txt", base_raw=base, head_raw=head)
+    assert (f.base_hunks, f.head_hunks) == (((99_998, 100_000),), ((99_998, 100_001),))
+    passes = clean_passes(review=[finding(file="big.txt", line=100_001, quote="y")])
+    r = run(tmp_path, bundle=_one_file(base, head), passes=passes)
+    (rv,) = r.gh.bodies("POST", "/reviews")
+    assert [(c["path"], c["line"], c["side"]) for c in rv["comments"]] == [("big.txt", 100_001, "RIGHT")]
+    assert r.code == 0
+    _reached_the_end(r)
+
+
+def test_change_inside_repeated_lines_gets_exact_hunk(bounded_diff):
+    base = "x\n" * 20_000
+    head = "x\n" * 10_000 + "y\n" + "x\n" * 10_000
+    assert verdict.hunks_from_texts(base, head) == (((9_998, 10_003),), ((9_998, 10_004),))
+
+
+def test_diff_past_budget_sends_findings_to_summary(tmp_path, bounded_diff):
+    n = 6_000  # middle 6,002 x 6,002 lines: past the budget
+    assert (n + 2) ** 2 > linediff.DIFF_BUDGET
+    base = "a\n" + "x\n" * n + "b\n"
+    head = "c\n" + "x\n" * n + "d\n"
+    assert verdict.hunks_from_texts(base, head) == ((), ())
+    blocking = finding("malicious", "high", file="big.txt", line=1, quote="c", title="Bad first line")
+    low = finding(file="big.txt", line=n + 2, quote="d", title="Low last line")
+    r = run(tmp_path, bundle=_one_file(base, head), passes=clean_passes(review=[low], supply_chain=[blocking]))
+    assert r.gh.bodies("POST", "/reviews") == []  # no exact hunk, so nothing inline
+    s = r.summary
+    assert "Bad first line" in s and "Low last line" in s  # every finding kept
+    assert r.code == 1 and "blocking-finding" in reason_codes(s)  # and it still blocks
+    _reached_the_end(r)
+
+
+def test_collect_patch_past_budget_is_one_middle_hunk(bounded_diff):
+    base = "a\n" + "x\n" * 6_000 + "b\n"
+    head = "c\n" + "x\n" * 6_000 + "d\n"
+    patch, adds, dels = collect.unified_diff(base, head)
+    assert (adds, dels) == (6_002, 6_002)
+    assert patch.startswith("@@ -1,6002 +1,6002 @@\n")
 
 
 # ---------------------------------------------------------------- never

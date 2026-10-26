@@ -30,7 +30,6 @@ Rules this module keeps:
 from __future__ import annotations
 
 import argparse
-import difflib
 import json
 import math
 import os
@@ -41,13 +40,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from oc_review import deps, envelope, prefilter, render
+from oc_review import deps, envelope, linediff, prefilter, render
 from oc_review.snapshot import (
     MODE_SUBMODULE,
     MODE_SYMLINK,
@@ -108,10 +107,10 @@ BUNDLE_FILE_NAME = "bundle.json"
 
 # Unified diff context lines, as git.
 PATCH_CONTEXT = 3
-# Past this product of middle lengths, the patch is one hunk that removes
-# every base line and adds every head line between the common prefix and
-# suffix: a larger patch than git's, never a wrong one.
-PATCH_DIFF_BUDGET = 25_000_000
+# Past this product of middle lengths (linediff), the patch is one hunk that
+# removes every base line and adds every head line between the common prefix
+# and suffix: a larger patch than git's, never a wrong one.
+PATCH_DIFF_BUDGET = linediff.DIFF_BUDGET
 NO_NEWLINE = "\\ No newline at end of file"
 
 # Signal added by collect (spec "Consistent snapshot"): GitHub's PR view can
@@ -412,50 +411,8 @@ def _git_lines(text: str | None) -> tuple[list[str], bool]:
     return lines, True
 
 
-def _opcodes(a: Sequence[Any], b: Sequence[Any]) -> list[tuple[str, int, int, int, int]]:
-    pre = 0
-    while pre < len(a) and pre < len(b) and a[pre] == b[pre]:
-        pre += 1
-    suf = 0
-    while suf < len(a) - pre and suf < len(b) - pre and a[-1 - suf] == b[-1 - suf]:
-        suf += 1
-    am, bm = a[pre : len(a) - suf], b[pre : len(b) - suf]
-    codes: list[tuple[str, int, int, int, int]] = []
-    if pre:
-        codes.append(("equal", 0, pre, 0, pre))
-    if am or bm:
-        if len(am) * len(bm) <= PATCH_DIFF_BUDGET:
-            middle = difflib.SequenceMatcher(None, am, bm, autojunk=False).get_opcodes()
-        else:
-            middle = [("replace", 0, len(am), 0, len(bm))]
-        codes.extend((tag, i1 + pre, i2 + pre, j1 + pre, j2 + pre) for tag, i1, i2, j1, j2 in middle)
-    if suf:
-        codes.append(("equal", len(a) - suf, len(a), len(b) - suf, len(b)))
-    return codes
-
-
-def _hunks(
-    codes: list[tuple[str, int, int, int, int]], n: int
-) -> Iterator[list[tuple[str, int, int, int, int]]]:
-    """Group opcodes into hunks with `n` lines of context (difflib's rule)."""
-    if not any(tag != "equal" for tag, *_ in codes):
-        return
-    tag, i1, i2, j1, j2 = codes[0]
-    if tag == "equal":
-        codes[0] = (tag, max(i1, i2 - n), i2, max(j1, j2 - n), j2)
-    tag, i1, i2, j1, j2 = codes[-1]
-    if tag == "equal":
-        codes[-1] = (tag, i1, min(i2, i1 + n), j1, min(j2, j1 + n))
-    group: list[tuple[str, int, int, int, int]] = []
-    for tag, i1, i2, j1, j2 in codes:
-        if tag == "equal" and i2 - i1 > 2 * n:
-            group.append((tag, i1, min(i2, i1 + n), j1, min(j2, j1 + n)))
-            yield group
-            group = []
-            i1, j1 = max(i1, i2 - n), max(j1, j2 - n)
-        group.append((tag, i1, i2, j1, j2))
-    if group and not (len(group) == 1 and group[0][0] == "equal"):
-        yield group
+def _opcodes(a: Sequence[Any], b: Sequence[Any]) -> list[linediff.Opcode]:
+    return linediff.opcodes(a, b, PATCH_DIFF_BUDGET)[0]
 
 
 def _range(start: int, stop: int) -> str:
@@ -484,7 +441,7 @@ def unified_diff(base_text: str | None, head_text: str | None) -> tuple[str, int
     out: list[str] = []
     adds = dels = 0
     no_eol = NO_NEWLINE
-    for group in _hunks(_opcodes(a_keys, b_keys), PATCH_CONTEXT):
+    for group in linediff.hunks(_opcodes(a_keys, b_keys), PATCH_CONTEXT):
         out.append(f"@@ -{_range(group[0][1], group[-1][2])} +{_range(group[0][3], group[-1][4])} @@")
         for tag, i1, i2, j1, j2 in group:
             if tag == "equal":
