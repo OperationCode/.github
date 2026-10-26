@@ -42,9 +42,9 @@ Tasks:
 
 - [ ] V6, first: which run counts when one head SHA has several runs. Cases (a) to (g). Use a scratch-only gate job that can pause after its final check.
 - [x] V2: a fork PR run prints its decoded OIDC claims (never the token).
-- [ ] V3: check the intended federation rule against the WIF reference, record the final rule text in the spec, then test it on a test workspace.
-- [ ] V5: one Messages API request with a mid-conversation system message, structured output and server-side fallback.
-- [ ] V9: spend limit behavior on a test workspace with a very small limit.
+- [x] V3: check the intended federation rule against the WIF reference, record the final rule text in the spec, then test it on a test workspace.
+- [x] V5: one Messages API request with a mid-conversation system message, structured output and server-side fallback.
+- [x] V9: spend limit behavior on a test workspace with a very small limit.
 - [x] V13: dependency review on a fork PR with no checkout and SHA refs.
 - [x] V16: push epoch events on a fork PR.
 - [x] V18: fork head trees and blobs through the base repo's git API.
@@ -53,19 +53,19 @@ Tasks:
 
 Owner:
 
-- [ ] Owner: create a scratch source repo in the org for the V tests, separate from claude-review-test.
-- [ ] Owner: Anthropic Console: a dedicated workspace with a hard monthly spend limit and a service account. Create the production federation rule from V3 with the condition shape only; it gets its first SHA in phase 3. No API key.
-- [ ] Owner: a separate eval workspace with its own small spend limit, and a federation rule for `eval.yml` on `workflow_dispatch` in `OperationCode/.github` that also requires the claim `environment: "eval"` (spec "Auth and cost"). Needed before phase 2.
+- [x] Owner: create a scratch source repo in the org for the V tests, separate from claude-review-test ([claude-review-p0-source](https://github.com/OperationCode/claude-review-p0-source)).
+- [ ] Owner: Anthropic Console: a dedicated workspace with a hard monthly spend limit and a service account. Create the production federation rule as in spec "Auth and cost": pattern mode, subject prefix `repo:OperationCode@10479364/*`, scope `workspace:developer`, the review workspace only, and a placeholder SHA in `job_workflow_ref`. Its ID goes into the central code; phase 3 sets the candidate SHA. No API key.
+- [ ] Owner: a separate eval workspace with its own small spend limit, and a federation rule for `eval.yml` on `workflow_dispatch` in `OperationCode/.github` that also requires the claim `environment: "eval"`: pattern mode, the same subject prefix, scope `workspace:developer`, the eval workspace only (spec "Auth and cost"). Test it once. Needed before phase 2.
 - [ ] Owner: on `.github`, create the GitHub environment `eval`: the owner is a required reviewer for every run, and any branch may deploy to it. Turn on "prevent self-review" so the PR author cannot approve their own eval run. Before approving a run, check that the PR does not change `eval.yml`, the eval code, the prompts, the fixtures or the federation setup in a harmful way, and that `test.yml` passed. The approval is the control; the residual risk is an approver who approves without reading. Exception to the no-execute rule (K-4): evals of PRs to this repo may run that PR's code, only after an owner approves the `eval` environment run. Needed before phase 2.
-- [ ] Owner: a test workspace with a very small spend limit for V9.
+- [x] Owner: a test workspace with a very small spend limit for V9.
 - [ ] Owner: the test org ruleset for V6 that targets only claude-review-test.
 - [ ] Owner: a Dependabot PR in claude-review-test for V4.
 
 Exit criteria:
 
 - [x] V6 shows that the newest run on the head SHA decides. If not, building stops. (The queued cell is still open.)
-- [ ] V2 and V3 pass. If not, building stops.
-- [ ] V4, V5, V9, V13, V16, V18 and V24 have results in the spec. A fallback in the spec covers each one that failed.
+- [x] V2 and V3 pass. If not, building stops.
+- [x] V4, V5, V9, V13, V16, V18 and V24 have results in the spec. A fallback in the spec covers each one that failed.
 
 ## Phase 1: build in this repo
 
@@ -91,10 +91,10 @@ Depends on: none for most tasks; V18 for `collect.py`, V16 for the push epoch in
 
 ### 1b. Analyze and publish
 
-- [ ] `analyze.py`: one Messages API call per pass, no tools, `claude-opus-5-5`, explicit `effort` and `max_tokens`, structured output, fallback, at most 2 retries, a request deadline, stale check before the calls. Always writes exactly three pass records. Tests use a fake client.
+- [ ] `analyze.py`: one Messages API call per pass, no tools, `claude-opus-5-5`, explicit `effort` and `max_tokens`, structured output with the stripped schema and a full schema check in code (V5), fallback, at most 2 retries, a request deadline, stale check before the calls. The spend limit error (HTTP 400 `invalid_request_error`, "workspace API usage limits") is an outage with its own clear reason, not a request bug (V9). Always writes exactly three pass records. Tests use a fake client.
 - [ ] `publish.py`: escaping, inline `COMMENT` review, sticky summary, final check, exit code (0 only for `pass`). It never approves, requests changes, merges, closes, labels or edits the PR (spec decision K-1).
 
-Depends on: V3, V5 (analyze); V6, V16, V24 (publish).
+Depends on: V3, V5, V9 (analyze); V6, V16, V24 (publish).
 
 ### 1c. Central workflow
 
@@ -149,7 +149,7 @@ Run the spec's workflow acceptance tests under a test org ruleset that requires 
 
 Owner:
 
-- [ ] Owner: add the candidate release SHA to the production federation rule.
+- [ ] Owner: set `job_workflow_ref` of the production federation rule to the candidate release SHA. The candidate's code must name that rule ID (spec "Auth and cost", "Each release").
 - [ ] Owner: an account outside the org opens the fork PRs.
 - [ ] Owner: test users with Write, Maintain and Admin on claude-review-test for V25.
 
@@ -165,7 +165,7 @@ Exit criteria:
 - [ ] Owner: before a repo joins the pilot, give it its own approval protection on the default branch: a repo ruleset or branch protection with at least 1 approval, code owner review and dismiss stale approvals on push. `back-end` has none today.
 - [ ] Owner: before a repo joins the pilot, check it for people or bots that push to the default branch directly (V25).
 - [ ] Owner: accept that during the pilot a maintainer or repo admin can merge past any failed run, also on their own PR (spec "Pilot and enforcement").
-- [ ] Owner: confirm the release SHA is in the federation rule.
+- [ ] Owner: confirm that the federation rule named in the release code has `job_workflow_ref` at the release SHA.
 - [ ] Owner: create the pilot ruleset. Only the rule "Require workflows to pass before merging" with the central workflow `repository_id`, path and release SHA. Targets: the pilot repos by name (first `back-end`), default branch. Bypass in `pull_request` mode: the Maintain and Admin repository roles, and org admins.
 - [ ] Owner: read the pilot ruleset back through the [org rules API](https://docs.github.com/en/rest/orgs/rules#get-an-organization-repository-ruleset). Check `repository_id`, path, `sha`, no `ref`, and the role `actor_id` values from V25. Then enable it.
 - [ ] Owner: require 2FA for all org members.
@@ -218,6 +218,10 @@ Exit criteria:
 ## Each release (from phase 4 on)
 
 - [ ] Run unit tests, and the fixture eval when prompts or the model change (it gates the merge of that change).
-- [ ] Owner: add the new SHA to the production federation rule.
+One federation rule allows one SHA (spec "Auth and cost", "Each release"):
+
+- [ ] Owner: create a new federation rule as a copy of the current one, with a placeholder SHA in `job_workflow_ref`.
+- [ ] Put the new rule ID in the central code. That commit is the release SHA.
+- [ ] Owner: set `job_workflow_ref` of the new rule to the release SHA.
 - [ ] Owner: move the pin of every ruleset that requires the workflow (the pilot ruleset, the org ruleset, or both), then read each back: `repository_id`, path, `sha`, no `ref`.
-- [ ] Owner: remove the previous SHA from the federation rule once open PRs have new runs (V22).
+- [ ] Owner: delete the old federation rule once open PRs have new runs (V22).
