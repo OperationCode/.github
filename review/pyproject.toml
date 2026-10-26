@@ -5,7 +5,8 @@ description = "OperationCode Claude PR review: collect, analyze and publish code
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "anthropic>=1,<2",
+    "anthropic>=1.17,<2",
+    "httpx2>=2.16,<3",
     "jsonschema>=4.23",
     "pyyaml>=6",
 ]
