@@ -659,7 +659,7 @@ def test_summary_under_limit_and_cut_in_order(tmp_path):
     for i in range(5):
         assert f"high malicious {i}" in s
     # The full JSON goes to the step summary.
-    assert "Full findings (the summary comment was cut)" in r.step
+    assert "Full record (the summary comment was cut)" in r.step
     assert "low bug 9" in r.step
 
 
@@ -676,9 +676,157 @@ def test_fit_cut_order():
     assert not cut
     text, cut = publish._fit(blocks, len(full) - 400)
     assert cut and "u" * 500 not in text and "l" * 500 in text
+    assert len(text) <= len(full) - 400
     text, cut = publish._fit(blocks, len(full) - 1300)
     assert "u" * 500 not in text and "l" * 500 not in text and "d" * 500 not in text and "s" * 500 in text
     assert text.count(publish.TRUNCATED_NOTE) == 3
+    # The size bookkeeping matches the joined text at every limit.
+    many = [B("keep")] + [B("x" * (i % 7), publish.CUT_ORDER[i % 4], f"g{i % 3}") for i in range(40)]
+    for limit in range(0, 400):
+        text, _ = publish._fit(many, limit)
+        assert text is None or len(text) <= limit
+
+
+def test_fit_never_cuts_unranked_blocks():
+    B = publish._Block
+    blocks = [B("r" * 500), B("d" * 100, publish.CUT_DEPENDENCY, "dependency")]
+    assert publish._fit(blocks, 300) == (None, True)
+
+
+# ---------------------------------------------------------------- protected data (D8)
+
+
+def hard_blocks(n, pad=0):
+    return [{"id": "foreign-source", "level": "hard_block", "detail": "git dependency",
+             "file": f"p{i:04d}/{'z' * pad}package.json", "subject": None, "lines": [], "count": 1}
+            for i in range(n)]
+
+
+def dep_delta(n):
+    changes = [{"path": "package-lock.json", "ecosystem": "npm", "name": f"pkg{i}", "old_versions": ["1.0.0"],
+                "new_version": "1.0.1", "source": {"kind": "registry", "normalized": "registry.npmjs.org"},
+                "direct": True, "has_install_script": False, "registry": None} for i in range(n)]
+    return {"changes": changes, "new_global_sources": [], "failures": []}
+
+
+def full_record_from_log(out: str) -> dict:
+    """The full record printed to the job log, between stop-commands markers."""
+    m = re.search(r"^::stop-commands::([0-9a-f]{32})\n[^\n]*\n(.*)\n::\1::$", out, re.M | re.S)
+    assert m, out[-2000:]
+    return json.loads(m.group(2))
+
+
+def test_reasons_kept_when_cuttable_data_is_cut(tmp_path, capsys):
+    r = run(tmp_path, bundle=bundle_doc(hard_blocks=hard_blocks(60), delta=dep_delta(700)))
+    s = r.summary
+    assert r.code == 1
+    assert publish.TRUNCATED_NOTE in s and "pkg699" not in s
+    shown = re.findall(r"^- prefilter-hard-block \(not waivable\): foreign-source in p(\d{4})/", plain(s), re.M)
+    assert shown == [f"{i:04d}" for i in range(60)]
+    assert s.rstrip().endswith("The result that counts is the required workflow in the merge box.")
+
+
+def test_reasons_that_do_not_fit_fail_closed(tmp_path, capsys):
+    r = run(tmp_path, bundle=bundle_doc(hard_blocks=hard_blocks(400, pad=200)))
+    s = r.summary
+    assert r.code == 1
+    assert len(s) < publish.SUMMARY_MAX_CHARS
+    assert "## OC Claude review: fail" in s and publish.OVERFLOW_NOTE in s
+    assert f"head SHA `{HEAD}`" in s and f"merge base `{MB}`" in s
+    assert "- prefilter-hard-block (not waivable): 400 reason(s)" in s
+    # No partial reason list: either every reason or none.
+    assert "p0000" not in s
+    rec = full_record_from_log(capsys.readouterr().out)
+    shown = [x["detail"][len("foreign-source in p"):][:4] for x in rec["reasons"]]
+    assert shown == [f"{i:04d}" for i in range(400)]
+    assert r.record["result"] == "fail" and r.record["publish_error"]
+
+
+def test_overrides_that_do_not_fit_fail_closed(tmp_path, capsys):
+    comments = [override(i, reason=f"reason {i:03d} " + "y" * 240) for i in range(1, 301)]
+    r = run(tmp_path, FakeGitHub(issue_comments=comments), passes=clean_passes(supply_chain=[BLOCKING]))
+    assert r.code == 1  # the override waives the finding, but the summary cannot show it
+    s = r.summary
+    assert publish.OVERFLOW_NOTE in s and "300 valid override(s)" in s
+    rec = full_record_from_log(capsys.readouterr().out)
+    assert [o["reason"][:10] for o in rec["overrides"]][-1] == "reason 300"
+    assert len(rec["overrides"]) == 300 and rec["override_applied"] is True
+
+
+def test_many_overrides_that_fit_are_all_listed(tmp_path):
+    comments = [override(i, reason=f"reason {i:03d}") for i in range(1, 101)]
+    r = run(tmp_path, FakeGitHub(issue_comments=comments), passes=clean_passes(supply_chain=[BLOCKING]),
+            bundle=bundle_doc(delta=dep_delta(700)))
+    assert r.code == 0
+    s = r.summary
+    assert publish.TRUNCATED_NOTE in s
+    for i in range(1, 101):
+        assert f"reason {i:03d} ([comment]" in s, i
+    assert s.rstrip().endswith("The result that counts is the required workflow in the merge box.")
+
+
+def test_cut_data_is_in_the_run_log(tmp_path, capsys):
+    signals = [{"id": "long-line", "level": "signal", "detail": "x" * 300, "file": f"f{i}.js", "subject": None,
+                "lines": [1], "count": 1} for i in range(300)]
+    r = run(tmp_path, bundle=bundle_doc(signals=signals, delta=dep_delta(700)))
+    s = r.summary
+    assert r.code == 0
+    assert f"item(s) {publish.TRUNCATED_NOTE}" in s and "pkg699" not in s and "f299.js" not in plain(s)
+    rec = full_record_from_log(capsys.readouterr().out)
+    assert [c["name"] for c in rec["dependency_delta"]["changes"]] == [f"pkg{i}" for i in range(700)]
+    assert [x["file"] for x in rec["prefilter"]["signals"]][-1] == "f299.js"
+    # Under the cap, the step summary has the same full record.
+    assert "Full record (the summary comment was cut)" in r.step and '"pkg699"' in r.step
+
+
+def test_full_record_over_step_summary_cap_names_the_job_log(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(publish, "STEP_SUMMARY_FULL_MAX", 1000)
+    r = run(tmp_path, bundle=bundle_doc(delta=dep_delta(700)))
+    assert '"pkg699"' not in r.step and "gate job log" in r.step
+    assert full_record_from_log(capsys.readouterr().out)["dependency_delta"]["changes"][-1]["name"] == "pkg699"
+
+
+# ---------------------------------------------------------------- write failures and late staleness
+
+
+@pytest.mark.parametrize("trigger", ["runs", "permission"])
+def test_stale_before_final_summary_update_writes_nothing(tmp_path, trigger):
+    perm_reads = []
+
+    def push(gh, req):
+        path = urllib.parse.urlsplit(req.url).path
+        if trigger == "runs" and req.method == "GET" and path == f"{API}/actions/runs":
+            gh.head = OTHER
+        if trigger == "permission" and "/collaborators/" in path:
+            perm_reads.append(path)
+            if len(perm_reads) == 2:  # the read at the final check
+                gh.head = OTHER
+
+    gh = FakeGitHub(after=push, runs=[{"id": RUN_ID, "path": WORKFLOW}, {"id": RUN_ID + 1, "path": WORKFLOW}])
+    kw: dict[str, Any] = {}
+    if trigger == "permission":
+        gh.issue_comments = [override(1)]
+        kw["passes"] = clean_passes(supply_chain=[BLOCKING])
+    r = run(tmp_path, gh, **kw)
+    assert r.code == 1
+    assert len(r.gh.summary_bodies()) == 1 and "## OC Claude review: pass" in r.summary
+    assert r.gh.paths("PATCH") == []
+    assert "stale" in r.record["reasons"]
+
+
+@pytest.mark.parametrize("method", ["POST", "PATCH"])
+def test_refused_summary_write_fails_closed(tmp_path, method):
+    gh = FakeGitHub()
+    if method == "POST":
+        gh.fail = {("POST", f"{API}/issues/{PR}/comments", "1")}
+    else:
+        gh.issue_comments = [api_comment(77, BOT, f"{verdict.STICKY_MARKER}\nold", type="Bot")]
+        gh.fail = {("PATCH", f"{API}/issues/comments/77", "1")}
+    r = run(tmp_path, gh)
+    assert r.code == 1
+    assert r.record["result"] == "fail" and r.record["publish_error"] == "the summary write failed"
+    assert r.gh.paths().count(f"{API}/actions/runs") == 1  # the final reads still ran
+    assert "publish_error" not in run(tmp_path / "ok").record
 
 
 # ---------------------------------------------------------------- overrides

@@ -44,6 +44,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import string
 import sys
 import unicodedata
@@ -755,17 +756,23 @@ def build_review(
 # leaves room for the truncation notes.
 SUMMARY_MAX_CHARS = 65_536
 SUMMARY_LIMIT = 64_000
+# The cut data is in the gate job log (`log_full_record`) and, under its cap,
+# in the step summary.
 TRUNCATED_NOTE = "truncated, see the run log"
+OVERFLOW_NOTE = (
+    "The summary does not fit in one comment, even after every permitted cut. "
+    "Reasons, SHAs and override data are never cut, so this run fails closed."
+)
 
 # Cut order (D8): unverified findings, low and medium findings, dependency
-# delta, signals. Past D8, as a last resort: high and critical findings, the
-# model summaries, hard block and coverage details, and then the reasons list.
+# delta, signals. Every other block has no rank and is never cut: reasons,
+# result, SHAs, override data, and also the blocks D8 does not list (high and
+# critical findings, model summaries, hard block and coverage details).
 CUT_UNVERIFIED = 0
 CUT_LOW_MEDIUM = 1
 CUT_DEPENDENCY = 2
 CUT_SIGNALS = 3
-CUT_LAST = 4
-CUT_REASONS = 5
+CUT_ORDER = (CUT_UNVERIFIED, CUT_LOW_MEDIUM, CUT_DEPENDENCY, CUT_SIGNALS)
 
 
 @dataclass
@@ -775,39 +782,40 @@ class _Block:
     group: str = ""
 
 
-def _fit(blocks: Sequence[_Block], limit: int) -> tuple[str, bool]:
-    """Join blocks; cut by rank, from the end of each rank, until it fits.
-    Each group that lost blocks gets one note where its first cut block was."""
+def _cut_note(n: int) -> str:
+    return f"- {n} item(s) {TRUNCATED_NOTE}."
+
+
+def _fit(blocks: Sequence[_Block], limit: int) -> tuple[str | None, bool]:
+    """Join blocks; cut by rank in `CUT_ORDER`, from the end of each rank,
+    until it fits. Each group that lost blocks gets one note where its first
+    cut block was. The space left after the never-cut blocks is the budget of
+    the cut ranks. Returns (None, True) when the never-cut blocks alone do not
+    fit: the caller fails closed (D8)."""
     keep = [True] * len(blocks)
-
-    def render() -> str:
-        cut: dict[str, int] = {}
-        for b, k in zip(blocks, keep):
-            if not k:
-                cut[b.group] = cut.get(b.group, 0) + 1
-        out: list[str] = []
-        for b, k in zip(blocks, keep):
-            if k:
-                out.append(b.text)
-            elif cut.pop(b.group, None) is not None:
-                n = sum(1 for c, kk in zip(blocks, keep) if not kk and c.group == b.group)
-                out.append(f"- {n} item(s) {TRUNCATED_NOTE}.")
-        return "\n".join(out)
-
-    text = render()
-    if len(text) <= limit:
-        return text, False
-    for rank in sorted({b.rank for b in blocks if b.rank is not None}):
+    cut: dict[str, int] = {}
+    size = sum(len(b.text) + 1 for b in blocks) - 1  # joined with "\n"
+    for rank in CUT_ORDER:
         for i in reversed(range(len(blocks))):
-            if blocks[i].rank == rank and keep[i]:
-                keep[i] = False
-                text = render()
-                if len(text) <= limit:
-                    return text, True
-    text = render()
-    if len(text) > limit:  # only never-cut blocks are left
-        text = text[: limit - 40].rstrip() + f"\n\n{TRUNCATED_NOTE}."
-    return text, True
+            if size <= limit:
+                break
+            b = blocks[i]
+            if b.rank != rank:
+                continue
+            keep[i] = False
+            n = cut.get(b.group, 0)
+            size -= len(b.text) + 1
+            size += len(_cut_note(n + 1)) + 1 - (len(_cut_note(n)) + 1 if n else 0)
+            cut[b.group] = n + 1
+    if size > limit:
+        return None, True
+    out: list[str] = []
+    for b, k in zip(blocks, keep):
+        if k:
+            out.append(b.text)
+        elif b.group in cut:
+            out.append(_cut_note(cut.pop(b.group)))
+    return "\n".join(out), not all(keep)
 
 
 def _waivable(r: verdict.Reason) -> str:
@@ -845,7 +853,7 @@ def _finding_where(f: verdict.CitedFinding) -> str:
 def _finding_block(f: verdict.CitedFinding, inline: InlineOutcome) -> _Block:
     key = finding_key(f)
     head = f"- {_finding_line(f)}, at {_finding_where(f)}: {_esc('title', f.title)}"
-    rank = CUT_LAST if f.severity in verdict.BLOCKING_SEVERITIES else CUT_LOW_MEDIUM
+    rank = None if f.severity in verdict.BLOCKING_SEVERITIES else CUT_LOW_MEDIUM
     group = f"findings-{f.pass_name}"
     if not f.verified:
         return _Block(
@@ -877,7 +885,7 @@ def _finding_block(f: verdict.CitedFinding, inline: InlineOutcome) -> _Block:
     )
 
 
-def _check_block(item: Any, rank: int, group: str) -> _Block | None:
+def _check_block(item: Any, rank: int | None, group: str) -> _Block | None:
     if not isinstance(item, Mapping):
         return None
     text = f"- {_esc('label', item.get('id'))}: {_esc('evidence', item.get('detail'))}"
@@ -959,11 +967,62 @@ def _coverage_blocks(cov: Any) -> list[_Block]:
             out.append(
                 _Block(
                     f"- unavailable: {_esc('path', f.get('path'))}: {_esc('reason', f.get('reason'))}",
-                    CUT_LAST,
-                    "coverage",
                 )
             )
     return out
+
+
+@dataclass(frozen=True)
+class RenderedSummary:
+    """The sticky summary body. `cut`: D8 cuts were made (the full record goes
+    to the run log). `overflow`: the never-cut data did not fit, so the body is
+    the short fail-closed notice and the run must fail."""
+
+    body: str
+    cut: bool
+    overflow: bool = False
+
+
+def _header_lines(ctx: PublishContext, result: verdict.GateResult, status: str) -> list[str]:
+    snap = result.snapshot
+    if snap is not None:
+        computed = (
+            f"Computed for head SHA `{snap.head_sha}`, merge base `{snap.merge_base_sha}`, "
+            f"base ref {_esc('ref', snap.base_ref)}."
+        )
+    else:
+        computed = f"No valid bundle. Event head SHA `{ctx.head_sha}`, merge base unknown."
+    return [
+        verdict.STICKY_MARKER,
+        f"## OC Claude review: {status}",
+        f"Result for run [{ctx.run_id}]({ctx.run_url}), attempt {ctx.run_attempt}.",
+        computed,
+        "The result that counts is the required workflow in the merge box.",
+    ]
+
+
+def _overflow_body(ctx: PublishContext, result: verdict.GateResult) -> str:
+    """The fail-closed notice when the never-cut data does not fit (D8). It
+    has a fixed size: the result, the SHAs, a count per reason code and the
+    override count. The full record is in the run log."""
+    counts: dict[str, int] = {}
+    for r in result.reasons:
+        counts[r.code] = counts.get(r.code, 0) + 1
+    lines = _header_lines(ctx, result, verdict.FAIL)
+    lines += ["\n### Summary too large", OVERFLOW_NOTE]
+    lines.append(
+        f"The computed gate result was {result.status}. The full record (every reason, override, "
+        "finding and prefilter result) is in the run log."
+    )
+    lines.append("\n### Reasons")
+    if not counts:
+        lines.append("No reason applies.")
+    for code in sorted(counts):
+        waivable = "waivable by override" if verdict.WAIVABLE[code] else "not waivable"
+        lines.append(f"- {code} ({waivable}): {counts[code]} reason(s)")
+    lines.append(f"\n### Override\n{len(result.valid_overrides)} valid override(s).")
+    lines.append(f"\n[Workflow run]({ctx.run_url}). The result that counts is the required workflow in the merge box.")
+    return "\n".join(lines)
 
 
 def render_summary(
@@ -973,31 +1032,17 @@ def render_summary(
     bundle: Mapping[str, Any] | None,
     inline: InlineOutcome,
     limit: int = SUMMARY_LIMIT,
-) -> tuple[str, bool]:
-    """The sticky summary body and whether it was cut (D8). Every untrusted
-    string goes through `escape_field`."""
-    b: list[_Block] = []
+) -> RenderedSummary:
+    """The sticky summary body (D8). Every untrusted string goes through
+    `escape_field`."""
+    b: list[_Block] = [_Block(line) for line in _header_lines(ctx, result, result.status)]
     add = b.append
-    add(_Block(verdict.STICKY_MARKER))
-    add(_Block(f"## OC Claude review: {result.status}"))
-    add(_Block(f"Result for run [{ctx.run_id}]({ctx.run_url}), attempt {ctx.run_attempt}."))
-    snap = result.snapshot
-    if snap is not None:
-        add(
-            _Block(
-                f"Computed for head SHA `{snap.head_sha}`, merge base `{snap.merge_base_sha}`, "
-                f"base ref {_esc('ref', snap.base_ref)}."
-            )
-        )
-    else:
-        add(_Block(f"No valid bundle. Event head SHA `{ctx.head_sha}`, merge base unknown."))
-    add(_Block("The result that counts is the required workflow in the merge box."))
 
     add(_Block("\n### Reasons"))
     if not result.reasons:
         add(_Block("No reason applies."))
     for r in result.reasons:
-        add(_Block(f"- {r.code} ({_waivable(r)}): {_esc('reason', r.detail)}", CUT_REASONS, "reasons"))
+        add(_Block(f"- {r.code} ({_waivable(r)}): {_esc('reason', r.detail)}"))
 
     if result.override_command is not None:
         add(_Block("\n### Override"))
@@ -1028,7 +1073,7 @@ def render_summary(
     if isinstance(payload, Mapping):
         pre = payload.get("prefilter") if isinstance(payload.get("prefilter"), Mapping) else {}
         add(_Block("\n### Prefilter (code, no LLM)"))
-        hard = [x for x in (_check_block(i, CUT_LAST, "hard-blocks") for i in pre.get("hard_blocks") or ()) if x]
+        hard = [x for x in (_check_block(i, None, "hard-blocks") for i in pre.get("hard_blocks") or ()) if x]
         sig = [x for x in (_check_block(i, CUT_SIGNALS, "signals") for i in pre.get("signals") or ()) if x]
         add(_Block(f"Hard blocks: {len(hard)}."))
         b.extend(hard)
@@ -1058,7 +1103,7 @@ def render_summary(
             line += f", {_esc('reason', reason)}"
         add(_Block(line))
         if info.summary:
-            add(_Block(f"Model summary: {_esc('summary', info.summary)}", CUT_LAST, f"summary-{name}"))
+            add(_Block(f"Model summary: {_esc('summary', info.summary)}"))
         verified = [f for f in result.findings if f.pass_name == name and f.verified]
         if not verified:
             add(_Block("No verified findings."))
@@ -1080,12 +1125,18 @@ def render_summary(
         add(_Block(f"- {info.name}: {_usage_text(nums)}"))
     add(_Block(f"- total: {_usage_text(totals)}"))
     add(_Block(f"\n[Workflow run]({ctx.run_url}). The result that counts is the required workflow in the merge box."))
-    return _fit(b, limit)
+    body, cut = _fit(b, limit)
+    if body is None:
+        return RenderedSummary(_overflow_body(ctx, result), True, overflow=True)
+    return RenderedSummary(body, cut)
 
 
-def _step_summary_record(ctx: PublishContext, result: verdict.GateResult | None, codes: Sequence[str]) -> str:
+def _step_summary_record(
+    ctx: PublishContext, result: verdict.GateResult | None, codes: Sequence[str], publish_error: str | None = None
+) -> str:
     """One JSON line: run, result, reason codes and token counts per pass (D6).
-    Only integers and fixed names, so no fence escape is needed."""
+    Only integers and fixed names, so no fence escape is needed. A failed
+    publication makes the result `fail` and adds `publish_error`."""
     passes: dict[str, Any] = {}
     for info in result.passes if result is not None else ():
         model = info.meta.get("model")
@@ -1094,13 +1145,15 @@ def _step_summary_record(ctx: PublishContext, result: verdict.GateResult | None,
             "model": re.sub(r"[^A-Za-z0-9._:-]", "", model)[:100] if isinstance(model, str) else None,
             "usage": _usage_numbers(info.meta),
         }
-    record = {
+    record: dict[str, Any] = {
         "run_id": ctx.run_id,
         "run_attempt": ctx.run_attempt,
-        "result": result.status if result is not None else verdict.FAIL,
+        "result": result.status if result is not None and publish_error is None else verdict.FAIL,
         "reasons": sorted(set(codes)),
         "passes": passes,
     }
+    if publish_error is not None:
+        record["publish_error"] = publish_error
     return json.dumps(record, ensure_ascii=True, separators=(",", ":"))
 
 
@@ -1110,6 +1163,7 @@ def _fence(text: str) -> str:
     return f"{fence}\n{text}\n{fence}"
 
 
+# GitHub caps the step summary of one step at 1 MiB.
 STEP_SUMMARY_FULL_MAX = 512 * 1024
 
 
@@ -1123,31 +1177,68 @@ def _redact_strings(value: Any) -> Any:
     return value
 
 
-def _full_findings_json(result: verdict.GateResult) -> str:
-    """Every finding as JSON with credentials redacted, for the step summary
-    when the comment was cut (D8)."""
-    doc = [
-        {
-            "pass": f.pass_name,
-            "category": f.category,
-            "severity": f.severity,
-            "confidence": f.confidence,
-            "file": f.file,
-            "side": f.side,
-            "line": f.line,
-            "title": f.title,
-            "explanation": f.explanation,
-            "quote": f.quote,
-            "verified": f.verified,
-            "inline": f.inline,
-            "unverified_reason": f.unverified_reason,
-        }
-        for f in result.findings
-    ]
-    text = json.dumps(_redact_strings(doc), ensure_ascii=True, indent=1)
-    if len(text) > STEP_SUMMARY_FULL_MAX:
-        text = text[:STEP_SUMMARY_FULL_MAX] + f"\n... {TRUNCATED_NOTE}"
-    return text
+def full_record(ctx: PublishContext, result: verdict.GateResult, bundle: Mapping[str, Any] | None) -> str:
+    """Everything the summary shows, as JSON with credentials redacted: the
+    reasons, the overrides, every finding, and the bundle's prefilter results,
+    coverage and dependency delta. For the run log when the comment was cut (D8)."""
+    payload = None
+    if bundle is not None and bundle.get("status") in verdict.BUNDLE_PAYLOAD_STATUSES:
+        payload = bundle.get("payload")
+    payload = payload if isinstance(payload, Mapping) else {}
+    snap = result.snapshot
+    doc = {
+        "run_id": ctx.run_id,
+        "run_attempt": ctx.run_attempt,
+        "result": result.status,
+        "head_sha": snap.head_sha if snap is not None else ctx.head_sha,
+        "merge_base_sha": snap.merge_base_sha if snap is not None else None,
+        "base_ref": snap.base_ref if snap is not None else None,
+        "reasons": [{"code": r.code, "waivable": r.waivable, "detail": r.detail} for r in result.reasons],
+        "override_applied": result.override_applied,
+        "waived": [r.code for r in result.waived],
+        "overrides": [
+            {
+                "author": c.author_login,
+                "created_at": c.created_at.isoformat(),
+                "reason": c.reason,
+                "comment_url": ctx.comment_url(c.comment_id),
+            }
+            for c in result.valid_overrides
+        ],
+        "findings": [
+            {
+                "pass": f.pass_name,
+                "category": f.category,
+                "severity": f.severity,
+                "confidence": f.confidence,
+                "file": f.file,
+                "side": f.side,
+                "line": f.line,
+                "title": f.title,
+                "explanation": f.explanation,
+                "quote": f.quote,
+                "verified": f.verified,
+                "inline": f.inline,
+                "unverified_reason": f.unverified_reason,
+            }
+            for f in result.findings
+        ],
+        "prefilter": payload.get("prefilter"),
+        "coverage": payload.get("coverage"),
+        "dependency_delta": payload.get("dependency_delta"),
+    }
+    return json.dumps(_redact_strings(doc), ensure_ascii=True, indent=1)
+
+
+def log_full_record(text: str) -> None:
+    """Print the full record to the gate job log: the "run log" that each cut
+    note names. The record holds untrusted text, so workflow commands are
+    stopped while it prints (`::stop-commands::` with a random token)."""
+    token = secrets.token_hex(16)
+    print(f"::stop-commands::{token}")
+    print("oc-claude-review full record (the summary comment was cut):")
+    print(text)
+    print(f"::{token}::", flush=True)
 
 
 def append_step_summary(
@@ -1157,14 +1248,18 @@ def append_step_summary(
     *,
     codes: Sequence[str] = (),
     full: str | None = None,
+    publish_error: str | None = None,
 ) -> None:
-    """Append the JSON line (spec "Cost reporting": token counts, no currency)."""
+    """Append the JSON line (spec "Cost reporting": token counts, no currency),
+    and the full record when the summary was cut and it fits under the cap."""
     if not path:
         return
     codes = list(codes) or ([r.code for r in result.reasons] if result is not None else [])
-    parts = ["oc-claude-review record:", _fence(_step_summary_record(ctx, result, codes))]
-    if full is not None:
-        parts += ["Full findings (the summary comment was cut):", _fence(full)]
+    parts = ["oc-claude-review record:", _fence(_step_summary_record(ctx, result, codes, publish_error))]
+    if full is not None and len(full) <= STEP_SUMMARY_FULL_MAX:
+        parts += ["Full record (the summary comment was cut):", _fence(full)]
+    elif full is not None:
+        parts.append("The summary comment was cut. The full record is over the step summary cap; it is in the gate job log.")
     try:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write("\n\n".join(parts) + "\n")
@@ -1177,28 +1272,37 @@ def append_step_summary(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class SummaryWrite:
+    """The result of one summary write. `comment_id` can be None after a
+    successful POST whose response has no usable id."""
+
+    ok: bool
+    comment_id: int | None = None
+
+
 def write_summary(
     api: GitHubApi,
     ctx: PublishContext,
     comments: Sequence[verdict.Comment],
     body: str,
     sticky_id: int | None = None,
-) -> int | None:
-    """PATCH the bot's sticky comment, or POST a new one. Best effort: returns
-    the comment id, or None when the write failed."""
+) -> SummaryWrite:
+    """PATCH the bot's sticky comment, or POST a new one. Never raises; a
+    refused write gives `ok=False`."""
     if sticky_id is None:
         sticky = verdict.find_sticky_comment(comments)
         sticky_id = sticky.id if sticky is not None else None
     try:
         if sticky_id is not None:
             api.write("PATCH", f"{ctx.repo_path}/issues/comments/{sticky_id}", {"body": body})
-            return sticky_id
+            return SummaryWrite(True, sticky_id)
         doc = api.write("POST", f"{ctx.repo_path}/issues/{ctx.pr_number}/comments", {"body": body})
     except WriteError as exc:
         print(f"publish: summary write failed: {exc}", file=sys.stderr)
-        return None
+        return SummaryWrite(False)
     cid = doc.get("id")
-    return cid if isinstance(cid, int) and not isinstance(cid, bool) else None
+    return SummaryWrite(True, cid if isinstance(cid, int) and not isinstance(cid, bool) else None)
 
 
 def post_inline_review(
@@ -1295,8 +1399,19 @@ def publish(
         append_step_summary(step_summary, ctx, result, codes=[*result.codes, verdict.R_STALE])
         return 1
     bundle_doc = bundle_read.envelope if bundle_read.error is None else None
-    body, cut = render_summary(ctx, result, bundle=bundle_doc, inline=inline)
-    sticky_id = write_summary(api, ctx, comments, body)
+    summary = render_summary(ctx, result, bundle=bundle_doc, inline=inline)
+    full = full_record(ctx, result, bundle_doc) if summary.cut else None
+    if full is not None:
+        log_full_record(full)
+    written = write_summary(api, ctx, comments, summary.body)
+    # The summary must be published in full (spec acceptance: a refused
+    # summary write leaves the run failed; D8: never-cut data that does not
+    # fit fails closed). This is not a gate reason, so no override applies.
+    publish_error = None
+    if not written.ok:
+        publish_error = "the summary write failed"
+    elif summary.overflow:
+        publish_error = "the summary is over the comment limit"
 
     # c) final check: snapshot, override authority and run list read again
     check = check_snapshot(api, ctx, snap)
@@ -1305,15 +1420,32 @@ def publish(
     final = verdict.final_check(result, revalidation=check.revalidation, overrides=overrides, runs=runs)
     if check.blocks_writes:
         print(f"publish: {check.describe()} at the final check; no sticky update", file=sys.stderr)
-        append_step_summary(step_summary, ctx, final, codes=[*final.codes, verdict.R_STALE])
+        append_step_summary(
+            step_summary, ctx, final, codes=[*final.codes, verdict.R_STALE], full=full, publish_error=publish_error
+        )
         return 1
     if result.passed and not final.passed:
-        body, cut = render_summary(ctx, final, bundle=bundle_doc, inline=inline)
-        write_summary(api, ctx, comments, body, sticky_id)
+        # Best effort: the exit code is non-zero whatever this write does. The
+        # reads above can take many pages, so check the snapshot once more.
+        summary = render_summary(ctx, final, bundle=bundle_doc, inline=inline)
+        check = check_snapshot(api, ctx, snap)
+        if check.blocks_writes:
+            print(f"publish: {check.describe()} before the summary update; no more writes", file=sys.stderr)
+            append_step_summary(
+                step_summary, ctx, final, codes=[*final.codes, verdict.R_STALE], full=full, publish_error=publish_error
+            )
+            return 1
+        if summary.cut:
+            full = full_record(ctx, final, bundle_doc)
+            log_full_record(full)
+        write_summary(api, ctx, comments, summary.body, written.comment_id)
 
     # d) exit code
-    append_step_summary(step_summary, ctx, final, full=_full_findings_json(final) if cut else None)
+    append_step_summary(step_summary, ctx, final, full=full, publish_error=publish_error)
     print(f"publish: result {final.status}, reasons {', '.join(sorted(final.codes)) or 'none'}")
+    if publish_error is not None:
+        print(f"publish: {publish_error}; the run fails", file=sys.stderr)
+        return 1
     return verdict.exit_code(final)
 
 
