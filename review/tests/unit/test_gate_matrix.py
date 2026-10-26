@@ -383,6 +383,55 @@ def test_failed_pass(name):
     assert r.status == FAIL
 
 
+SPEND_META = {
+    "reason": "workspace spend limit reached",
+    "model": None,
+    "stop_reason": None,
+    "request_schema_sha256": "f" * 64,
+    "usage": None,
+}
+
+
+def test_failed_pass_shows_meta_reason_and_stays_not_waivable():
+    passes = [pass_rec(n, "failed", meta=SPEND_META) if n == "security" else pass_rec(n) for n in PASS_NAMES]
+    r = gate(passes=passes, overrides=ov_inputs([override_comment()]))
+    assert r.status == FAIL and not r.override_applied
+    details = [x.detail for x in r.reasons if x.code == R_PASS_RECORDS]
+    assert details == ["pass security failed: workspace spend limit reached"]
+    assert [x.waivable for x in r.reasons] == [False]
+
+
+def test_failed_pass_without_meta_reason():
+    meta = {**SPEND_META, "reason": None}
+    passes = [pass_rec(n, "failed", meta=meta) if n == "review" else pass_rec(n) for n in PASS_NAMES]
+    assert [x.detail for x in gate(passes=passes).reasons] == ["pass review failed"]
+
+
+def test_meta_never_lowers_risk():
+    """An ok pass with meta that names a reason still blocks on its finding."""
+    meta = {**SPEND_META, "reason": "all clear", "model": "claude-opus-5-5", "stop_reason": "end_turn"}
+    passes = [pass_rec(n, findings=[BLOCKING], meta=meta) if n == "supply-chain" else pass_rec(n) for n in PASS_NAMES]
+    r = gate(passes=passes)
+    assert r.codes == {R_BLOCKING_FINDING} and r.status == FAIL
+
+
+def test_pass_meta_exposed_read_only():
+    usage = {"input_tokens": 10, "output_tokens": 2, "iterations": 1}
+    meta = {**SPEND_META, "reason": None, "model": "claude-opus-5-5", "usage": usage}
+    passes = [pass_rec(n, meta=meta) for n in PASS_NAMES]
+    r = gate(passes=passes)
+    assert [p.name for p in r.passes] == list(PASS_NAMES)
+    info = r.passes[0]
+    assert (info.status, info.summary, info.meta["model"]) == ("ok", "ok", "claude-opus-5-5")
+    assert info.meta["usage"]["input_tokens"] == 10
+    with pytest.raises(TypeError):
+        info.meta["model"] = "x"
+    with pytest.raises(TypeError):
+        info.meta["usage"]["input_tokens"] = 0
+    final = run_final(r, gate_inputs(passes=passes))
+    assert final.passes == r.passes
+
+
 def write_artifact(tmp_path, doc, name):
     d = tmp_path / name.split(".")[0]
     d.mkdir()

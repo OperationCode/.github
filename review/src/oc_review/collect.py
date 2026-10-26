@@ -155,6 +155,8 @@ class HttpRequest:
     headers: Mapping[str, str]
     max_bytes: int
     timeout: float
+    # Request body (JSON bytes) for the publisher's writes; None for a GET.
+    body: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -188,7 +190,9 @@ def default_transport(
     if parts.scheme != "https" or parts.hostname != API_HOST or parts.port is not None:
         raise HttpError("default_transport refuses a URL outside api.github.com")
     opener = opener or urllib.request.build_opener(_NoRedirect)
-    req = urllib.request.Request(request.url, method=request.method, headers=dict(request.headers))
+    req = urllib.request.Request(
+        request.url, data=request.body, method=request.method, headers=dict(request.headers)
+    )
     deadline = clock() + request.timeout
     try:
         with opener.open(req, timeout=request.timeout) as resp:

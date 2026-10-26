@@ -111,6 +111,10 @@ _SHA_RE = re.compile(r"[0-9a-f]{40}")
 # Legacy `permission` field of the collaborator permission API: maintain reads as write.
 OVERRIDE_PERMISSIONS = frozenset({"admin", "write"})
 
+# Detail of the `stale` reason when the publisher had no snapshot to re-check
+# (for example, no valid bundle). It fails the gate like any stale reason.
+NOT_REVALIDATED = "snapshot not re-validated"
+
 BOT_LOGIN = "github-actions[bot]"
 STICKY_MARKER = "<!-- oc-claude-review -->"
 WORKFLOW_PATH = ".github/workflows/claude-review.yml"
@@ -442,6 +446,21 @@ class OverrideCandidate:
 
 
 @dataclass(frozen=True)
+class PassInfo:
+    """One schema-valid pass record, for the summary only.
+
+    `meta` is a read-only copy of the envelope `meta` (empty when absent):
+    the failure reason, model, stop reason and token usage. The gate never
+    reads risk from it.
+    """
+
+    name: str
+    status: str
+    summary: str | None
+    meta: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
 class GateResult:
     status: str  # PASS | FAIL
     run_id: int
@@ -450,6 +469,7 @@ class GateResult:
     snapshot: SnapshotPair | None
     overrides: tuple[OverrideCandidate, ...]
     override_applied: bool
+    passes: tuple[PassInfo, ...] = ()
 
     @property
     def passed(self) -> bool:
@@ -755,6 +775,35 @@ def _context_reasons(
     return []
 
 
+def _frozen(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({k: _frozen(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return tuple(_frozen(v) for v in value)
+    return value
+
+
+def _pass_info(doc: Mapping[str, Any]) -> PassInfo:
+    meta = doc.get("meta")
+    payload = doc["payload"]
+    summary = payload.get("summary") if isinstance(payload, Mapping) else None
+    return PassInfo(
+        name=doc["pass"],
+        status=doc["status"],
+        summary=summary if isinstance(summary, str) else None,
+        meta=_frozen(meta) if isinstance(meta, Mapping) else MappingProxyType({}),
+    )
+
+
+def _failed_detail(info: PassInfo) -> str:
+    """`pass X failed`, with the analyze reason from `meta` when it has one
+    (for example "workspace spend limit reached")."""
+    reason = info.meta.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        return f"pass {info.name} failed: {reason.strip()[:200]}"
+    return f"pass {info.name} failed"
+
+
 def _job_reasons(job_results: Mapping[str, str], outcome: str | None) -> list[Reason]:
     out = []
     for job in REQUIRED_JOBS:
@@ -771,7 +820,7 @@ def _job_reasons(job_results: Mapping[str, str], outcome: str | None) -> list[Re
 
 def _revalidation_reasons(check: SnapshotCheck | None) -> list[Reason]:
     if check is None:
-        return [Reason(R_STALE, "snapshot not re-validated")]
+        return [Reason(R_STALE, NOT_REVALIDATED)]
     out = [Reason(R_STALE, str(r)) for r in check.stale_reasons]
     if check.base_not_default_branch:
         out.append(Reason(R_BASE_NOT_DEFAULT, "base ref is not the default branch"))
@@ -847,6 +896,7 @@ def compute_gate(inputs: GateInputs) -> GateResult:
         )
     index = _FileIndex(inputs.files)
     findings: list[CitedFinding] = []
+    infos: list[PassInfo] = []
     names: Counter[str] = Counter()
     for i, read in enumerate(inputs.passes):
         label = f"pass record {i + 1}"
@@ -855,11 +905,13 @@ def compute_gate(inputs: GateInputs) -> GateResult:
         if doc is None:
             continue
         reasons += _context_reasons(doc, label, ctx, snap_fields)
+        info = _pass_info(doc)
+        infos.append(info)
         name = doc["pass"]
         names[name] += 1
         status = doc["status"]
         if status == "failed":
-            reasons.append(Reason(R_PASS_RECORDS, f"pass {name} failed"))
+            reasons.append(Reason(R_PASS_RECORDS, _failed_detail(info)))
         elif status == "stale":
             reasons.append(Reason(R_STALE, f"pass {name} stale"))
         elif status == "skipped-size":
@@ -902,6 +954,7 @@ def compute_gate(inputs: GateInputs) -> GateResult:
         snapshot=snapshot,
         overrides=overrides,
         override_applied=applied,
+        passes=tuple(infos),
     )
 
 
@@ -954,4 +1007,5 @@ def final_check(
         snapshot=initial.snapshot,
         overrides=candidates,
         override_applied=applied,
+        passes=initial.passes,
     )
