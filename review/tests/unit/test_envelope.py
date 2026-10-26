@@ -305,3 +305,32 @@ def test_skipped_size_bundle_has_no_content_for_claude(good_envelope, key):
 def test_skipped_size_bundle_may_carry_size(good_envelope):
     doc = {**good_envelope, "status": "skipped-size", "payload": {**BUNDLE_PAYLOAD, "size": {"estimated_tokens": 1}}}
     envelope.validate_envelope(doc)
+
+
+def test_pass_file_names():
+    assert envelope.PASS_FILE_NAMES == {
+        "review": "pass-review.json",
+        "security": "pass-security.json",
+        "supply-chain": "pass-supply-chain.json",
+    }
+    assert [envelope.pass_dir_name(n) for n in envelope.PASS_FILE_NAMES] == [
+        "pass-review",
+        "pass-security",
+        "pass-supply-chain",
+    ]
+
+
+@pytest.mark.parametrize("bad", ["", "bundle", "../review", "pass-review"])
+def test_pass_dir_name_rejects_unknown(bad):
+    with pytest.raises(EnvelopeError, match="unknown pass"):
+        envelope.pass_dir_name(bad)
+
+
+def test_pass_meta_is_optional_and_kind_pass_only(good_envelope):
+    from .conftest import load_fixture
+
+    rec = load_fixture("envelope", "good-pass-failed-null-payload")
+    envelope.validate_envelope(rec)
+    envelope.validate_envelope({**rec, "meta": {"reason": "workspace spend limit reached"}})
+    with pytest.raises(EnvelopeError, match=r"<root>: \[not\]"):
+        envelope.validate_envelope({**good_envelope, "meta": {}})

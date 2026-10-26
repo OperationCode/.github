@@ -30,6 +30,16 @@ MAX_BYTES_BY_KIND = {"bundle": 16 * 1024 * 1024, "pass": 1024 * 1024}
 
 _DIGEST_RE = re.compile(r"^(?:sha256:)?([0-9a-fA-F]{64})$")
 
+# Analyze writes each pass record as `<root>/pass-<name>/pass-<name>.json`, and
+# the publisher reads it from there. The names are fixed in trusted code.
+PASS_FILE_NAMES = {name: f"pass-{name}.json" for name in ("review", "security", "supply-chain")}
+
+
+def pass_dir_name(name: str) -> str:
+    if name not in PASS_FILE_NAMES:
+        raise EnvelopeError(f"unknown pass {name!r}")
+    return f"pass-{name}"
+
 
 class EnvelopeError(Exception):
     """The artifact or envelope is not acceptable. The gate fails closed."""
@@ -64,7 +74,12 @@ def validate_envelope(doc: Any) -> None:
     `skipped-size` carries the prefilter result, coverage and dependency data
     (a skipped-size bundle omits only the content for Claude). A `pass` record
     with status `ok` carries a payload that must match the findings schema.
-    Every other payload is null."""
+    Every other payload is null.
+
+    A `pass` record of any status may carry `meta`: the failure reason, the
+    response model and stop reason, the digest of the request schema and the
+    token usage. The gate never reads risk from it. A `bundle` with `meta` is
+    rejected."""
     err = _first_error("envelope", doc)
     if err:
         raise EnvelopeError(f"envelope schema: {err}")
