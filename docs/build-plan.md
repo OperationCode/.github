@@ -98,27 +98,30 @@ Depends on: V3, V5, V9 (analyze); V6, V16, V24 (publish).
 
 ### 1c. Central workflow
 
-- [ ] `.github/workflows/claude-review.yml`: `pull_request_target` only, `permissions: {}` at the top, per-job scopes as in the spec, no `if:` except `always()` on the gate job, no concurrency group, no `continue-on-error`, every action pinned by full commit SHA, checkout of `OperationCode/.github` at `job.workflow_sha`.
+- [ ] `.github/workflows/claude-review.yml`: `pull_request_target` only, `permissions: {}` at the top, per-job scopes as in the spec, no job `if:` except `always()` on the gate job (the gate job's download steps carry the non-empty id guard, below), no concurrency group, no `continue-on-error`, every action pinned by full commit SHA, checkout of `OperationCode/.github` at `job.workflow_sha`.
 - [ ] The analyze job is the only job with `id-token: write`. The gate job has no Anthropic credential. The analyze job sets `JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}`, passes `GITHUB_TOKEN` and `RUNNER_TEMP`, and runs `python -m oc_review.analyze --bundle-dir ... --bundle-digest ... --out-dir ...`. The gate job has `contents: read` (spec D9), `pull-requests: write`, `issues: write` and `actions: read`.
 - [ ] The dependency-review job exports the step outcome as the job output named `outcome` (`publish.py` reads `needs.dependency-review.outputs.outcome`, and `DEPENDENCY_REVIEW_OUTCOME` if the workflow sets it; the two must agree).
 - [ ] Guard every artifact download in the gate job with an explicit non-empty id check (D10). An empty `artifact-ids` makes `actions/download-artifact` fetch every artifact of the run. When analyze failed, its ids are empty, and `publish.py` must find a missing directory and fail with the `artifact` reason while it still posts the summary.
 - [ ] A unit test parses the workflow: no `continue-on-error`, the dependency-review job exports the step `outcome`, every `uses:` is a full SHA.
-- [ ] `.github/workflows/test.yml`: unit tests on PRs to this repo.
+- [ ] `.github/workflows/test.yml`: unit tests on PRs to this repo (`pull_request`, no path filter) and on pushes to `main`. The job is `unit-tests`, with `contents: read`, no `id-token`, no environment and no secrets, so it runs a PR's code with a read-only token (the no-execute rule covers the review workflow).
+- [ ] Every workflow job starts with harden-runner and has `timeout-minutes`. Actions are pinned to the newest release at least 7 days old. Python is the runner image's 3.12, and `setup-uv` has an exact version and checksum, with its cache and the Astral mirror off. Artifact names carry the run attempt.
 - [ ] `.github/workflows/eval.yml`: manual fixture evals. The job uses `environment: eval` and has `contents: read` and `id-token: write` only. A workflow unit test reads every workflow file and fails if a workflow other than `eval.yml` uses `environment: eval`, or if a job that uses `eval` sets no explicit job-level `permissions` or has any `write` permission other than `id-token: write`. Job-level `permissions` is required even if the workflow level sets it. `write-all` at either level fails the test, and so do `read-all` and a missing job-level block, because the job must state `contents: read` and `id-token: write` itself.
-- [ ] V10: harden-runner in audit mode for a full run, then block mode with the measured allowlist.
+- [ ] `review/src/oc_review/evals.py`: the runner that `eval.yml` calls (`python -m oc_review.evals --fixtures-dir ... --out-dir ...`), with placeholder eval federation IDs and one smoke fixture. The phase 2 fixtures and IDs come later. `analyze` takes an optional federation IDs parameter for it.
+- [ ] Prefilter run budget: the prefilter line diff has a budget of 40,000,000 steps per run next to its 2,000,000 per file (spec "Coverage limits").
+- [ ] V10: harden-runner in audit mode for a full run, then block mode (`disable-telemetry: true`) with the measured allowlist. The workflows are committed in audit mode, and a `release`-marked test (`pytest -m release`) fails until the lists are in. Steps: run `test.yml` in audit on the 1c PR and set its list; stage a copy of the workflow and `review/` in the scratch repo, run one same-repo PR and one fork PR to the test repo's ruleset base, read the endpoint list per job, then set block mode and run again. These live steps are pending.
 
 Depends on: V2, V4, V13, V18 (workflow); V10 needs a full run, so it runs here.
 
 Owner:
 
 - [ ] Owner: confirm the protection of `.github` main: CODEOWNERS review, 1 approval, no force push, no deletion, org admin bypass through a pull request only.
-- [ ] Owner: on `.github` main, turn on dismiss stale approvals on push, and require the `test.yml` check.
+- [ ] Owner: on `.github` main, turn on dismiss stale approvals on push, and require the `test.yml` check (the job `unit-tests`, only after it has reported once).
 - [ ] Owner: org Actions setting, default `GITHUB_TOKEN` permissions read-only.
 
 Exit criteria:
 
 - [ ] Unit tests pass in CI on `.github`.
-- [ ] A full run in claude-review-test succeeds with egress in block mode (V10).
+- [ ] A full run in claude-review-test succeeds with egress in block mode (V10). Note: the V10 live steps are pending, and the owner has not yet ruled what this run must prove. With placeholder federation IDs each pass fails, so a fully green run needs the production rule (phase 3).
 - [ ] Each change was reviewed through a PR with code owner approval.
 
 ## Phase 2: fixture evals
