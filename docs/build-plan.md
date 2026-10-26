@@ -54,9 +54,9 @@ Tasks:
 Owner:
 
 - [x] Owner: create a scratch source repo in the org for the V tests, separate from claude-review-test ([claude-review-p0-source](https://github.com/OperationCode/claude-review-p0-source)).
-- [ ] Owner: Anthropic Console: a dedicated workspace with a hard monthly spend limit and a service account. Create the production federation rule as in spec "Auth and cost": pattern mode, subject prefix `repo:OperationCode@10479364/*`, scope `workspace:developer`, the review workspace only, and a placeholder SHA in `job_workflow_ref`. Its ID goes into the central code; phase 3 sets the candidate SHA. No API key.
-- [ ] Owner: a separate eval workspace with its own small spend limit, and a federation rule for `eval.yml` on `workflow_dispatch` in `OperationCode/.github` that also requires the claim `environment: "eval"`: pattern mode, the same subject prefix, scope `workspace:developer`, the eval workspace only (spec "Auth and cost"). Test it once. Needed before phase 2.
-- [ ] Owner: on `.github`, create the GitHub environment `eval`: the owner is a required reviewer for every run, and any branch may deploy to it. Turn on "prevent self-review" so the PR author cannot approve their own eval run. Before approving a run, check that the PR does not change `eval.yml`, the eval code, the prompts, the fixtures or the federation setup in a harmful way, and that `test.yml` passed. The approval is the control; the residual risk is an approver who approves without reading. Exception to the no-execute rule (K-4): evals of PRs to this repo may run that PR's code, only after an owner approves the `eval` environment run. Needed before phase 2.
+- [ ] Owner: Anthropic Console: a dedicated workspace with a hard monthly spend limit and a service account. Create the production federation rule as in spec "Auth and cost": pattern mode, subject prefix `repo:OperationCode@10479364/*`, scope `workspace:developer`, the review workspace only, and the placeholder SHA `0000000000000000000000000000000000000000` in `job_workflow_ref`. Read it back; if the Console rejects the placeholder, stop and resolve the order of rule ID and SHA first (spec V26 a). Its ID goes into the central code; phase 3 sets the candidate SHA. No API key.
+- [ ] Owner: a separate eval workspace with its own small spend limit, and a federation rule for `workflow_dispatch` runs in `OperationCode/.github` whose job uses the environment `eval`: pattern mode, the same subject prefix, exact claims `repository_owner_id`, `repository_id`, `event_name` and `environment`, scope `workspace:developer`, the eval workspace only (spec "Auth and cost"). The rule cannot name `eval.yml`: any `.github` workflow that uses `eval` can match, so the owner's approval and the workflow unit test (1c) hold it to `eval.yml`. Test it as in spec V27 before phase 2.
+- [ ] Owner: on `.github`, create the GitHub environment `eval`: the owner is a required reviewer for every run, and any branch may deploy to it. Turn on "prevent self-review" so the PR author cannot approve their own eval run. Before approving a run, check the run that waits for approval: the workflow file and commit it runs, every job in it that uses `eval`, and their effective permissions (no GitHub write). Also check that the PR does not change `eval.yml`, any other workflow file, the eval code, the prompts, the fixtures or the federation setup in a harmful way, and that `test.yml` passed. The approval is the control; the residual risk is an approver who approves without reading. Exception to the no-execute rule (K-4): evals of PRs to this repo may run that PR's code, only after an owner approves the `eval` environment run. Needed before phase 2.
 - [x] Owner: a test workspace with a very small spend limit for V9.
 - [ ] Owner: the test org ruleset for V6 that targets only claude-review-test.
 - [ ] Owner: a Dependabot PR in claude-review-test for V4.
@@ -102,7 +102,7 @@ Depends on: V3, V5, V9 (analyze); V6, V16, V24 (publish).
 - [ ] The analyze job is the only job with `id-token: write`. The gate job has no Anthropic credential.
 - [ ] A unit test parses the workflow: no `continue-on-error`, the dependency-review job exports the step `outcome`, every `uses:` is a full SHA.
 - [ ] `.github/workflows/test.yml`: unit tests on PRs to this repo.
-- [ ] `.github/workflows/eval.yml`: manual fixture evals. The job uses `environment: eval` and has `contents: read` and `id-token: write` only. The workflow unit test checks this.
+- [ ] `.github/workflows/eval.yml`: manual fixture evals. The job uses `environment: eval` and has `contents: read` and `id-token: write` only. A workflow unit test reads every workflow file and fails if a workflow other than `eval.yml` uses `environment: eval`, or if a job that uses `eval` sets no explicit `permissions` or has any `write` permission other than `id-token: write`.
 - [ ] V10: harden-runner in audit mode for a full run, then block mode with the measured allowlist.
 
 Depends on: V2, V4, V13, V18 (workflow); V10 needs a full run, so it runs here.
@@ -123,14 +123,16 @@ Exit criteria:
 
 The fixture eval calls the live API and costs money. The owner runs it on request only. It is the one exception to the no-execute rule: it may run a PR's code, only after an owner approves the `eval` environment run (K-4).
 
+- [ ] V27, before the first eval: test the eval federation rule (an approved `eval.yml` run gets a token; the deny cases in the spec get none).
 - [ ] Add the fixture bundles from the spec's minimum set, with expected outcomes.
 - [ ] Owner: run `eval.yml` on the PR branch and approve the `eval` environment, with the eval federation rule and eval workspace from phase 0. Check the PR first (see phase 0). Record the results in the PR that changed the prompts or code. Passing evals gate the merge of a prompt or model change, and a release pin never moves to a SHA whose evals have not passed. No required check enforces the merge gate, so the owner holds the merge until the evals pass.
 - [ ] Fix prompts or code for each miss, then run again on request.
 
-Depends on: phase 1.
+Depends on: phase 1; V27.
 
 Exit criteria:
 
+- [ ] V27 passes.
 - [ ] Every fixture in the minimum set gives its expected outcome.
 - [ ] The hard-block fixtures (bidi, git URL lockfile) block whatever Claude returns.
 
@@ -138,6 +140,8 @@ Exit criteria:
 
 Run the spec's workflow acceptance tests under a test org ruleset that requires the central workflow from `OperationCode/.github` at the candidate release SHA and targets only claude-review-test. Only one ruleset requires the workflow there at a time.
 
+- [ ] V26 b, before the acceptance tests: after the owner sets the production rule to the candidate SHA, a run at that SHA gets a token and a run at another SHA is denied.
+- [ ] V26 c, before V22 b: release steps 1 to 4 with a scratch rule R2 on the test workspace, R1 unchanged.
 - [ ] A fork PR from an account outside the org, including a draft that later becomes ready. The review starts with no approval click (V8 b).
 - [ ] V8 a: a fork PR whose own workflow has a job named `oc-claude-review` that starts before the required run.
 - [ ] V11: retarget from a non-default branch.
@@ -153,7 +157,7 @@ Owner:
 - [ ] Owner: an account outside the org opens the fork PRs.
 - [ ] Owner: test users with Write, Maintain and Admin on claude-review-test for V25.
 
-Depends on: phases 1 and 2; V8, V11, V12, V22, V23, V25.
+Depends on: phases 1 and 2; V8, V11, V12, V22, V23, V25, V26.
 
 Exit criteria:
 
@@ -171,7 +175,7 @@ Exit criteria:
 - [ ] Owner: require 2FA for all org members.
 - [ ] Owner: CODEOWNERS in each pilot repo for `.github/`, manifests, lockfiles, `pyproject.toml`, `Dockerfile`.
 - [ ] Start a run on each open PR in the pilot repos (push, or close and reopen).
-- [ ] Each week, record false positives, overrides, bypasses, failed runs by reason, egress blocks and cost per run. Keep cost numbers in the owner's private notes and the Anthropic Console, never in this public repo.
+- [ ] Each week, record false positives, overrides, bypasses, failed runs by reason, egress blocks and cost per run. Keep cost numbers (any currency amount) in the owner's private notes and the Anthropic Console, never in this public repo. Public text may give ratios and timing only.
 - [ ] Fix false positives in prompts or code. Each fix goes through phase 2 again, then ships as in "Each release" below.
 
 Depends on: phase 3.
@@ -217,11 +221,13 @@ Exit criteria:
 
 ## Each release (from phase 4 on)
 
-- [ ] Run unit tests, and the fixture eval when prompts or the model change (it gates the merge of that change).
-One federation rule allows one SHA (spec "Auth and cost", "Each release"):
+One federation rule allows one SHA, and every release is validated at its final SHA before a pin moves (spec "Auth and cost", "Each release"):
 
-- [ ] Owner: create a new federation rule as a copy of the current one, with a placeholder SHA in `job_workflow_ref`.
-- [ ] Put the new rule ID in the central code. That commit is the release SHA.
-- [ ] Owner: set `job_workflow_ref` of the new rule to the release SHA.
-- [ ] Owner: move the pin of every ruleset that requires the workflow (the pilot ruleset, the org ruleset, or both), then read each back: `repository_id`, path, `sha`, no `ref`.
-- [ ] Owner: delete the old federation rule once open PRs have new runs (V22).
+- [ ] Owner: create a new federation rule R2 as a copy of the current rule R1, with the placeholder SHA `0000000000000000000000000000000000000000` in `job_workflow_ref`. Read it back (V26).
+- [ ] Put the R2 ID in the central code. That commit is the release candidate S2.
+- [ ] Owner: set `job_workflow_ref` of R2 to S2 and read it back.
+- [ ] Validate S2, for every release: unit tests pass, the owner-approved fixture eval passes, and a run under the scratch test ruleset pinned to S2 gets a token through R2.
+- [ ] Merge. If the merge makes a new SHA, check that its tree equals S2 (`git diff` is empty, so the content and rule ID are the same), then the owner sets R2 to that SHA. If the trees differ, validate again. That SHA is the release SHA.
+- [ ] Owner: move the pin of every ruleset that requires the workflow (the pilot ruleset, the org ruleset, or both) to the release SHA, then read each back: `repository_id`, path, `sha`, no `ref`.
+- [ ] Start a new run on each open PR (push, or close and reopen). Do not re-run old runs: after R1 is deleted, a re-run at the old SHA fails auth.
+- [ ] Owner: delete R1 only when each new run has completed at the release SHA (`job.workflow_sha`); a queued run does not count (V22).
