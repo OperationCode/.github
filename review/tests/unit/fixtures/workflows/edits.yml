@@ -17,6 +17,11 @@
   new: "actions/upload-artifact@cf430e0"
   expect: unpinned-uses
 - id: uses-local-action
+  file: claude-review.yml
+  old: "uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294"
+  new: "uses: ./.github/actions/dependency-review"
+  expect: [unpinned-uses, dependency-review]
+- id: uses-local-action-eval
   file: eval.yml
   old: "uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884"
   new: "uses: ./.github/actions/setup-uv"
@@ -175,6 +180,11 @@
   old: "    if: always()\n"
   new: "    if: always()\n    concurrency: gate\n"
   expect: concurrency
+- id: job-renamed
+  file: claude-review.yml
+  old: "  oc-claude-review:\n"
+  new: "  gate:\n"
+  expect: [jobs, job-if, step-if, download, publish-env, publish-run]
 - id: job-added
   file: claude-review.yml
   old: "  oc-claude-review:\n"
@@ -190,6 +200,11 @@
   old: "  collect:\n    runs-on: ubuntu-24.04\n"
   new: "  collect:\n    runs-on: ubuntu-24.04\n    environment: production\n"
   expect: environment
+- id: eval-environment-in-central
+  file: claude-review.yml
+  old: "  oc-claude-review:\n    needs: [collect, analyze, dependency-review]\n"
+  new: "  oc-claude-review:\n    needs: [collect, analyze, dependency-review]\n    environment: eval\n"
+  expect: [eval-environment, environment, eval-permissions]
 
 # --- central workflow: if ---
 - id: job-if-on-analyze
@@ -261,10 +276,20 @@
   expect: checkout
 - id: github-sha
   file: claude-review.yml
+  old: "JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}"
+  new: "JOB_WORKFLOW_SHA: ${{ github.sha }}"
+  expect: [forbidden-text, analyze-env]
+- id: github-workflow-sha
+  file: claude-review.yml
+  old: "JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}"
+  new: "JOB_WORKFLOW_SHA: ${{ github.workflow_sha }}"
+  expect: [forbidden-text, analyze-env]
+- id: github-sha-comment
+  file: claude-review.yml
   old: "# BLOCK-MODE ALLOWLIST (L8): placeholder until V10 measures it."
   new: "# github.sha"
   expect: forbidden-text
-- id: github-workflow-sha
+- id: github-workflow-sha-comment
   file: claude-review.yml
   old: "# BLOCK-MODE ALLOWLIST (L8): placeholder until V10 measures it."
   new: "# github.workflow_sha"
@@ -543,6 +568,11 @@
   old: "on: workflow_dispatch\n"
   new: "on: [workflow_dispatch, workflow_call]\n"
   expect: eval-trigger
+- id: eval-pull-requests-write
+  file: eval.yml
+  old: "      id-token: write\n"
+  new: "      id-token: write\n      pull-requests: write\n"
+  expect: [eval-permissions, credential-separation]
 - id: eval-id-token-missing
   file: eval.yml
   old: "      id-token: write\n"
