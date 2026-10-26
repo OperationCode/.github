@@ -1,0 +1,61 @@
+# Manual fixture evals against the live API (costs money; run on request only).
+#
+# workflow_dispatch only, on the branch to test: a dispatch run uses that
+# branch's copy of this file and of the code. The job uses the `eval`
+# environment, which needs the owner's approval for every run, and the eval
+# federation rule binds the token to that environment. Only this file may use
+# `eval`, and its job states contents: read and id-token: write and nothing
+# else, so the job that holds the Anthropic credential has no GitHub write
+# (spec "Fixture eval credential"; review/tests/unit/test_workflows.py).
+#
+# Harden-runner is in audit mode until the endpoints are measured; then
+# egress-policy: block, disable-telemetry: true and the allowed-endpoints below.
+
+name: eval
+
+on: workflow_dispatch
+
+permissions: {}
+
+jobs:
+  fixture-evals:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: eval
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      UV_PYTHON_DOWNLOADS: never
+      UV_PYTHON: python3.12
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
+        with:
+          egress-policy: audit
+          # BLOCK-MODE ALLOWLIST: placeholder until measured.
+          # Expected, to confirm: github.com:443 api.github.com:443
+          # raw.githubusercontent.com:443 release-assets.githubusercontent.com:443
+          # pypi.org:443 files.pythonhosted.org:443
+          # api.anthropic.com:443 and the Actions OIDC token host
+      - name: Check out the dispatched branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, released 2026-07-20
+        with:
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0, released 2026-10-09
+        with:
+          version: 0.13.1
+          checksum: eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
+          enable-cache: false
+          download-from-astral-mirror: false
+      - name: Install the locked Python deps
+        run: uv sync --locked --no-dev --project review
+      - name: Run the fixture evals
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          PYTHONPATH: ${{ github.workspace }}/review/src
+        run: >-
+          uv run --no-sync --project review python -m oc_review.evals
+          --fixtures-dir review/tests/fixtures
+          --out-dir "$RUNNER_TEMP/eval"

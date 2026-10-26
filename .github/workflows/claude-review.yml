@@ -1,0 +1,295 @@
+# Central Claude PR review (docs/claude-review-design.md is the source of truth).
+#
+# The org ruleset requires this file at a pinned SHA. It reads the PR through
+# the GitHub REST API only: no job checks out, installs, builds or runs PR
+# content. Each job checks out OperationCode/.github at job.workflow_sha.
+#
+# Rules that review/tests/unit/test_workflows.py enforces:
+# - trigger pull_request_target only, no filters; no concurrency; no
+#   continue-on-error; permissions {} here and exact scopes per job
+# - only analyze has id-token (the Anthropic credential) and it has no GitHub
+#   write; the gate job writes comments and has no id-token
+# - no job if: except always() on the gate job; the only step if: is the
+#   non-empty artifact id check on each gate job download
+# - every action pinned by full commit SHA (tag and release date in the comment)
+# - no ${{ }} inside run: scripts; values reach scripts through env:
+#
+# Harden-runner is in audit mode for the V10 run. Live step L8 sets
+# egress-policy: block, disable-telemetry: true and the allowed-endpoints
+# measured for each job (see the BLOCK-MODE ALLOWLIST comment in each job).
+
+name: claude-review
+
+on: pull_request_target
+
+permissions: {}
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      UV_PYTHON_DOWNLOADS: never
+      UV_PYTHON: python3.12
+    outputs:
+      bundle-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      bundle-digest: ${{ steps.collect.outputs.bundle-digest }}
+      status: ${{ steps.collect.outputs.status }}
+      head-sha: ${{ steps.collect.outputs.head-sha }}
+      merge-base-sha: ${{ steps.collect.outputs.merge-base-sha }}
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
+        with:
+          egress-policy: audit
+          # BLOCK-MODE ALLOWLIST (L8): placeholder until V10 measures it.
+          # Expected, to confirm: github.com:443 api.github.com:443
+          # raw.githubusercontent.com:443 release-assets.githubusercontent.com:443
+          # results-receiver.actions.githubusercontent.com:443
+          # *.blob.core.windows.net:443 pypi.org:443 files.pythonhosted.org:443
+          # registry.npmjs.org:443
+      - name: Check out the central review code (never the PR)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, released 2026-07-20
+        with:
+          repository: OperationCode/.github
+          ref: ${{ job.workflow_sha }}
+          path: central
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0, released 2026-10-09
+        with:
+          version: 0.13.1
+          checksum: eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
+          enable-cache: false
+          download-from-astral-mirror: false
+      - name: Install the locked Python deps
+        run: uv sync --locked --no-dev --project central/review
+      - name: Collect the PR bundle
+        id: collect
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PYTHONPATH: ${{ github.workspace }}/central/review/src
+        run: uv run --no-sync --project central/review python -m oc_review.collect --out-dir "$RUNNER_TEMP/data/bundle"
+      - name: Upload the bundle
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, released 2026-10-07
+        with:
+          name: oc-bundle-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/data/bundle/bundle.json
+          if-no-files-found: error
+          retention-days: 3
+
+  analyze:
+    needs: collect
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      id-token: write
+    env:
+      UV_PYTHON_DOWNLOADS: never
+      UV_PYTHON: python3.12
+    outputs:
+      review-artifact-id: ${{ steps.upload-review.outputs.artifact-id }}
+      review-digest: ${{ steps.analyze.outputs.review-digest }}
+      security-artifact-id: ${{ steps.upload-security.outputs.artifact-id }}
+      security-digest: ${{ steps.analyze.outputs.security-digest }}
+      supply-chain-artifact-id: ${{ steps.upload-supply-chain.outputs.artifact-id }}
+      supply-chain-digest: ${{ steps.analyze.outputs.supply-chain-digest }}
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
+        with:
+          egress-policy: audit
+          # BLOCK-MODE ALLOWLIST (L8): placeholder until V10 measures it.
+          # Expected, to confirm: github.com:443 api.github.com:443
+          # raw.githubusercontent.com:443 release-assets.githubusercontent.com:443
+          # results-receiver.actions.githubusercontent.com:443
+          # *.blob.core.windows.net:443 pypi.org:443 files.pythonhosted.org:443
+          # api.anthropic.com:443 and the Actions OIDC token host
+      - name: Check out the central review code (never the PR)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, released 2026-07-20
+        with:
+          repository: OperationCode/.github
+          ref: ${{ job.workflow_sha }}
+          path: central
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0, released 2026-10-09
+        with:
+          version: 0.13.1
+          checksum: eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
+          enable-cache: false
+          download-from-astral-mirror: false
+      - name: Install the locked Python deps
+        run: uv sync --locked --no-dev --project central/review
+      # An empty artifact-ids would make download-artifact fetch every artifact
+      # of the run, so a missing id fails the job here.
+      - name: Check the bundle artifact id
+        env:
+          BUNDLE_ARTIFACT_ID: ${{ needs.collect.outputs.bundle-artifact-id }}
+        run: |
+          if [ -z "$BUNDLE_ARTIFACT_ID" ]; then
+            echo "::error::collect gave no bundle artifact id"
+            exit 1
+          fi
+      - name: Download the bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, released 2026-10-07
+        with:
+          artifact-ids: ${{ needs.collect.outputs.bundle-artifact-id }}
+          path: ${{ runner.temp }}/data/bundle
+          digest-mismatch: error
+      # Exits 0 when it wrote all three pass records, whatever their status.
+      # A non-zero exit (bundle not trusted) skips the uploads and fails the job.
+      - name: Run the three Claude passes
+        id: analyze
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          BUNDLE_DIGEST: ${{ needs.collect.outputs.bundle-digest }}
+          PYTHONPATH: ${{ github.workspace }}/central/review/src
+        run: >-
+          uv run --no-sync --project central/review python -m oc_review.analyze
+          --bundle-dir "$RUNNER_TEMP/data/bundle"
+          --bundle-digest "$BUNDLE_DIGEST"
+          --out-dir "$RUNNER_TEMP/out"
+      - name: Upload the review pass record
+        id: upload-review
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, released 2026-10-07
+        with:
+          name: oc-pass-review-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out/pass-review/pass-review.json
+          if-no-files-found: error
+          retention-days: 3
+      - name: Upload the security pass record
+        id: upload-security
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, released 2026-10-07
+        with:
+          name: oc-pass-security-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out/pass-security/pass-security.json
+          if-no-files-found: error
+          retention-days: 3
+      - name: Upload the supply-chain pass record
+        id: upload-supply-chain
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, released 2026-10-07
+        with:
+          name: oc-pass-supply-chain-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out/pass-supply-chain/pass-supply-chain.json
+          if-no-files-found: error
+          retention-days: 3
+
+  dependency-review:
+    needs: collect
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      # The gate checks this apart from the job result (spec "Reasons").
+      outcome: ${{ steps.dr.outcome }}
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
+        with:
+          egress-policy: audit
+          # BLOCK-MODE ALLOWLIST (L8): placeholder until V10 measures it.
+          # Expected, to confirm: github.com:443 api.github.com:443
+      - name: Dependency review of the reviewed pair (no checkout)
+        id: dr
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0, released 2026-05-08
+        with:
+          base-ref: ${{ needs.collect.outputs.merge-base-sha }}
+          head-ref: ${{ needs.collect.outputs.head-sha }}
+          fail-on-severity: high
+          warn-only: false
+          comment-summary-in-pr: never
+          show-openssf-scorecard: false
+
+  oc-claude-review:
+    needs: [collect, analyze, dependency-review]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+    env:
+      UV_PYTHON_DOWNLOADS: never
+      UV_PYTHON: python3.12
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
+        with:
+          egress-policy: audit
+          # BLOCK-MODE ALLOWLIST (L8): placeholder until V10 measures it.
+          # Expected, to confirm: github.com:443 api.github.com:443
+          # raw.githubusercontent.com:443 release-assets.githubusercontent.com:443
+          # results-receiver.actions.githubusercontent.com:443
+          # *.blob.core.windows.net:443 pypi.org:443 files.pythonhosted.org:443
+      - name: Check out the central review code (never the PR)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, released 2026-07-20
+        with:
+          repository: OperationCode/.github
+          ref: ${{ job.workflow_sha }}
+          path: central
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0, released 2026-10-09
+        with:
+          version: 0.13.1
+          checksum: eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
+          enable-cache: false
+          download-from-astral-mirror: false
+      - name: Install the locked Python deps
+        run: uv sync --locked --no-dev --project central/review
+      # Each download runs only with a non-empty id (D10): an empty
+      # artifact-ids would fetch every artifact of the run. A skipped download
+      # leaves its directory missing, and publish fails with `artifact`.
+      - name: Download the bundle
+        if: needs.collect.outputs.bundle-artifact-id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, released 2026-10-07
+        with:
+          artifact-ids: ${{ needs.collect.outputs.bundle-artifact-id }}
+          path: ${{ runner.temp }}/data/bundle
+          digest-mismatch: error
+      - name: Download the review pass record
+        if: needs.analyze.outputs.review-artifact-id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, released 2026-10-07
+        with:
+          artifact-ids: ${{ needs.analyze.outputs.review-artifact-id }}
+          path: ${{ runner.temp }}/data/pass-review
+          digest-mismatch: error
+      - name: Download the security pass record
+        if: needs.analyze.outputs.security-artifact-id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, released 2026-10-07
+        with:
+          artifact-ids: ${{ needs.analyze.outputs.security-artifact-id }}
+          path: ${{ runner.temp }}/data/pass-security
+          digest-mismatch: error
+      - name: Download the supply-chain pass record
+        if: needs.analyze.outputs.supply-chain-artifact-id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, released 2026-10-07
+        with:
+          artifact-ids: ${{ needs.analyze.outputs.supply-chain-artifact-id }}
+          path: ${{ runner.temp }}/data/pass-supply-chain
+          digest-mismatch: error
+      # The exit code of publish is the gate: 0 only for `pass`.
+      - name: Compute the gate and write the PR comments
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          BUNDLE_DIGEST: ${{ needs.collect.outputs.bundle-digest }}
+          REVIEW_DIGEST: ${{ needs.analyze.outputs.review-digest }}
+          SECURITY_DIGEST: ${{ needs.analyze.outputs.security-digest }}
+          SUPPLY_CHAIN_DIGEST: ${{ needs.analyze.outputs.supply-chain-digest }}
+          DEPENDENCY_REVIEW_OUTCOME: ${{ needs.dependency-review.outputs.outcome }}
+          PYTHONPATH: ${{ github.workspace }}/central/review/src
+        run: |
+          printf '%s' "$NEEDS_JSON" > "$RUNNER_TEMP/needs.json"
+          uv run --no-sync --project central/review python -m oc_review.publish --data-dir "$RUNNER_TEMP/data" --needs-json "$RUNNER_TEMP/needs.json"
