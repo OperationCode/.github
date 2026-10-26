@@ -799,13 +799,21 @@ class TestChangedLines:
         err = capsys.readouterr().err
         assert pf.PAST_RUN_DIFF_BUDGET in err
 
-    def test_run_budget_never_goes_negative_and_caps_steps(self):
+    def test_run_budget_left_is_clamped_at_zero(self):
         base = pf._Lines("".join(f"a{i}\n" for i in range(400)))
         head = pf._Lines("".join(f"b{i}\n" for i in range(400)))
         budget = pf.DiffBudget(total=250_000, per_file=100_000)
         for i in range(10):
             pf._added_lines(head, base, budget=100_000, run=budget, path=f"f{i}")
             assert budget.left >= 0
+        assert budget.left == 0
+
+    def test_run_budget_left_is_clamped_when_a_snake_overshoots(self):
+        # one long snake on diagonal 0 after a first edit: work passes the allowance by up to the line count
+        base = pf._Lines("x\n" + "".join(f"s{i}\n" for i in range(5_000)) + "e\n")
+        head = pf._Lines("y\n" + "".join(f"s{i}\n" for i in range(5_000)) + "f\n")
+        budget = pf.DiffBudget(total=2, per_file=2)
+        pf._added_lines(head, base, budget=2, run=budget, path="a")
         assert budget.left == 0
 
     def test_past_run_budget_every_middle_line_is_added(self):
@@ -816,24 +824,48 @@ class TestChangedLines:
         assert pf._added_lines(head, base, run=pf.DiffBudget(), path="x") == [2, 4]
         assert pf._added_lines(head, base, run=budget, path="x") == [2, 3, 4]
 
+    @staticmethod
+    def _shared_line_change(i):
+        # the shared line carries a zero-width char: only a coarse diff counts it as added
+        return change(f"f{i}.txt", "top\nx0\nkeep\u200b\nx1\nend\n", "top\ny0\nkeep\u200b\ny1\nend\n")
+
     def test_run_budget_across_many_files_in_run_prefilter(self, capsys):
-        rows = 300
-        changes = [
-            change(
-                f"f{i}.txt",
-                "".join(f"b{j}\n" for j in range(rows)) + "x\u200b\n",
-                "".join(f"a{j}\n" for j in range(rows)),
-            )
-            for i in range(8)
-        ]
-        budget = pf.DiffBudget(total=200_000, per_file=100_000)
-        start = time.monotonic()
-        r = run(*changes, diff_budget=budget)
-        assert time.monotonic() - start < 10
-        assert 0 <= budget.left < 100_000
-        assert len(checks(r, pf.ZERO_WIDTH)) == 8  # coarse diff still sees every added line
-        assert pf.PAST_RUN_DIFF_BUDGET in capsys.readouterr().err
+        probe = pf.DiffBudget(total=1_000_000, per_file=1_000_000)
+        r = run(self._shared_line_change(0), diff_budget=probe)
+        used = 1_000_000 - probe.left
+        assert used > 0 and not checks(r, pf.ZERO_WIDTH)  # exact: the shared line is not added
+        capsys.readouterr()
+        # room for two files, then the run budget is spent
+        budget = pf.DiffBudget(total=2 * used + used // 2, per_file=1_000_000)
+        r = run(*[self._shared_line_change(i) for i in range(8)], diff_budget=budget)
+        assert budget.left == 0
+        assert sorted(c.file for c in checks(r, pf.ZERO_WIDTH)) == [f"f{i}.txt" for i in range(2, 8)]
+        err = capsys.readouterr().err.splitlines()
+        assert len(err) == 6 and all(pf.PAST_RUN_DIFF_BUDGET in line for line in err)
         assert r.coverage.complete
+
+    def test_per_file_limit_names_the_per_file_reason(self, capsys):
+        base = pf._Lines("top\n" + "".join(f"a{i}\n" for i in range(50)) + "end\n")
+        head = pf._Lines("top\n" + "".join(f"b{i}\n" for i in range(50)) + "end\n")
+        pf._added_lines(head, base, budget=10, run=pf.DiffBudget(total=1_000_000, per_file=10), path="a")
+        err = capsys.readouterr().err
+        assert pf.PAST_FILE_DIFF_BUDGET in err and pf.PAST_RUN_DIFF_BUDGET not in err
+
+    def test_run_limit_names_the_run_reason(self, capsys):
+        base = pf._Lines("top\n" + "".join(f"a{i}\n" for i in range(50)) + "end\n")
+        head = pf._Lines("top\n" + "".join(f"b{i}\n" for i in range(50)) + "end\n")
+        pf._added_lines(head, base, budget=1_000_000, run=pf.DiffBudget(total=10, per_file=1_000_000), path="a")
+        err = capsys.readouterr().err
+        assert pf.PAST_RUN_DIFF_BUDGET in err and pf.PAST_FILE_DIFF_BUDGET not in err
+
+    def test_budget_message_escapes_an_untrusted_path(self, capsys):
+        base = pf._Lines("top\n" + "".join(f"a{i}\n" for i in range(50)) + "end\n")
+        head = pf._Lines("top\n" + "".join(f"b{i}\n" for i in range(50)) + "end\n")
+        path = "x\n::add-mask::secret\n::stop-commands::t"
+        pf._added_lines(head, base, budget=10, run=pf.DiffBudget(), path=path)
+        err = capsys.readouterr().err
+        assert err.count("\n") == 1 and err.startswith("prefilter: ")
+        assert not any(line.startswith("::") for line in err.splitlines())
 
     def test_budget_never_clears_a_block(self):
         bidi = "\u202e"

@@ -19,6 +19,9 @@ CONFIGURED = analyze.FederationIds(
 )
 
 
+FAKE_EXPECTED = {"gate": "fail", "findings": [{"category": "security", "severity": "high"}]}
+
+
 def _b64(doc):
     return base64.urlsafe_b64encode(json.dumps(doc).encode()).rstrip(b"=").decode()
 
@@ -80,9 +83,9 @@ def make_case(root, name="case1", expected=None):
     d = root / name
     d.mkdir(parents=True)
     shutil.copy(SMOKE / "bundle.json", d / "bundle.json")
-    shutil.copy(SMOKE / "expected.json", d / "expected.json")
-    if expected is not None:
-        (d / "expected.json").write_text(json.dumps(expected))
+    # the fake client returns a high security finding, so the default case expects it
+    expected = FAKE_EXPECTED if expected is None else expected
+    (d / "expected.json").write_text(json.dumps(expected))
     return d
 
 
@@ -191,3 +194,71 @@ def test_pr_transport_allows_only_the_one_pr():
             t(collect.HttpRequest("GET", bad, {}, 1000, 1.0))
     with pytest.raises(AssertionError):
         t(collect.HttpRequest("POST", url, {}, 1000, 1.0))
+
+
+def test_smoke_fixture_expects_only_what_is_deterministic():
+    # the live model decides findings and the gate; only code decides hard blocks
+    expected = json.loads((SMOKE / "expected.json").read_text())
+    assert set(expected) <= {"hard_blocks"} and expected.get("hard_blocks", []) == []
+
+
+def test_smoke_fixture_matches_any_valid_output(tmp_path):
+    fx = tmp_path / "fixtures"
+    d = make_case(fx)
+    shutil.copy(SMOKE / "expected.json", d / "expected.json")
+    assert run(tmp_path, FakeClient(findings=[])) == 0
+    assert result_lines(tmp_path)[0]["matched"]
+
+
+def test_matching_hard_blocks_pass(tmp_path):
+    d = make_case(tmp_path / "fixtures", expected={"hard_blocks": ["bidi-control-characters"]})
+    bundle = json.loads((d / "bundle.json").read_text())
+    bundle["payload"]["prefilter"]["hard_blocks"] = [{
+        "id": "bidi-control-characters", "level": "hard_block", "detail": "bidi control characters",
+        "file": "src/a.js", "subject": None, "lines": [3], "count": 1,
+    }]
+    (d / "bundle.json").write_text(json.dumps(bundle))
+    assert run(tmp_path, FakeClient()) == 0
+    [r] = result_lines(tmp_path)
+    assert r["matched"] and r["gate"] == "fail"
+
+
+def test_malformed_expected_finding_is_a_mismatch(tmp_path):
+    make_case(tmp_path / "fixtures", expected={"findings": [{"category": "security"}, "oops"]})
+    assert run(tmp_path, FakeClient()) == 1
+    mismatches = result_lines(tmp_path)[0]["mismatches"]
+    assert len([m for m in mismatches if m.startswith("bad expected finding")]) == 2
+
+
+def test_bad_gate_value_is_a_failed_case(tmp_path):
+    make_case(tmp_path / "fixtures", expected={"gate": "maybe"})
+    assert run(tmp_path, FakeClient()) == 1
+    [r] = result_lines(tmp_path)
+    assert not r["matched"] and "gate must be pass or fail" in r["mismatches"][0]
+
+
+def test_results_are_written_per_case(tmp_path, monkeypatch):
+    fx = tmp_path / "fixtures"
+    make_case(fx, "a-good")
+    make_case(fx, "b-good")
+
+    real = evals.run_case
+    calls = []
+
+    def crash_on_second(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise KeyboardInterrupt  # not an Exception: main does not catch it
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(evals, "run_case", crash_on_second)
+    with pytest.raises(KeyboardInterrupt):
+        run(tmp_path, FakeClient())
+    assert [r["case"] for r in result_lines(tmp_path)] == ["a-good"]
+
+
+def test_stdout_is_one_line_per_case_for_a_hostile_case_name(tmp_path, capsys):
+    make_case(tmp_path / "fixtures", "a\n::add-mask::x", expected={"gate": "maybe"})
+    run(tmp_path, FakeClient())
+    out = capsys.readouterr().out
+    assert len(out.splitlines()) == 1 and not out.startswith("::")

@@ -117,7 +117,9 @@ def compare(expected: Mapping[str, Any], gate: verdict.GateResult, bundle: Mappi
         out.append(f"gate: expected {expected['gate']}, got {gate.status}")
     have = {(f.category, f.severity) for f in gate.findings}
     for want in expected.get("findings", []):
-        if (want["category"], want["severity"]) not in have:
+        if not isinstance(want, Mapping) or not {"category", "severity"} <= want.keys():
+            out.append(f"bad expected finding: {json.dumps(want, default=str)[:80]}")
+        elif (want["category"], want["severity"]) not in have:
             out.append(f"missing finding {want['category']}/{want['severity']}")
     if "hard_blocks" in expected:
         actual = _bundle_hard_block_ids(bundle)
@@ -218,11 +220,12 @@ def main(
 
     cases = discover_cases(args.fixtures_dir)
     if not cases:
-        print(f"evals: no cases in {args.fixtures_dir}", file=sys.stderr)
+        print(f"evals: no cases in {args.fixtures_dir!r}", file=sys.stderr)
         return 1
     mint = analyze.oidc_minter(env.get("ACTIONS_ID_TOKEN_REQUEST_URL"), env.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN"),
                                oidc_transport, sleep=sleep)
-    lines: list[str] = []
+    results_path = out_dir / "results.jsonl"
+    results_path.write_text("", encoding="utf-8")
     ok = True
     for case_dir in cases:
         try:
@@ -234,9 +237,10 @@ def main(
         except Exception as exc:  # noqa: BLE001 - one bad case must not stop the others
             result = {"case": case_dir.name, "matched": False, "mismatches": [f"{type(exc).__name__}: {exc}"]}
         ok = ok and result["matched"]
-        lines.append(json.dumps(result, sort_keys=True))
-        print(lines[-1])
-    (out_dir / "results.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        line = json.dumps(result, sort_keys=True)
+        with results_path.open("a", encoding="utf-8") as fh:  # per case: a kill keeps the finished cases
+            fh.write(line + "\n")
+        print(line)
     return 0 if ok else 1
 
 

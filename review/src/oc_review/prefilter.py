@@ -436,7 +436,9 @@ def _added_lines(
     duplicate or a moved line counts as added. When the diff needs more than
     `budget` steps, every head line in the middle counts as added: more lines
     than git shows, never fewer. With `run`, the file also takes from the
-    run's budget, and past either limit stderr names the file and the limit.
+    run's budget (the left share never drops below 0), and past either limit
+    stderr names the file and the limit. A file's work is bounded by its
+    allowance plus one snake (at most the file's line count), not exactly by it.
     """
     if base is None:
         return list(range(1, len(head.lines) + 1))
@@ -454,11 +456,12 @@ def _added_lines(
     steps = [0]
     middle = _myers_inserts(a, b, allowed, steps)
     if run is not None:
-        run.left -= allowed if middle is None else steps[0]
+        run.left = max(0, run.left - (allowed if middle is None else steps[0]))
     if middle is None:
         run_limited = run is not None and allowed < budget
         limit = PAST_RUN_DIFF_BUDGET if run_limited else PAST_FILE_DIFF_BUDGET
-        print(f"prefilter: {path or '(file)'}: {limit}; every changed line counts as added", file=sys.stderr)
+        # repr: the path is untrusted and may hold a newline that would start a workflow command
+        print(f"prefilter: {(path or '(file)')!r}: {limit}; every changed line counts as added", file=sys.stderr)
         middle = list(range(len(b)))
     return [pre + j + 1 for j in middle]
 
