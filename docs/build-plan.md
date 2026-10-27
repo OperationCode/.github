@@ -129,7 +129,7 @@ Exit criteria:
 
 The fixture eval calls the live API and costs money. The owner runs it on request only. It is the one exception to the no-execute rule: it may run a PR's code, only after an owner approves the `eval` environment run (K-4).
 
-- [x] V27, before the first eval (passed 2026-10-27, throwaway branch `v27-probe`, never merged; Console deny reasons and the P1 scope are pending owner confirmation): test the eval federation rule (an approved `eval.yml` run gets a token; the deny cases in the spec get none, including a dispatch run in claude-review-test with its own `eval` environment, spec P2-2).
+- [x] V27, before the first eval (passed 2026-10-27, throwaway branch `v27-probe`, never merged; Console deny reasons and the P1 scope are pending owner confirmation): test the eval federation rule (an approved `eval.yml` run gets a token; the deny cases in the spec get none, including the other-repo case, spec P2-2; it ran as the substitute N4, `push` in claude-review-test with no environment, 401, so repository isolation is not tested separately).
 - [x] Real eval federation IDs in `evals.py`, checked by a unit test against the production placeholders (spec P2-1).
 - [x] Eval runner: expectation format v2 and the rendered summary per case (spec "Testing", P2-5).
 - [x] Fixture builder `review/tests/eval_fixtures.py` and the 13 cases of the spec's minimum set in `review/tests/fixtures`, with expected outcomes. Unit tests: each bundle equals a rebuild, and each hard-block case fails the gate whatever Claude returns.
