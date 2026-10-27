@@ -601,7 +601,8 @@ def test_cut_quote_that_is_not_on_the_line_stays_unverified_and_blocking():
 
 
 def test_cut_file_path_stays_unverified_and_blocking():
-    path = "a/" * 250 + "setup.js"
+    path = "abcde/" * 75 + "setup.js"
+    assert path[LIMITS["file"] - 1] != "/"  # so the plain cut does not end in "/"
     doc = cut(long_doc(file=path, quote="global[_0x1a[0]](payload);"))
     f = doc["findings"][0]
     assert f["file"] == path[: LIMITS["file"] - 1] + "/"

@@ -3,6 +3,7 @@ transport stands in for api.github.com."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -539,10 +540,48 @@ def test_dedupe_by_bot_key_only(tmp_path):
     assert "first. See the inline comment from an earlier run." in r.summary
 
 
-def test_key_of_a_finding_below_the_limits_is_the_d14_key():
+def test_finding_key_covers_every_shown_field_and_is_stable():
     c = verdict.cite_finding("review", finding(), ())
-    raw = "\0".join((c.file, c.side, c.title, c.quote)).encode()
+    raw = b'["review", "bug", "low", "high", "src/app.py", "head", 10, "t", "shell=True", "e"]'
     assert publish.finding_key(c) == hashlib.sha256(raw).hexdigest()
+    # A fixed value: a change to the key format re-posts every earlier comment.
+    assert publish.finding_key(c) == "cd2365850b5f3a1b4a9cc356d224471b66f23a5353b3110a0ed072271c55ad52"
+
+
+def test_findings_below_the_limits_that_differ_in_explanation_are_both_posted(tmp_path):
+    first = finding("security", "high", title="same", explanation="First distinct explanation.")
+    second = finding("malicious", "critical", title="same", explanation="Second distinct explanation.")
+    r = run(tmp_path, passes=clean_passes(review=[first, second]))
+    (rv,) = r.gh.bodies("POST", "/reviews")
+    bodies = [plain(c["body"]) for c in rv["comments"]]
+    assert len(bodies) == 2
+    assert any("First distinct explanation." in b for b in bodies)
+    assert any("Second distinct explanation." in b for b in bodies)
+
+
+def jwt(sub: str, length: int) -> str:
+    """A JWT that the redaction finds, padded to `length` with its signature."""
+    def b64(doc: dict[str, str]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(doc).encode()).decode().rstrip("=")
+    token = b64({"alg": "HS256"}) + "." + b64({"sub": sub}) + "."
+    return token + "s" * (length - len(token))
+
+
+def test_titles_that_redaction_makes_equal_keep_both_explanations(tmp_path):
+    # Review rr-p3-cut-fix1 Important A: the cut is taken from the redacted
+    # text, so it can be far below the limit and still make two titles equal.
+    titles = ["Token " + jwt("user-a", 155), "Token " + jwt("user-b", 155)]
+    assert [len(t) for t in titles] == [161, 161]
+    first = finding("security", "high", title=titles[0], explanation="First distinct explanation.")
+    second = finding("malicious", "critical", title=titles[1], explanation="Second distinct explanation: secret theft.")
+    doc = analyze.cut_to_limits({"summary": "s", "findings": [first, second]}, analyze.findings_schema())
+    assert [f["title"] for f in doc["findings"]] == ["Token [REDACTED:jwt]"] * 2
+    r = run(tmp_path, passes=clean_passes(review=doc["findings"]))
+    (rv,) = r.gh.bodies("POST", "/reviews")
+    bodies = [plain(c["body"]) for c in rv["comments"]]
+    assert len(bodies) == 2
+    assert any("First distinct explanation." in b for b in bodies)
+    assert any("Second distinct explanation: secret theft." in b for b in bodies)
 
 
 CUT_PREFIX = "Same long title " + "x" * 104  # exactly the title limit

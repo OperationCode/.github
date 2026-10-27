@@ -51,7 +51,6 @@ import unicodedata
 import urllib.parse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -650,29 +649,17 @@ UNTRUSTED_NOTE = "Model output from untrusted input. Check it before you act on 
 VERIFIED_NOTE = "Verified means only that the quoted text is at that place. It does not mean the claim is true."
 
 
-@lru_cache(maxsize=None)
-def _key_limits() -> dict[str, int]:
-    """The schema `maxLength` of each string in the D14 key."""
-    schema = envelope.parse_json((envelope.SCHEMA_DIR / "findings.schema.json").read_bytes())
-    props = schema["properties"]["findings"]["items"]["properties"]
-    return {name: props[name]["maxLength"] for name in ("file", "title", "quote")}
-
-
 def finding_key(f: verdict.CitedFinding) -> str:
-    """SHA-256 of `file\\0side\\0title\\0quote` (D14).
+    """SHA-256 of the JSON list of every field that the reader sees (D14, P3-2).
 
-    Analyze may have cut a string at its limit (P3-2), and two findings that
-    differ only past the cut then have the same file, title and quote. So when
-    one of them is at its limit, the key covers every field that the reader
-    sees, and a shared key never hides a different finding."""
-    limits = _key_limits()
-    if any(len(getattr(f, name)) >= limit for name, limit in limits.items()):
-        fields = [f.pass_name, f.category, f.severity, f.confidence, f.file, f.side, f.line,
-                  f.title, f.quote, f.explanation]
-        raw = json.dumps(["cut", *fields])
-    else:
-        raw = "\0".join((f.file, f.side, f.title, f.quote))
-    return hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()
+    Two findings share a key only when they show the same text, so a shared
+    key never hides a different explanation. A cut or a redaction can make
+    two different findings equal in file, title and quote, at any length.
+    The JSON of strings and integers with the default `json.dumps` settings
+    is ASCII and the same on every run, so the key is stable across runs."""
+    fields = [f.pass_name, f.category, f.severity, f.confidence, f.file, f.side, f.line,
+              f.title, f.quote, f.explanation]
+    return hashlib.sha256(json.dumps(fields).encode("ascii")).hexdigest()
 
 
 def read_posted_keys(api: GitHubApi, ctx: PublishContext) -> frozenset[str]:
