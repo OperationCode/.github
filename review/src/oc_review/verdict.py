@@ -582,6 +582,9 @@ class _FileIndex:
                 self.by_old_path[f.old_path] = f
 
     def lookup(self, path: str, side: str) -> FileSides | None:
+        if path.endswith("/"):
+            # No file path ends in "/". A cut path does (analyze `cut_path`).
+            return None
         if side == "base":
             # The old path of a rename names its base blob, also when an added
             # file reuses that path.

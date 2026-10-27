@@ -290,19 +290,34 @@ def cut_string(text: str, limit: int) -> str:
     return (text if redacted == cleaned else redacted)[:limit]
 
 
-def cut_to_limits(doc: Any, schema: Mapping[str, Any]) -> Any:
+# Properties that name a file. A path is an identifier, not prose.
+PATH_FIELDS = frozenset({"file"})
+
+
+def cut_path(text: str, limit: int) -> str:
+    """A cut file path that names no file: `cut_string` to `limit - 1`, then "/".
+
+    A plain prefix of a path can be the path of another changed file, and the
+    citation check would then verify the finding on that file. Git and GitHub
+    never name a file with a final "/", so the cut path names no changed file
+    and the finding stays unverified (and still blocks, P3-2)."""
+    return cut_string(text, limit - 1) + "/"
+
+
+def cut_to_limits(doc: Any, schema: Mapping[str, Any], name: str | None = None) -> Any:
     """Cut each string over its schema `maxLength` to that limit, in place
     (spec "Request shape", P3-2). The finding stays, and nothing else changes.
 
     The API cannot enforce `maxLength`, so one long string would fail the
     whole pass. The walk follows `properties` and `items`, the only structure
     keywords of the findings schema (a unit test checks that it reaches every
-    `maxLength`). Every other keyword is left to the schema check."""
+    `maxLength`). Every other keyword is left to the schema check. `name` is
+    the property that holds `doc`; a path is cut with `cut_path`."""
     if isinstance(doc, dict):
         props = schema.get("properties")
-        for name, sub in props.items() if isinstance(props, Mapping) else ():
-            if name in doc and isinstance(sub, Mapping):
-                doc[name] = cut_to_limits(doc[name], sub)
+        for key, sub in props.items() if isinstance(props, Mapping) else ():
+            if key in doc and isinstance(sub, Mapping):
+                doc[key] = cut_to_limits(doc[key], sub, key)
     elif isinstance(doc, list):
         items = schema.get("items")
         if isinstance(items, Mapping):
@@ -310,7 +325,7 @@ def cut_to_limits(doc: Any, schema: Mapping[str, Any]) -> Any:
     elif isinstance(doc, str):
         limit = schema.get("maxLength")
         if isinstance(limit, int) and len(doc) > limit:
-            return cut_string(doc, limit)
+            return (cut_path if name in PATH_FIELDS else cut_string)(doc, limit)
     return doc
 
 

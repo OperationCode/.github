@@ -3,6 +3,7 @@ transport stands in for api.github.com."""
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import re
@@ -538,6 +539,45 @@ def test_dedupe_by_bot_key_only(tmp_path):
     assert "first. See the inline comment from an earlier run." in r.summary
 
 
+def test_key_of_a_finding_below_the_limits_is_the_d14_key():
+    c = verdict.cite_finding("review", finding(), ())
+    raw = "\0".join((c.file, c.side, c.title, c.quote)).encode()
+    assert publish.finding_key(c) == hashlib.sha256(raw).hexdigest()
+
+
+CUT_PREFIX = "Same long title " + "x" * 104  # exactly the title limit
+
+
+def cut_pair():
+    """Two findings whose titles differ only past the title limit, after the analyze cut."""
+    first = finding("security", "high", title=CUT_PREFIX + " SQL injection", explanation="First distinct explanation.")
+    second = finding("malicious", "critical", title=CUT_PREFIX + " secret theft",
+                     explanation="Second distinct explanation: secret theft.")
+    doc = analyze.cut_to_limits({"summary": "s", "findings": [first, second]}, analyze.findings_schema())
+    assert doc["findings"][0]["title"] == doc["findings"][1]["title"] == CUT_PREFIX
+    return doc["findings"]
+
+
+def test_findings_that_differ_past_the_cut_are_both_posted(tmp_path):
+    r = run(tmp_path, passes=clean_passes(review=cut_pair()))
+    (rv,) = r.gh.bodies("POST", "/reviews")
+    bodies = [plain(c["body"]) for c in rv["comments"]]
+    assert len(bodies) == 2
+    assert any("First distinct explanation." in b for b in bodies)
+    assert any("Second distinct explanation: secret theft." in b for b in bodies)
+
+
+def test_finding_that_differs_past_the_cut_from_an_earlier_one_is_posted(tmp_path):
+    first, second = cut_pair()
+    key = publish.finding_key(verdict.cite_finding("review", first, ()))
+    gh = FakeGitHub(review_comments=[{"user": {"login": BOT}, "body": f"<!-- oc-finding:{key} -->"}])
+    r = run(tmp_path, gh, passes=clean_passes(review=[first, second]))
+    (rv,) = r.gh.bodies("POST", "/reviews")
+    assert [c["line"] for c in rv["comments"]] == [10]
+    assert "Second distinct explanation: secret theft." in plain(rv["comments"][0]["body"])
+    assert "See the inline comment from an earlier run." in r.summary
+
+
 def test_no_review_when_nothing_new(tmp_path):
     f1 = finding(title="first")
     key = publish.finding_key(verdict.cite_finding("review", f1, ()))
@@ -636,8 +676,11 @@ def test_strings_cut_by_analyze_render_escaped(tmp_path):
     tail = "\\`<!--&amp;@user #12 ["
 
     def over(kind):
-        limit = publish.LIMITS[kind]
+        limit = publish.LIMITS[kind] - (kind == "file")  # a cut path ends in "/"
         return "w" * (limit - len(tail)) + tail + "**bold** <b>more</b>"
+
+    def end(kind):
+        return "/" if kind == "file" else ""
 
     payload = {"summary": over("summary"), "findings": [finding(
         "malicious", "high", file=over("file"), quote=over("quote"), title=over("title"),
@@ -646,7 +689,7 @@ def test_strings_cut_by_analyze_render_escaped(tmp_path):
     envelope.validate_findings(payload)
     [f] = payload["findings"]
     cut = {"summary": payload["summary"], **{k: f[k] for k in ("file", "quote", "title", "explanation")}}
-    assert all(v.endswith(tail) and len(v) == publish.LIMITS[k] for k, v in cut.items())
+    assert all(v.endswith(tail + end(k)) and len(v) == publish.LIMITS[k] for k, v in cut.items())
 
     passes = clean_passes()
     passes["review"] = pass_doc("review", findings=payload["findings"], summary=payload["summary"])
@@ -659,7 +702,8 @@ def test_strings_cut_by_analyze_render_escaped(tmp_path):
         assert shown in s, kind
         assert not shown.endswith(publish.TRUNCATED)
         assert plain(shown) == value, kind  # every character shows as text
-        assert shown.endswith(r"\\\`\<\!\-\-\&amp\;\@" + ZWSP + r"user \#" + ZWSP + r"12 \["), kind
+        escaped_end = r"\\\`\<\!\-\-\&amp\;\@" + ZWSP + r"user \#" + ZWSP + r"12 \["
+        assert shown.endswith(escaped_end + "\\/" * (kind == "file")), kind
     body = s.replace(verdict.STICKY_MARKER, "")
     assert not re.search(r"(?<!\\)<!--", body) and "<b>" not in body and "**bold**" not in body
 

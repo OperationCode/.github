@@ -503,6 +503,13 @@ def cut(doc):
     return analyze.cut_to_limits(doc, analyze.findings_schema())
 
 
+def cut_value(field, value):
+    """A plain prefix; a path ends in "/" so that it names no file."""
+    if field == "file":
+        return value[: LIMITS[field] - 1] + "/"
+    return value[: LIMITS[field]]
+
+
 def test_the_cut_reaches_every_max_length_in_the_schema():
     paths = schema_limits(analyze.findings_schema())
     assert set(LIMITS) == {"summary", "file", "quote", "title", "explanation"}
@@ -525,7 +532,7 @@ def test_over_long_string_is_cut_and_the_finding_stays(tmp_path, configured, fie
     assert statuses(run) == {"review": "ok", "security": "ok", "supply-chain": "ok"}
     rec = run.records["supply-chain"]
     assert rec["meta"]["reason"] is None
-    want = long_doc(**{field: value[: LIMITS[field]]})
+    want = long_doc(**{field: cut_value(field, value)})
     assert rec["payload"] == want  # only that string changed: category, severity, flags stay
     envelope.validate_findings(rec["payload"])  # the record holds the full-schema-valid payload
 
@@ -597,10 +604,30 @@ def test_cut_file_path_stays_unverified_and_blocking():
     path = "a/" * 250 + "setup.js"
     doc = cut(long_doc(file=path, quote="global[_0x1a[0]](payload);"))
     f = doc["findings"][0]
-    assert f["file"] == path[: LIMITS["file"]]
+    assert f["file"] == path[: LIMITS["file"] - 1] + "/"
     files = (verdict.FileSides(path, head_text=LONG_FILE, head_hunks=((1, 3),)),)
     c = verdict.cite_finding("supply-chain", f, files)
     assert not c.verified and not c.inline and c.blocking
+
+
+def test_cut_file_path_never_names_another_changed_file():
+    short = "a" * 200 + "/" + "b" * 199  # a changed file whose path is the plain cut of `long`
+    long = short + "X"
+    assert len(short) == LIMITS["file"]
+    files = tuple(verdict.FileSides(p, head_text="danger();\n", head_hunks=((1, 1),)) for p in (short, long))
+    doc = cut(long_doc(file=long, line=1, quote="danger();"))
+    f = doc["findings"][0]
+    assert len(f["file"]) == LIMITS["file"] and f["file"].endswith("/")
+    envelope.validate_findings(doc)
+    c = verdict.cite_finding("supply-chain", f, files)
+    assert (c.verified, c.inline, c.blocking) == (False, False, True)
+    assert c.unverified_reason == "file is not in the changed files"
+
+
+def test_a_path_with_a_final_slash_names_no_file():
+    files = (verdict.FileSides("dir/", head_text="danger();\n", head_hunks=((1, 1),)),)
+    f = json.loads(findings_text(file="dir/", line=1, quote="danger();"))["findings"][0]
+    assert not verdict.cite_finding("review", f, files).verified
 
 
 @pytest.mark.parametrize(
