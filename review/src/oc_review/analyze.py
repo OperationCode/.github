@@ -50,7 +50,9 @@ PASS_NAMES = ("review", "security", "supply-chain")
 # so they can read the cache entry it writes (spec "Cache order").
 FIRST_PASS = "supply-chain"
 
-MODEL = "claude-opus-5-5"
+# Per pass, so a pass that Sonnet misses in the release eval can stay on Opus
+# (spec "Request shape"). `claude-sonnet-5-5` is the candidate.
+MODEL = {name: "claude-sonnet-5-5" for name in PASS_NAMES}
 EFFORT = {"review": "medium", "security": "medium", "supply-chain": "high"}
 # Thinking tokens count toward `max_tokens`, so this bounds thinking plus output.
 MAX_TOKENS = {"review": 16_000, "security": 16_000, "supply-chain": 32_000}
@@ -233,7 +235,7 @@ def build_request(pass_name: str, *, system_text: str, user_text: str, pass_text
     so they share one cache entry. The pass message is a mid-conversation
     system message, after the untrusted data, as the last entry."""
     return {
-        "model": MODEL,
+        "model": MODEL[pass_name],
         "max_tokens": MAX_TOKENS[pass_name],
         "system": system_text,
         "messages": [
