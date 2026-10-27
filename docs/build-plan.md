@@ -41,6 +41,7 @@ Use [claude-review-test](https://github.com/OperationCode/claude-review-test) as
 Tasks:
 
 - [ ] V6, first: which run counts when one head SHA has several runs. Cases (a) to (g). Use a scratch-only gate job that can pause after its final check.
+  - Note for the open V6 rounds, such as (f) run deletion: the V6 kit `0ec8b86` in the scratch source repo always does the token exchange, and the test federation rule now names the V10 kit `df8ff51`. So a V6 run at `0ec8b86` fails in analyze, and the gate fails on it (not waivable). Use a kit variant without the exchange (`0ec8b86` with `P0_FEDERATION_RULE_ID` empty, and the ruleset pinned to it), or set the test rule back to `0ec8b86` in the Console.
 - [x] V2: a fork PR run prints its decoded OIDC claims (never the token).
 - [x] V3: check the intended federation rule against the WIF reference, record the final rule text in the spec, then test it on a test workspace.
 - [x] V5: one Messages API request with a mid-conversation system message, structured output and server-side fallback.
@@ -98,27 +99,30 @@ Depends on: V3, V5, V9 (analyze); V6, V16, V24 (publish).
 
 ### 1c. Central workflow
 
-- [ ] `.github/workflows/claude-review.yml`: `pull_request_target` only, `permissions: {}` at the top, per-job scopes as in the spec, no `if:` except `always()` on the gate job, no concurrency group, no `continue-on-error`, every action pinned by full commit SHA, checkout of `OperationCode/.github` at `job.workflow_sha`.
+- [ ] `.github/workflows/claude-review.yml`: `pull_request_target` only, `permissions: {}` at the top, per-job scopes as in the spec, no job `if:` except `always()` on the gate job (the gate job's download steps carry the non-empty id guard, below), no concurrency group, no `continue-on-error`, every action pinned by full commit SHA, checkout of `OperationCode/.github` at `job.workflow_sha`.
 - [ ] The analyze job is the only job with `id-token: write`. The gate job has no Anthropic credential. The analyze job sets `JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}`, passes `GITHUB_TOKEN` and `RUNNER_TEMP`, and runs `python -m oc_review.analyze --bundle-dir ... --bundle-digest ... --out-dir ...`. The gate job has `contents: read` (spec D9), `pull-requests: write`, `issues: write` and `actions: read`.
 - [ ] The dependency-review job exports the step outcome as the job output named `outcome` (`publish.py` reads `needs.dependency-review.outputs.outcome`, and `DEPENDENCY_REVIEW_OUTCOME` if the workflow sets it; the two must agree).
 - [ ] Guard every artifact download in the gate job with an explicit non-empty id check (D10). An empty `artifact-ids` makes `actions/download-artifact` fetch every artifact of the run. When analyze failed, its ids are empty, and `publish.py` must find a missing directory and fail with the `artifact` reason while it still posts the summary.
 - [ ] A unit test parses the workflow: no `continue-on-error`, the dependency-review job exports the step `outcome`, every `uses:` is a full SHA.
-- [ ] `.github/workflows/test.yml`: unit tests on PRs to this repo.
+- [ ] `.github/workflows/test.yml`: unit tests on PRs to this repo (`pull_request`, no path filter) and on pushes to `main`. The job is `unit-tests`, with `contents: read`, no `id-token`, no environment and no secrets, so it runs a PR's code with a read-only token (the no-execute rule covers the review workflow).
+- [ ] Every workflow job starts with harden-runner and has `timeout-minutes`. Actions are pinned to the newest release at least 7 days old, except `setup-uv` v10.3.2 (spec K-15). Python is the runner image's 3.12, and `setup-uv` has an exact version and checksum, with its cache and the Astral mirror off. Artifact names carry the run attempt.
 - [ ] `.github/workflows/eval.yml`: manual fixture evals. The job uses `environment: eval` and has `contents: read` and `id-token: write` only. A workflow unit test reads every workflow file and fails if a workflow other than `eval.yml` uses `environment: eval`, or if a job that uses `eval` sets no explicit job-level `permissions` or has any `write` permission other than `id-token: write`. Job-level `permissions` is required even if the workflow level sets it. `write-all` at either level fails the test, and so do `read-all` and a missing job-level block, because the job must state `contents: read` and `id-token: write` itself.
-- [ ] V10: harden-runner in audit mode for a full run, then block mode with the measured allowlist.
+- [ ] `review/src/oc_review/evals.py`: the runner that `eval.yml` calls (`python -m oc_review.evals --fixtures-dir ... --out-dir ...`), with placeholder eval federation IDs and one smoke fixture. The phase 2 fixtures and IDs come later. `analyze` takes an optional federation IDs parameter for it.
+- [ ] Prefilter run budget: the prefilter line diff has a budget of 40,000,000 steps per run next to its 2,000,000 per file (spec "Coverage limits").
+- [x] V10: harden-runner in audit mode for a full run, then block mode (`disable-telemetry: true`) with the measured allowlist. Done 2026-10-27 (spec V10): block mode passed, but 2 of 24 block-mode jobs hung in "Complete job" (the symptoms match open harden-runner issue 708). Ruling K-14: every job runs in audit mode with its measured list and no `disable-sudo-and-containers`; the `release`-marked test holds the central lists to the V10 lists. The `test.yml` and `eval.yml` lists are not measured (phase 5).
 
 Depends on: V2, V4, V13, V18 (workflow); V10 needs a full run, so it runs here.
 
 Owner:
 
 - [ ] Owner: confirm the protection of `.github` main: CODEOWNERS review, 1 approval, no force push, no deletion, org admin bypass through a pull request only.
-- [ ] Owner: on `.github` main, turn on dismiss stale approvals on push, and require the `test.yml` check.
+- [ ] Owner: on `.github` main, turn on dismiss stale approvals on push, and require the `test.yml` check (the job `unit-tests`, only after it has reported once).
 - [ ] Owner: org Actions setting, default `GITHUB_TOKEN` permissions read-only.
 
 Exit criteria:
 
 - [ ] Unit tests pass in CI on `.github`.
-- [ ] A full run in claude-review-test succeeds with egress in block mode (V10).
+- [x] A full run in claude-review-test succeeds with egress in block mode (V10). Done 2026-10-27 with the test federation rule: a clean PR passed and a vulnerable one failed in block mode; 2 of 24 jobs hung; the K3 failed run passed on a re-run. The workflows ship in audit mode (spec K-14).
 - [ ] Each change was reviewed through a PR with code owner approval.
 
 ## Phase 2: fixture evals
@@ -200,6 +204,7 @@ Exit criteria:
 - [ ] Owner: CODEOWNERS in each supported repo.
 - [ ] Owner: Dependabot alerts with npm malware detection on active repos.
 - [ ] Re-run the key acceptance tests on the current release: V6 a, V8 a, V22 b, V23 and the outage process.
+- [ ] Revisit harden-runner block mode (spec K-14): switch to block when harden-runner [issue 708](https://github.com/step-security/harden-runner/issues/708) is fixed in a harden-runner release. Pin that release, measure the `test.yml` and `eval.yml` lists in audit mode, and re-test block mode. If no job hangs, set `egress-policy: block` and `disable-telemetry: true` in every job, and update the unit tests and the spec.
 
 Depends on: phase 4; V6, V8, V22, V23.
 

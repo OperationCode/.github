@@ -57,7 +57,7 @@ def _first_error(name: str, doc: Any) -> str | None:
     if not errors:
         return None
     e = errors[0]
-    where = "/".join(str(p) for p in e.absolute_path) or "<root>"
+    where = "/".join(repr(p) for p in e.absolute_path) or "<root>"
     return f"{where}: [{e.validator}] {e.message[:200]}"
 
 

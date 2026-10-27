@@ -1,0 +1,59 @@
+# Unit tests on PRs to this repo and on pushes to main.
+#
+# This runs the PR's own code, with a read-only token, no id-token, no
+# environment and no secrets (decision O11). It is not the review workflow.
+# No path filter, so the required check never stays pending. The job name is
+# the required check name: do not rename it.
+#
+# Harden-runner runs in audit mode (spec K-14). The allowlist is not measured
+# for this job: it holds the hosts that the same checkout, setup-uv and uv
+# sync steps, and the runner itself (results-receiver), reached in the V10 run
+# of the central workflow. Measure it in audit mode before block mode (build
+# plan, phase 5).
+
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      UV_PYTHON_DOWNLOADS: never
+      UV_PYTHON: python3.12
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
+        with:
+          egress-policy: audit
+          allowed-endpoints: >
+            github.com:443
+            raw.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            files.pythonhosted.org:443
+            results-receiver.actions.githubusercontent.com:443
+      - name: Check out this repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, released 2026-07-20
+        with:
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2, released 2026-10-22
+        with:
+          version: 0.13.1
+          checksum: eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
+          enable-cache: false
+          download-from-astral-mirror: false
+      - name: Install the locked Python deps
+        working-directory: review
+        run: uv sync --locked
+      - name: Run the unit tests
+        working-directory: review
+        run: uv run --locked pytest tests/unit
