@@ -76,9 +76,9 @@ CREDENTIAL_HEADERS = frozenset({"x-api-key", "authorization"})
 # Production federation rule (spec "Auth and cost", "Each release").
 # Rule R1 `claude-review-prod-r1` and service account `claude-review`, in
 # workspace `claude-review`. Each release names its own rule here.
-ANTHROPIC_FEDERATION_RULE_ID = "fdrl_01N2ZktTiVKqUvvXwywBFfys"
+ANTHROPIC_FEDERATION_RULE_ID = "fdrl_01AfACzupW3U4Bx361ZUbsyR"
 ANTHROPIC_ORGANIZATION_ID = "2bc920f9-977b-43b2-870a-f840e4ce809c"
-ANTHROPIC_SERVICE_ACCOUNT_ID = "svac_01PiMgfb6qJgNpLZUV8hprCC"
+ANTHROPIC_SERVICE_ACCOUNT_ID = "svac_017eR3ohB6rP5MEAsda6U7X6"
 
 FEDERATION_RULE_ID_RE = re.compile(r"^fdrl_[A-Za-z0-9]{24}$")
 ORGANIZATION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
