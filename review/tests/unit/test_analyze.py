@@ -354,7 +354,7 @@ def test_request_kwargs_per_pass(tmp_path, configured):
     users = {json.dumps(c["messages"][0]) for c in calls.values()}
     assert len(systems) == 1 and len(users) == 1
     for name, kw in calls.items():
-        assert kw["model"] == "claude-opus-5-5"
+        assert kw["model"] == "claude-sonnet-5-5"
         assert "<grounding_rules>" in kw["system"]
         user, last = kw["messages"]
         assert user["role"] == "user"
@@ -1446,3 +1446,11 @@ def test_default_client_factory_uses_the_federation_parameter(tmp_path, configur
     except Exception:  # noqa: BLE001 - the Messages call is not the point
         pass
     assert seen["federation_rule_id"] == other.rule_id
+
+
+def test_every_pass_has_a_model_and_an_effort():
+    for name in analyze.PASS_NAMES:
+        assert analyze.MODEL[name]
+        assert analyze.EFFORT[name]
+        assert analyze.MAX_TOKENS[name]
+    assert set(analyze.MODEL) == set(analyze.EFFORT) == set(analyze.PASS_NAMES)
