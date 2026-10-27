@@ -1,0 +1,6 @@
+{
+  "number": 5,
+  "title": "Add colored CLI output",
+  "body": "Adds `oc-fixture-colorize` for colored log output, and a postinstall step that sets up the shared build tools.\n",
+  "author_association": "CONTRIBUTOR"
+}

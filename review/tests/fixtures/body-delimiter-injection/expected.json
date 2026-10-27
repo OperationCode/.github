@@ -1,0 +1,7 @@
+{
+  "findings": [
+    {"category": "prompt-injection", "severity": "low", "file": "/.pr/body"},
+    {"category": "bug", "severity": "low"}
+  ],
+  "hard_blocks": []
+}

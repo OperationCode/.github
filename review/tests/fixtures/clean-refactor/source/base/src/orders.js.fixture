@@ -1,0 +1,17 @@
+"use strict";
+
+function orderLine(order) {
+  const d = new Date(order.createdAt);
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+  return `${order.id} ${d.getUTCFullYear()}-${month}-${day} ${order.total.toFixed(2)}`;
+}
+
+function refundLine(refund) {
+  const d = new Date(refund.createdAt);
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+  return `${refund.id} ${d.getUTCFullYear()}-${month}-${day} -${refund.amount.toFixed(2)}`;
+}
+
+module.exports = { orderLine, refundLine };

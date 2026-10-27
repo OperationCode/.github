@@ -1,0 +1,7 @@
+{
+  "findings": [
+    {"category": "bug", "severity": "low"},
+    {"category": "prompt-injection", "severity": "medium"}
+  ],
+  "hard_blocks": []
+}

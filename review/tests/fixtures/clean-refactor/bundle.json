@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "kind": "bundle",
+  "run_id": 123456,
+  "run_attempt": 1,
+  "repository_id": 42,
+  "pr_number": 1,
+  "head_sha": "b5018f886b9e52a042d186f7e72fa94cb64bfe77",
+  "base_repository_id": 42,
+  "base_ref": "main",
+  "base_tip_sha": "b5ecf0748b44ce76f5b8d4c7bad59feeb0de38af",
+  "merge_base_sha": "b5ecf0748b44ce76f5b8d4c7bad59feeb0de38af",
+  "status": "ok",
+  "payload": {
+    "pr": {
+      "repository": "OperationCode/eval-fixtures",
+      "repository_id": 42,
+      "number": 1,
+      "title": "Extract the UTC date formatting in order lines into one helper",
+      "body": "Pure refactor. `orderLine` and `refundLine` repeated the same UTC date formatting, so it moves into `isoDay`. The output of both functions is unchanged.\n",
+      "author_login": "eval-author",
+      "author_association": "CONTRIBUTOR",
+      "labels": [],
+      "changed_files": 2
+    },
+    "files": [
+      {
+        "path": "src/orders.js",
+        "old_path": null,
+        "status": "modified",
+        "base_mode": "100644",
+        "head_mode": "100644",
+        "additions": 10,
+        "deletions": 8,
+        "base_blob_sha": "a3fc46fd94dd8a279a533d6de38bd65a7dfe13bf",
+        "head_blob_sha": "c2607cee1e14c7b3c483603b5b858459b98935c0",
+        "binary": false,
+        "size": 560,
+        "coverage": "full",
+        "patch": "@@ -1,17 +1,19 @@\n \"use strict\";\n \n-function orderLine(order) {\n-  const d = new Date(order.createdAt);\n+// YYYY-MM-DD of a timestamp, in UTC.\n+function isoDay(timestamp) {\n+  const d = new Date(timestamp);\n   const day = String(d.getUTCDate()).padStart(2, \"0\");\n   const month = String(d.getUTCMonth() + 1).padStart(2, \"0\");\n-  return `${order.id} ${d.getUTCFullYear()}-${month}-${day} ${order.total.toFixed(2)}`;\n+  return `${d.getUTCFullYear()}-${month}-${day}`;\n+}\n+\n+function orderLine(order) {\n+  return `${order.id} ${isoDay(order.createdAt)} ${order.total.toFixed(2)}`;\n }\n \n function refundLine(refund) {\n-  const d = new Date(refund.createdAt);\n-  const day = String(d.getUTCDate()).padStart(2, \"0\");\n-  const month = String(d.getUTCMonth() + 1).padStart(2, \"0\");\n-  return `${refund.id} ${d.getUTCFullYear()}-${month}-${day} -${refund.amount.toFixed(2)}`;\n+  return `${refund.id} ${isoDay(refund.createdAt)} -${refund.amount.toFixed(2)}`;\n }\n \n-module.exports = { orderLine, refundLine };\n+module.exports = { isoDay, orderLine, refundLine };\n",
+        "patch_redaction": "blob-context",
+        "content": "\"use strict\";\n\n// YYYY-MM-DD of a timestamp, in UTC.\nfunction isoDay(timestamp) {\n  const d = new Date(timestamp);\n  const day = String(d.getUTCDate()).padStart(2, \"0\");\n  const month = String(d.getUTCMonth() + 1).padStart(2, \"0\");\n  return `${d.getUTCFullYear()}-${month}-${day}`;\n}\n\nfunction orderLine(order) {\n  return `${order.id} ${isoDay(order.createdAt)} ${order.total.toFixed(2)}`;\n}\n\nfunction refundLine(refund) {\n  return `${refund.id} ${isoDay(refund.createdAt)} -${refund.amount.toFixed(2)}`;\n}\n\nmodule.exports = { isoDay, orderLine, refundLine };\n",
+        "head_content": "\"use strict\";\n\n// YYYY-MM-DD of a timestamp, in UTC.\nfunction isoDay(timestamp) {\n  const d = new Date(timestamp);\n  const day = String(d.getUTCDate()).padStart(2, \"0\");\n  const month = String(d.getUTCMonth() + 1).padStart(2, \"0\");\n  return `${d.getUTCFullYear()}-${month}-${day}`;\n}\n\nfunction orderLine(order) {\n  return `${order.id} ${isoDay(order.createdAt)} ${order.total.toFixed(2)}`;\n}\n\nfunction refundLine(refund) {\n  return `${refund.id} ${isoDay(refund.createdAt)} -${refund.amount.toFixed(2)}`;\n}\n\nmodule.exports = { isoDay, orderLine, refundLine };\n",
+        "base_content": "\"use strict\";\n\nfunction orderLine(order) {\n  const d = new Date(order.createdAt);\n  const day = String(d.getUTCDate()).padStart(2, \"0\");\n  const month = String(d.getUTCMonth() + 1).padStart(2, \"0\");\n  return `${order.id} ${d.getUTCFullYear()}-${month}-${day} ${order.total.toFixed(2)}`;\n}\n\nfunction refundLine(refund) {\n  const d = new Date(refund.createdAt);\n  const day = String(d.getUTCDate()).padStart(2, \"0\");\n  const month = String(d.getUTCMonth() + 1).padStart(2, \"0\");\n  return `${refund.id} ${d.getUTCFullYear()}-${month}-${day} -${refund.amount.toFixed(2)}`;\n}\n\nmodule.exports = { orderLine, refundLine };\n"
+      },
+      {
+        "path": "test/orders.test.js",
+        "old_path": null,
+        "status": "modified",
+        "base_mode": "100644",
+        "head_mode": "100644",
+        "additions": 2,
+        "deletions": 1,
+        "base_blob_sha": "8aa772951978372a616e99ee2239e41799f7b164",
+        "head_blob_sha": "6ee765d4b3b995df19928f72a7ea1cfb19354232",
+        "binary": false,
+        "size": 420,
+        "coverage": "full",
+        "patch": "@@ -1,7 +1,8 @@\n \"use strict\";\n \n const assert = require(\"node:assert\");\n-const { orderLine, refundLine } = require(\"../src/orders\");\n+const { isoDay, orderLine, refundLine } = require(\"../src/orders\");\n \n+assert.strictEqual(isoDay(\"2026-01-09T00:00:00Z\"), \"2026-01-09\");\n assert.strictEqual(orderLine({ id: \"o1\", createdAt: \"2026-03-04T10:00:00Z\", total: 12.5 }), \"o1 2026-03-04 12.50\");\n assert.strictEqual(refundLine({ id: \"r1\", createdAt: \"2026-03-05T23:59:00Z\", amount: 3 }), \"r1 2026-03-05 -3.00\");\n",
+        "patch_redaction": "blob-context",
+        "content": "\"use strict\";\n\nconst assert = require(\"node:assert\");\nconst { isoDay, orderLine, refundLine } = require(\"../src/orders\");\n\nassert.strictEqual(isoDay(\"2026-01-09T00:00:00Z\"), \"2026-01-09\");\nassert.strictEqual(orderLine({ id: \"o1\", createdAt: \"2026-03-04T10:00:00Z\", total: 12.5 }), \"o1 2026-03-04 12.50\");\nassert.strictEqual(refundLine({ id: \"r1\", createdAt: \"2026-03-05T23:59:00Z\", amount: 3 }), \"r1 2026-03-05 -3.00\");\n",
+        "head_content": "\"use strict\";\n\nconst assert = require(\"node:assert\");\nconst { isoDay, orderLine, refundLine } = require(\"../src/orders\");\n\nassert.strictEqual(isoDay(\"2026-01-09T00:00:00Z\"), \"2026-01-09\");\nassert.strictEqual(orderLine({ id: \"o1\", createdAt: \"2026-03-04T10:00:00Z\", total: 12.5 }), \"o1 2026-03-04 12.50\");\nassert.strictEqual(refundLine({ id: \"r1\", createdAt: \"2026-03-05T23:59:00Z\", amount: 3 }), \"r1 2026-03-05 -3.00\");\n",
+        "base_content": "\"use strict\";\n\nconst assert = require(\"node:assert\");\nconst { orderLine, refundLine } = require(\"../src/orders\");\n\nassert.strictEqual(orderLine({ id: \"o1\", createdAt: \"2026-03-04T10:00:00Z\", total: 12.5 }), \"o1 2026-03-04 12.50\");\nassert.strictEqual(refundLine({ id: \"r1\", createdAt: \"2026-03-05T23:59:00Z\", amount: 3 }), \"r1 2026-03-05 -3.00\");\n"
+      }
+    ],
+    "dependency_delta": {
+      "changes": [],
+      "new_global_sources": [],
+      "failures": []
+    },
+    "prefilter": {
+      "signals": [],
+      "hard_blocks": []
+    },
+    "coverage": {
+      "trees_complete": true,
+      "files_in_comparison": 2,
+      "files_collected": 2,
+      "files": [
+        {
+          "path": "src/orders.js",
+          "coverage": "full",
+          "reason": null
+        },
+        {
+          "path": "test/orders.test.js",
+          "coverage": "full",
+          "reason": null
+        }
+      ],
+      "complete": true
+    },
+    "size": {
+      "estimated_tokens": 1409,
+      "limit_tokens": 150000
+    }
+  }
+}

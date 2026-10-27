@@ -1,0 +1,6 @@
+{
+  "findings": [
+    {"category": "bug", "severity": "low", "file": "src/views/profileCard.js", "side": "head", "verified": true}
+  ],
+  "hard_blocks": []
+}

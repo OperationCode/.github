@@ -1,0 +1,12 @@
+"use strict";
+
+// Display data for a profile card. `profile` is a plain object copied from
+// the API response; it is only read here.
+function profileCard(profile) {
+  return {
+    name: profile.displayName,
+    joined: profile.joinedYear,
+  };
+}
+
+module.exports = { profileCard };

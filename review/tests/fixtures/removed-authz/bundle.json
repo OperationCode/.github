@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "kind": "bundle",
+  "run_id": 123456,
+  "run_attempt": 1,
+  "repository_id": 42,
+  "pr_number": 4,
+  "head_sha": "de73d196f0819ec0b4f8f538b952d8a1110afeba",
+  "base_repository_id": 42,
+  "base_ref": "main",
+  "base_tip_sha": "aed8cacf50765a9d2fb55310b3579671aebca4de",
+  "merge_base_sha": "aed8cacf50765a9d2fb55310b3579671aebca4de",
+  "status": "ok",
+  "payload": {
+    "pr": {
+      "repository": "OperationCode/eval-fixtures",
+      "repository_id": 42,
+      "number": 4,
+      "title": "Simplify the invoice delete handler",
+      "body": "Cleans up the delete handler and returns 204 instead of 200.\n",
+      "author_login": "eval-author",
+      "author_association": "CONTRIBUTOR",
+      "labels": [],
+      "changed_files": 1
+    },
+    "files": [
+      {
+        "path": "src/routes/invoices.js",
+        "old_path": null,
+        "status": "modified",
+        "base_mode": "100644",
+        "head_mode": "100644",
+        "additions": 1,
+        "deletions": 4,
+        "base_blob_sha": "67f51972437af1f9d76d1806a299bc852e841501",
+        "head_blob_sha": "f50df7a30072cba954ef6d350d8cd79e9023d684",
+        "binary": false,
+        "size": 469,
+        "coverage": "full",
+        "patch": "@@ -11,11 +11,8 @@\n   if (!invoice) {\n     return res.status(404).json({ error: \"not found\" });\n   }\n-  if (invoice.ownerId !== req.user.id && !req.user.isAdmin) {\n-    return res.status(403).json({ error: \"forbidden\" });\n-  }\n   await db.invoices.remove(invoice.id);\n-  return res.status(200).json({ deleted: invoice.id });\n+  return res.status(204).end();\n });\n \n module.exports = router;\n",
+        "patch_redaction": "blob-context",
+        "content": "\"use strict\";\n\nconst express = require(\"express\");\nconst db = require(\"../db\");\nconst { requireLogin } = require(\"../auth\");\n\nconst router = express.Router();\n\nrouter.delete(\"/invoices/:id\", requireLogin, async (req, res) => {\n  const invoice = await db.invoices.findById(req.params.id);\n  if (!invoice) {\n    return res.status(404).json({ error: \"not found\" });\n  }\n  await db.invoices.remove(invoice.id);\n  return res.status(204).end();\n});\n\nmodule.exports = router;\n",
+        "head_content": "\"use strict\";\n\nconst express = require(\"express\");\nconst db = require(\"../db\");\nconst { requireLogin } = require(\"../auth\");\n\nconst router = express.Router();\n\nrouter.delete(\"/invoices/:id\", requireLogin, async (req, res) => {\n  const invoice = await db.invoices.findById(req.params.id);\n  if (!invoice) {\n    return res.status(404).json({ error: \"not found\" });\n  }\n  await db.invoices.remove(invoice.id);\n  return res.status(204).end();\n});\n\nmodule.exports = router;\n",
+        "base_content": "\"use strict\";\n\nconst express = require(\"express\");\nconst db = require(\"../db\");\nconst { requireLogin } = require(\"../auth\");\n\nconst router = express.Router();\n\nrouter.delete(\"/invoices/:id\", requireLogin, async (req, res) => {\n  const invoice = await db.invoices.findById(req.params.id);\n  if (!invoice) {\n    return res.status(404).json({ error: \"not found\" });\n  }\n  if (invoice.ownerId !== req.user.id && !req.user.isAdmin) {\n    return res.status(403).json({ error: \"forbidden\" });\n  }\n  await db.invoices.remove(invoice.id);\n  return res.status(200).json({ deleted: invoice.id });\n});\n\nmodule.exports = router;\n"
+      }
+    ],
+    "dependency_delta": {
+      "changes": [],
+      "new_global_sources": [],
+      "failures": []
+    },
+    "prefilter": {
+      "signals": [],
+      "hard_blocks": []
+    },
+    "coverage": {
+      "trees_complete": true,
+      "files_in_comparison": 1,
+      "files_collected": 1,
+      "files": [
+        {
+          "path": "src/routes/invoices.js",
+          "coverage": "full",
+          "reason": null
+        }
+      ],
+      "complete": true
+    },
+    "size": {
+      "estimated_tokens": 709,
+      "limit_tokens": 150000
+    }
+  }
+}

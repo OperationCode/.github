@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "kind": "bundle",
+  "run_id": 123456,
+  "run_attempt": 1,
+  "repository_id": 42,
+  "pr_number": 3,
+  "head_sha": "0acd44471c0059aee9254e80c597cf03dcf365d1",
+  "base_repository_id": 42,
+  "base_ref": "main",
+  "base_tip_sha": "9296ce30f33338ed74f9993d8bb263fbc1b273de",
+  "merge_base_sha": "9296ce30f33338ed74f9993d8bb263fbc1b273de",
+  "status": "ok",
+  "payload": {
+    "pr": {
+      "repository": "OperationCode/eval-fixtures",
+      "repository_id": 42,
+      "number": 3,
+      "title": "Add a member search endpoint",
+      "body": "Adds `GET /members/search?name=...` so the directory page can look members up by name.\n",
+      "author_login": "eval-author",
+      "author_association": "CONTRIBUTOR",
+      "labels": [],
+      "changed_files": 1
+    },
+    "files": [
+      {
+        "path": "src/routes/members.js",
+        "old_path": null,
+        "status": "modified",
+        "base_mode": "100644",
+        "head_mode": "100644",
+        "additions": 7,
+        "deletions": 0,
+        "base_blob_sha": "8efb7fae9709f5f9c636853ffcf037f8b3a2a80c",
+        "head_blob_sha": "3bae2b74ad27b2ef1c3f5e3e93d68187344f93b0",
+        "binary": false,
+        "size": 699,
+        "coverage": "full",
+        "patch": "@@ -5,6 +5,13 @@\n \n const router = express.Router();\n \n+router.get(\"/members/search\", async (req, res) => {\n+  const name = req.query.name || \"\";\n+  const sql = \"SELECT id, display_name, email FROM members WHERE display_name LIKE '%\" + name + \"%' ORDER BY display_name\";\n+  const { rows } = await db.query(sql);\n+  return res.json(rows);\n+});\n+\n router.get(\"/members/:id\", async (req, res) => {\n   const { rows } = await db.query(\"SELECT id, display_name FROM members WHERE id = $1\", [req.params.id]);\n   if (rows.length === 0) {\n",
+        "patch_redaction": "blob-context",
+        "content": "\"use strict\";\n\nconst express = require(\"express\");\nconst db = require(\"../db\");\n\nconst router = express.Router();\n\nrouter.get(\"/members/search\", async (req, res) => {\n  const name = req.query.name || \"\";\n  const sql = \"SELECT id, display_name, email FROM members WHERE display_name LIKE '%\" + name + \"%' ORDER BY display_name\";\n  const { rows } = await db.query(sql);\n  return res.json(rows);\n});\n\nrouter.get(\"/members/:id\", async (req, res) => {\n  const { rows } = await db.query(\"SELECT id, display_name FROM members WHERE id = $1\", [req.params.id]);\n  if (rows.length === 0) {\n    return res.status(404).json({ error: \"not found\" });\n  }\n  return res.json(rows[0]);\n});\n\nmodule.exports = router;\n",
+        "head_content": "\"use strict\";\n\nconst express = require(\"express\");\nconst db = require(\"../db\");\n\nconst router = express.Router();\n\nrouter.get(\"/members/search\", async (req, res) => {\n  const name = req.query.name || \"\";\n  const sql = \"SELECT id, display_name, email FROM members WHERE display_name LIKE '%\" + name + \"%' ORDER BY display_name\";\n  const { rows } = await db.query(sql);\n  return res.json(rows);\n});\n\nrouter.get(\"/members/:id\", async (req, res) => {\n  const { rows } = await db.query(\"SELECT id, display_name FROM members WHERE id = $1\", [req.params.id]);\n  if (rows.length === 0) {\n    return res.status(404).json({ error: \"not found\" });\n  }\n  return res.json(rows[0]);\n});\n\nmodule.exports = router;\n",
+        "base_content": "\"use strict\";\n\nconst express = require(\"express\");\nconst db = require(\"../db\");\n\nconst router = express.Router();\n\nrouter.get(\"/members/:id\", async (req, res) => {\n  const { rows } = await db.query(\"SELECT id, display_name FROM members WHERE id = $1\", [req.params.id]);\n  if (rows.length === 0) {\n    return res.status(404).json({ error: \"not found\" });\n  }\n  return res.json(rows[0]);\n});\n\nmodule.exports = router;\n"
+      }
+    ],
+    "dependency_delta": {
+      "changes": [],
+      "new_global_sources": [],
+      "failures": []
+    },
+    "prefilter": {
+      "signals": [],
+      "hard_blocks": []
+    },
+    "coverage": {
+      "trees_complete": true,
+      "files_in_comparison": 1,
+      "files_collected": 1,
+      "files": [
+        {
+          "path": "src/routes/members.js",
+          "coverage": "full",
+          "reason": null
+        }
+      ],
+      "complete": true
+    },
+    "size": {
+      "estimated_tokens": 825,
+      "limit_tokens": 150000
+    }
+  }
+}

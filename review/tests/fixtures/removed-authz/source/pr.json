@@ -1,0 +1,6 @@
+{
+  "number": 4,
+  "title": "Simplify the invoice delete handler",
+  "body": "Cleans up the delete handler and returns 204 instead of 200.\n",
+  "author_association": "CONTRIBUTOR"
+}

@@ -1,0 +1,6 @@
+{
+  "number": 2,
+  "title": "Show an Administrator badge on profile cards",
+  "body": "Profile cards now show \"Administrator\" for admin accounts and \"Member\" for everyone else.\n",
+  "author_association": "CONTRIBUTOR"
+}

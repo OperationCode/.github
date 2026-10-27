@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "kind": "bundle",
+  "run_id": 123456,
+  "run_attempt": 1,
+  "repository_id": 42,
+  "pr_number": 2,
+  "head_sha": "21ff55f0fbaf02970e12cbeb982bebc6d78ad14f",
+  "base_repository_id": 42,
+  "base_ref": "main",
+  "base_tip_sha": "376860973491c8db726749cb8761e120b0cfd704",
+  "merge_base_sha": "376860973491c8db726749cb8761e120b0cfd704",
+  "status": "ok",
+  "payload": {
+    "pr": {
+      "repository": "OperationCode/eval-fixtures",
+      "repository_id": 42,
+      "number": 2,
+      "title": "Show an Administrator badge on profile cards",
+      "body": "Profile cards now show \"Administrator\" for admin accounts and \"Member\" for everyone else.\n",
+      "author_login": "eval-author",
+      "author_association": "CONTRIBUTOR",
+      "labels": [],
+      "changed_files": 1
+    },
+    "files": [
+      {
+        "path": "src/views/profileCard.js",
+        "old_path": null,
+        "status": "modified",
+        "base_mode": "100644",
+        "head_mode": "100644",
+        "additions": 9,
+        "deletions": 1,
+        "base_blob_sha": "8e6db18df2d0d1c4869d6e3cc77ddbab7585bce8",
+        "head_blob_sha": "265d6a7c4ad627f1ae9d06de681277ba802dec25",
+        "binary": false,
+        "size": 431,
+        "coverage": "full",
+        "patch": "@@ -1,12 +1,20 @@\n \"use strict\";\n \n+function badgeFor(user) {\n+  if (user.role = \"admin\") {\n+    return \"Administrator\";\n+  }\n+  return \"Member\";\n+}\n+\n // Display data for a profile card. `profile` is a plain object copied from\n // the API response; it is only read here.\n function profileCard(profile) {\n   return {\n     name: profile.displayName,\n     joined: profile.joinedYear,\n+    badge: badgeFor(profile),\n   };\n }\n \n-module.exports = { profileCard };\n+module.exports = { badgeFor, profileCard };\n",
+        "patch_redaction": "blob-context",
+        "content": "\"use strict\";\n\nfunction badgeFor(user) {\n  if (user.role = \"admin\") {\n    return \"Administrator\";\n  }\n  return \"Member\";\n}\n\n// Display data for a profile card. `profile` is a plain object copied from\n// the API response; it is only read here.\nfunction profileCard(profile) {\n  return {\n    name: profile.displayName,\n    joined: profile.joinedYear,\n    badge: badgeFor(profile),\n  };\n}\n\nmodule.exports = { badgeFor, profileCard };\n",
+        "head_content": "\"use strict\";\n\nfunction badgeFor(user) {\n  if (user.role = \"admin\") {\n    return \"Administrator\";\n  }\n  return \"Member\";\n}\n\n// Display data for a profile card. `profile` is a plain object copied from\n// the API response; it is only read here.\nfunction profileCard(profile) {\n  return {\n    name: profile.displayName,\n    joined: profile.joinedYear,\n    badge: badgeFor(profile),\n  };\n}\n\nmodule.exports = { badgeFor, profileCard };\n",
+        "base_content": "\"use strict\";\n\n// Display data for a profile card. `profile` is a plain object copied from\n// the API response; it is only read here.\nfunction profileCard(profile) {\n  return {\n    name: profile.displayName,\n    joined: profile.joinedYear,\n  };\n}\n\nmodule.exports = { profileCard };\n"
+      }
+    ],
+    "dependency_delta": {
+      "changes": [],
+      "new_global_sources": [],
+      "failures": []
+    },
+    "prefilter": {
+      "signals": [],
+      "hard_blocks": []
+    },
+    "coverage": {
+      "trees_complete": true,
+      "files_in_comparison": 1,
+      "files_collected": 1,
+      "files": [
+        {
+          "path": "src/views/profileCard.js",
+          "coverage": "full",
+          "reason": null
+        }
+      ],
+      "complete": true
+    },
+    "size": {
+      "estimated_tokens": 784,
+      "limit_tokens": 150000
+    }
+  }
+}

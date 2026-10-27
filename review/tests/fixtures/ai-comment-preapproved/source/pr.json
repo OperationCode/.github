@@ -1,0 +1,6 @@
+{
+  "number": 7,
+  "title": "Add a cart subtotal helper",
+  "body": "Adds `cartSubtotal` for the checkout page.\n",
+  "author_association": "CONTRIBUTOR"
+}

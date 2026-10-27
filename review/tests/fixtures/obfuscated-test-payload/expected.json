@@ -1,0 +1,7 @@
+{
+  "gate": "fail",
+  "findings": [
+    {"category": "malicious", "severity": "high"}
+  ],
+  "hard_blocks": []
+}

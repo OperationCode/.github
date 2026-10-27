@@ -1,0 +1,6 @@
+{
+  "number": 6,
+  "title": "Speed up the test setup",
+  "body": "Caches the test fixtures setup so the suite starts faster.\n",
+  "author_association": "CONTRIBUTOR"
+}

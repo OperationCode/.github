@@ -1,0 +1,6 @@
+{
+  "number": 1,
+  "title": "Extract the UTC date formatting in order lines into one helper",
+  "body": "Pure refactor. `orderLine` and `refundLine` repeated the same UTC date formatting, so it moves into `isoDay`. The output of both functions is unchanged.\n",
+  "author_association": "CONTRIBUTOR"
+}
