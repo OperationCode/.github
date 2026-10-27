@@ -177,7 +177,8 @@ class FakeGitHub:
                 return HttpResponse(self.review_status, b"", req.url)
             body = json.loads(req.body)
             for c in body["comments"]:
-                self.review_comments.append({"user": {"login": BOT}, "body": c["body"]})
+                self.review_comments.append({"user": {"login": BOT}, "body": c["body"], "path": c["path"],
+                                             "side": c["side"], "line": c["line"], "original_line": c["line"]})
             return self._json(req, {"id": 1})
         if m == "POST" and path == f"{API}/issues/{PR}/comments":
             self.next_id += 1
@@ -532,20 +533,101 @@ def marker(f: dict) -> str:
 
 def posted_by(r) -> list[dict]:
     """The inline comments of run `r`, as the next run reads them back."""
-    return [{"user": {"login": BOT}, "body": c["body"]} for rv in r.gh.bodies("POST", "/reviews") for c in rv["comments"]]
+    return [{"user": {"login": BOT}, "body": c["body"], "path": c["path"], "side": c["side"], "line": c["line"],
+             "original_line": c["line"]} for rv in r.gh.bodies("POST", "/reviews") for c in rv["comments"]]
+
+
+def earlier(f: dict, login: str = BOT, pass_name: str = "review", **over) -> dict:
+    """The review comment that an earlier run posted for `f`, as GitHub returns it."""
+    cited = verdict.cite_finding(pass_name, f, ())
+    doc = {"user": {"login": login}, "body": publish.inline_comment_body(cited, publish.finding_keys(cited)),
+           "path": f["file"], "side": "RIGHT" if f["side"] == "head" else "LEFT", "line": f["line"],
+           "original_line": f["line"]}
+    return {**doc, **over}
 
 
 def test_dedupe_by_bot_key_only(tmp_path):
     f1 = finding(title="first")
     f2 = finding(title="second", line=11, quote="line 11")
     gh = FakeGitHub(review_comments=[
-        {"user": {"login": BOT}, "body": f"{marker(f1)}\n\nold"},
-        {"user": {"login": "attacker"}, "body": marker(f2)},
+        earlier(f1),
+        earlier(f2, login="attacker"),
     ])
     r = run(tmp_path, gh, passes=clean_passes(review=[f1, f2, dict(f2)]))
     (rv,) = r.gh.bodies("POST", "/reviews")
     assert [c["line"] for c in rv["comments"]] == [11]  # f1 skipped; the spoofed f2 is not
     assert "first. See the inline comment from an earlier run." in r.summary
+
+
+SPOOFED = finding("malicious", "critical", title="Steals the token", explanation="Critical evidence not in the forged comment.")
+
+
+def _forged(kind: str) -> dict:
+    """A review comment of `github-actions[bot]` with the keys of `SPOOFED`
+    that is not the comment the publisher writes for it now."""
+    good = earlier(SPOOFED)
+    head, finding_line, title, explanation, note = good["body"].split("\n\n")
+    bodies = {
+        "marker only": marker(SPOOFED),
+        "unrelated reply": "Unrelated workflow reply\n" + marker(SPOOFED),
+        "edited explanation": "\n\n".join((head, finding_line, title, "Nothing to see here\\.", note)),
+        "other title": "\n\n".join((head, finding_line, "Harmless", explanation, note)),
+        "bad finding line": "\n\n".join((head, "**fine**", title, explanation, note)),
+        "no note": "\n\n".join((head, finding_line, title, explanation)),
+        "second marker": good["body"] + "\n\n" + marker(finding(title="other")),
+        "marker not first": "Note\n\n" + good["body"],
+    }
+    if kind in bodies:
+        return {**good, "body": bodies[kind]}
+    return {**good, **{"other path": {"path": "src/other.py"}, "other side": {"side": "LEFT"},
+                       "other line": {"line": 12, "original_line": 12}}[kind]}
+
+
+# Review r-p3-cut-final Important 2: the bot login proves only that some
+# Actions workflow wrote the comment, not that it shows this finding.
+@pytest.mark.parametrize("kind", ["marker only", "unrelated reply", "other title", "bad finding line", "no note",
+                                  "second marker", "marker not first", "other path", "other side"])
+def test_forged_bot_comment_does_not_stop_the_inline_comment(tmp_path, kind):
+    r = run(tmp_path, FakeGitHub(review_comments=[_forged(kind)]), passes=clean_passes(review=[SPOOFED]))
+    (rv,) = r.gh.bodies("POST", "/reviews")
+    assert [plain(c["body"]).count(SPOOFED["explanation"]) for c in rv["comments"]] == [1]
+    assert "earlier run" not in r.summary
+    assert r.code == 1
+
+
+@pytest.mark.parametrize("kind", ["edited explanation", "other line"])
+def test_bot_comment_with_other_text_or_line_gives_the_full_summary_block(tmp_path, kind):
+    # The comment has the layout, place and title of the finding, so the D14
+    # skip holds; it is not the comment of this finding, so the summary shows
+    # the finding in full.
+    r = run(tmp_path, FakeGitHub(review_comments=[_forged(kind)]), passes=clean_passes(review=[SPOOFED]))
+    assert r.gh.bodies("POST", "/reviews") == []
+    s = plain(r.summary)
+    assert "Differs from the inline comment of an earlier run, shown here." in s
+    assert SPOOFED["explanation"] in s and "See the inline comment from an earlier run" not in s
+    assert r.code == 1
+
+
+def test_exact_bot_comment_is_the_earlier_comment(tmp_path):
+    r = run(tmp_path, FakeGitHub(review_comments=[earlier(SPOOFED)]), passes=clean_passes(review=[SPOOFED]))
+    assert r.gh.bodies("POST", "/reviews") == []
+    assert "See the inline comment from an earlier run." in r.summary
+    assert SPOOFED["explanation"] not in plain(r.summary)
+    # GitHub sets `line` to null on an outdated comment; `original_line` stays.
+    outdated = earlier(SPOOFED, line=None)
+    r = run(tmp_path / "outdated", FakeGitHub(review_comments=[outdated]), passes=clean_passes(review=[SPOOFED]))
+    assert "See the inline comment from an earlier run." in r.summary
+
+
+def test_finding_line_pattern_has_the_schema_enums():
+    props = analyze.findings_schema()["properties"]["findings"]["items"]["properties"]
+    for pass_name in verdict.PASS_NAMES:
+        for sev in props["severity"]["enum"]:
+            for cat in props["category"]["enum"]:
+                for conf in props["confidence"]["enum"]:
+                    f = verdict.cite_finding(pass_name, finding(cat, sev, confidence=conf), ())
+                    assert publish._FINDING_LINE_RE.fullmatch(publish._finding_line(f))
+    assert not publish._FINDING_LINE_RE.fullmatch("**high bug**, confidence high, pass other")
 
 
 def test_one_key_marker_is_not_read(tmp_path):
@@ -644,7 +726,7 @@ def test_moved_line_alone_shows_the_finding_in_the_summary(tmp_path):
 def test_same_d14_key_in_one_run_after_an_earlier_comment(tmp_path):
     old = finding("security", "high", title="same", explanation="Old words.")
     new = finding("malicious", "critical", title="same", explanation="Critical new words.")
-    gh = FakeGitHub(review_comments=[{"user": {"login": BOT}, "body": marker(old)}])
+    gh = FakeGitHub(review_comments=[earlier(old)])
     r = run(tmp_path, gh, passes=clean_passes(review=[old, new]))
     assert r.gh.bodies("POST", "/reviews") == []
     s = plain(r.summary)
@@ -713,7 +795,7 @@ def test_findings_that_differ_past_the_cut_are_both_posted(tmp_path):
 
 def test_finding_that_differs_past_the_cut_from_an_earlier_one_is_shown_in_full(tmp_path):
     first, second = cut_pair()
-    gh = FakeGitHub(review_comments=[{"user": {"login": BOT}, "body": marker(first)}])
+    gh = FakeGitHub(review_comments=[earlier(first)])
     r = run(tmp_path, gh, passes=clean_passes(review=[first, second]))
     assert r.gh.bodies("POST", "/reviews") == []
     s = plain(r.summary)
@@ -724,7 +806,7 @@ def test_finding_that_differs_past_the_cut_from_an_earlier_one_is_shown_in_full(
 
 def test_no_review_when_nothing_new(tmp_path):
     f1 = finding(title="first")
-    gh = FakeGitHub(review_comments=[{"user": {"login": BOT}, "body": marker(f1)}])
+    gh = FakeGitHub(review_comments=[earlier(f1)])
     r = run(tmp_path, gh, passes=clean_passes(review=[f1]))
     assert r.gh.bodies("POST", "/reviews") == []
     assert r.code == 0
@@ -733,7 +815,7 @@ def test_no_review_when_nothing_new(tmp_path):
 def test_review_comments_read_with_paging(tmp_path):
     findings = [finding(title=f"t{i}", line=10) for i in range(3)]
     filler = [{"user": {"login": BOT}, "body": "x"} for _ in range(150)]
-    gh = FakeGitHub(review_comments=filler + [{"user": {"login": BOT}, "body": marker(f)} for f in findings])
+    gh = FakeGitHub(review_comments=filler + [earlier(f) for f in findings])
     r = run(tmp_path, gh, passes=clean_passes(review=findings))
     assert r.gh.bodies("POST", "/reviews") == []
     assert sum(p.endswith(f"/pulls/{PR}/comments") for p in r.gh.paths()) == 2
@@ -945,6 +1027,67 @@ def test_reasons_kept_when_cuttable_data_is_cut(tmp_path, capsys):
     shown = re.findall(r"^- prefilter-hard-block \(not waivable\): foreign-source in p(\d{4})/", plain(s), re.M)
     assert shown == [f"{i:04d}" for i in range(60)]
     assert s.rstrip().endswith("The result that counts is the required workflow in the merge box.")
+
+
+CUT_PATH = "abcde/" * 75 + "setup.js"  # over the file limit: analyze cuts it to a final "/"
+
+
+def cut_path_passes(label: str, counts=(("review", 10), ("security", 10), ("supply-chain", 15)), pad=1100):
+    """Critical findings with a cut path (so unverified), at the per-pass limits."""
+    out = {}
+    for p, n in counts:
+        doc = {"summary": "ok", "findings": [
+            finding("malicious", "critical", file=CUT_PATH, title=f"{p} issue {i}",
+                    explanation=f"{label} claim {p} {i} " + "!" * pad) for i in range(n)]}
+        analyze.cut_to_limits(doc, analyze.findings_schema())
+        assert all(f["file"].endswith("/") for f in doc["findings"])
+        out[p] = pass_doc(p, **doc)
+    return out
+
+
+def claims(passes: dict) -> list[str]:
+    return [f["explanation"].split("!")[0].strip() for p in passes.values() for f in p["payload"]["findings"]]
+
+
+def test_critical_findings_with_a_cut_path_are_never_cut_from_the_summary(tmp_path, capsys):
+    # Review r-p3-cut-final Important 1, probe 3: every critical explanation
+    # is in the summary, or the run fails closed with the size notice.
+    passes = cut_path_passes("CRITICAL")
+    r = run(tmp_path, passes=passes)
+    assert r.code == 1 and r.gh.bodies("POST", "/reviews") == []
+    s = plain(r.summary)
+    assert publish.OVERFLOW_NOTE in s and "### Summary too large" in s
+    assert not any(c in s for c in claims(passes))  # no partial list
+    assert r.record["result"] == "fail" and r.record["publish_error"]
+    rec = full_record_from_log(capsys.readouterr().out)
+    assert len([f for f in rec["findings"] if f["severity"] == "critical"]) == 35
+
+
+def test_unverified_high_and_critical_findings_stay_when_others_are_cut(tmp_path):
+    passes = cut_path_passes("CRITICAL", counts=(("supply-chain", 3),))
+    passes["supply-chain"]["payload"]["findings"].append(
+        finding("security", "high", title="unverified high", quote="not there", explanation="HIGH claim kept"))
+    passes["review"] = pass_doc("review", findings=[
+        finding(title=f"low {i}", quote="not there", explanation=f"LOW claim {i} " + "!" * 1100) for i in range(10)])
+    passes["security"] = pass_doc("security", findings=[
+        finding(severity="medium", title=f"medium {i}", line=25, quote="line 25",
+                explanation=f"MEDIUM claim {i} " + "!" * 1100) for i in range(10)])
+    r = run(tmp_path, bundle=bundle_doc(delta=dep_delta(250)), passes=passes)
+    s = plain(r.summary)
+    assert r.code == 1 and publish.OVERFLOW_NOTE not in s
+    assert "pass-records" not in s
+    assert publish.TRUNCATED_NOTE in s and "LOW claim 9" not in s
+    for c in claims({"supply-chain": passes["supply-chain"]}):
+        assert c in s
+    assert "HIGH claim kept" in s
+
+
+def test_unverified_finding_ranks():
+    def rank(sev):
+        f = verdict.cite_finding("review", finding(severity=sev, quote="not there"), ())
+        assert not f.verified
+        return publish._finding_block(f, publish.InlineOutcome()).rank
+    assert [rank(s) for s in ("low", "medium", "high", "critical")] == [publish.CUT_UNVERIFIED] * 2 + [None] * 2
 
 
 def test_reasons_that_do_not_fit_fail_closed(tmp_path, capsys):

@@ -692,23 +692,48 @@ def finding_key(f: verdict.CitedFinding) -> str:
     return finding_keys(f).full
 
 
-def read_posted_keys(api: GitHubApi, ctx: PublishContext) -> dict[str, frozenset[str]]:
-    """The full keys of each D14 key in the review comments of
-    `github-actions[bot]` on the PR. A read error gives no keys, so findings
-    are posted again, never hidden."""
+@dataclass(frozen=True)
+class PostedComment:
+    """A review comment of `github-actions[bot]` whose body starts with the
+    one marker it holds. `lines` holds its `line` and `original_line`."""
+
+    d14: str
+    full: str
+    body: str
+    path: str
+    side: str
+    lines: frozenset[int]
+
+
+def _int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def read_posted_comments(api: GitHubApi, ctx: PublishContext) -> dict[str, tuple[PostedComment, ...]]:
+    """The review comments of `github-actions[bot]` on the PR that start with
+    their only marker, by D14 key. The login proves only that some Actions
+    workflow in the repo wrote a comment, so `build_review` also checks its
+    text. A read error gives no comments, so findings are posted again, never
+    hidden."""
     try:
         items = api.get_pages(f"{ctx.repo_path}/pulls/{ctx.pr_number}/comments")
     except collect.CollectError:
         return {}
-    keys: dict[str, set[str]] = {}
+    out: dict[str, list[PostedComment]] = {}
     for item in items:
         if not isinstance(item, Mapping):
             continue
-        user, body = item.get("user"), item.get("body")
-        if isinstance(user, Mapping) and user.get("login") == verdict.BOT_LOGIN and isinstance(body, str):
-            for d14, full in _FINDING_KEY_RE.findall(body):
-                keys.setdefault(d14, set()).add(full)
-    return {d14: frozenset(fulls) for d14, fulls in keys.items()}
+        user, body, path, side = (item.get(k) for k in ("user", "body", "path", "side"))
+        if not (isinstance(user, Mapping) and user.get("login") == verdict.BOT_LOGIN):
+            continue
+        if not (isinstance(body, str) and isinstance(path, str) and isinstance(side, str)):
+            continue
+        m = _FINDING_KEY_RE.match(body)
+        if m is None or len(_FINDING_KEY_RE.findall(body)) != 1:
+            continue
+        lines = frozenset(n for n in (_int(item.get("line")), _int(item.get("original_line"))) if n is not None)
+        out.setdefault(m.group(1), []).append(PostedComment(m.group(1), m.group(2), body, path, side, lines))
+    return {d14: tuple(cs) for d14, cs in out.items()}
 
 
 def _diff_path(f: verdict.CitedFinding, files: Sequence[verdict.FileSides]) -> str | None:
@@ -740,6 +765,29 @@ def inline_comment_body(f: verdict.CitedFinding, keys: FindingKeys) -> str:
     )
 
 
+# The finding line of an inline comment, from the schema enums and our pass names.
+_FINDING_LINE_RE = re.compile(
+    r"\*\*(?:low|medium|high|critical) (?:bug|security|supply-chain|malicious|prompt-injection)\*\*, "
+    r"confidence (?:low|medium|high), pass (?:" + "|".join(map(re.escape, verdict.PASS_NAMES)) + ")"
+)
+
+
+def _shows_same_place(c: PostedComment, f: verdict.CitedFinding, path: str, side: str) -> bool:
+    """`c` has the layout of `inline_comment_body` (marker, finding line,
+    title, explanation, note), at `path` and `side`, with the title of `f`.
+    Its explanation and line can differ: the D14 key covers neither."""
+    parts = c.body.split("\n\n")
+    return (
+        c.path == path
+        and c.side == side
+        and len(parts) == 5
+        and _FINDING_LINE_RE.fullmatch(parts[1]) is not None
+        and parts[2] == _esc("title", f.title)
+        and parts[3] != ""
+        and parts[4] == f"_{UNTRUSTED_NOTE}_"
+    )
+
+
 @dataclass(frozen=True)
 class InlineOutcome:
     """Full keys posted by this run, full keys already on the PR, full keys
@@ -757,12 +805,19 @@ class InlineOutcome:
 def build_review(
     result: verdict.GateResult,
     files: Sequence[verdict.FileSides],
-    posted: Mapping[str, frozenset[str]],
+    posted: Mapping[str, Sequence[PostedComment]],
     head_sha: str,
 ) -> tuple[dict[str, Any] | None, InlineOutcome]:
-    """The review request for verified, inline-eligible findings whose D14 key
-    is not on the PR yet, deduped by full key. Returns (request or None, the
-    outcome if the request is posted)."""
+    """The review request for verified, inline-eligible findings that no
+    earlier comment shows, deduped by full key. Returns (request or None, the
+    outcome if the request is posted).
+
+    An earlier comment with the D14 key of a finding counts only when it has
+    the inline layout, the same path, side and title (`_shows_same_place`);
+    then the finding is not posted again. It is `earlier` only when that
+    comment is, in full, the body this run would write, at the same line;
+    else it is `changed` and the summary shows it in full. So a forged marker
+    can at most move a finding from inline to its full summary block."""
     comments = []
     new: set[str] = set()
     earlier: set[str] = set()
@@ -771,21 +826,18 @@ def build_review(
         if not (f.verified and f.inline):
             continue
         keys = finding_keys(f)
-        if keys.d14 in posted:
-            (earlier if keys.full in posted[keys.d14] else changed).add(keys.full)
-            continue
         path = _diff_path(f, files)
+        side = "RIGHT" if f.side == "head" else "LEFT"
+        body = inline_comment_body(f, keys)
+        same = [c for c in posted.get(keys.d14, ()) if path is not None and _shows_same_place(c, f, path, side)]
+        if same:
+            exact = any(c.full == keys.full and c.body == body and f.line in c.lines for c in same)
+            (earlier if exact else changed).add(keys.full)
+            continue
         if keys.full in new or path is None:
             continue
         new.add(keys.full)
-        comments.append(
-            {
-                "path": path,
-                "line": f.line,
-                "side": "RIGHT" if f.side == "head" else "LEFT",
-                "body": inline_comment_body(f, keys),
-            }
-        )
+        comments.append({"path": path, "line": f.line, "side": side, "body": body})
     outcome = InlineOutcome(posted=frozenset(new), earlier=frozenset(earlier), changed=frozenset(changed))
     if not comments:
         return None, outcome
@@ -813,10 +865,11 @@ OVERFLOW_NOTE = (
     "Reasons, SHAs and override data are never cut, so this run fails closed."
 )
 
-# Cut order (D8): unverified findings, low and medium findings, dependency
-# delta, signals. Every other block has no rank and is never cut: reasons,
-# result, SHAs, override data, and also the blocks D8 does not list (high and
-# critical findings, model summaries, hard block and coverage details).
+# Cut order (D8): unverified low and medium findings, low and medium findings,
+# dependency delta, signals. Every other block has no rank and is never cut:
+# reasons, result, SHAs, override data, and also the blocks D8 does not list
+# (high and critical findings, verified or not, model summaries, hard block
+# and coverage details).
 CUT_UNVERIFIED = 0
 CUT_LOW_MEDIUM = 1
 CUT_DEPENDENCY = 2
@@ -902,7 +955,10 @@ def _finding_where(f: verdict.CitedFinding) -> str:
 def _finding_block(f: verdict.CitedFinding, inline: InlineOutcome) -> _Block:
     key = finding_key(f)
     head = f"- {_finding_line(f)}, at {_finding_where(f)}: {_esc('title', f.title)}"
-    rank = None if f.severity in verdict.BLOCKING_SEVERITIES else CUT_LOW_MEDIUM
+    # A high or critical finding is never cut, also when it is unverified
+    # (a cut file path makes it so).
+    protected = f.severity in verdict.BLOCKING_SEVERITIES
+    rank = None if protected else CUT_LOW_MEDIUM
     group = f"findings-{f.pass_name}"
     if not f.verified:
         return _Block(
@@ -914,7 +970,7 @@ def _finding_block(f: verdict.CitedFinding, inline: InlineOutcome) -> _Block:
                     f"Quote: {_esc('quote', f.quote)}",
                 )
             ),
-            CUT_UNVERIFIED,
+            None if protected else CUT_UNVERIFIED,
             "unverified",
         )
     if key in inline.posted:
@@ -1370,7 +1426,7 @@ def post_inline_review(
     when the fresh snapshot check before the write shows the run stale."""
     if not any(f.verified and f.inline for f in result.findings):
         return InlineOutcome()
-    request, outcome = build_review(result, files, read_posted_keys(api, ctx), head_sha)
+    request, outcome = build_review(result, files, read_posted_comments(api, ctx), head_sha)
     if request is None:
         return outcome
     check = check_snapshot(api, ctx, snap)
