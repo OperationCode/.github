@@ -50,7 +50,7 @@ import sys
 import unicodedata
 import urllib.parse
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -158,6 +158,13 @@ def escape_text(text: str, limit: int, *, multiline: bool = False) -> str:
         raise TypeError("escape_text takes a str")
     if not isinstance(limit, int) or limit < 1:
         raise ValueError("limit must be a positive int")
+    joined, cut = _clean_text(text, limit, multiline)
+    escaped = "\\\n".join(_escape_line(line) for line in joined.split("\n"))
+    return escaped + TRUNCATED if cut else escaped
+
+
+def _clean_text(text: str, limit: int, multiline: bool) -> tuple[str, bool]:
+    """The redacted, cut text that `escape_text` escapes, and whether it was cut."""
     text = redact_text(strip_controls(text))
     lines = [" ".join(line.split()) for line in text.split("\n")]
     lines = [line for line in lines if line]
@@ -165,8 +172,14 @@ def escape_text(text: str, limit: int, *, multiline: bool = False) -> str:
     cut = len(joined) > limit
     if cut:
         joined = joined[:limit].rstrip()
-    escaped = "\\\n".join(_escape_line(line) for line in joined.split("\n"))
-    return escaped + TRUNCATED if cut else escaped
+    return joined, cut
+
+
+def shown_field(kind: str, text: str) -> str:
+    """The text of a field as the reader sees it, before Markdown escaping:
+    redacted and cut to the field limit, with a mark when cut."""
+    joined, cut = _clean_text(text, LIMITS[kind], kind in MULTILINE)
+    return joined + "… [truncated]" if cut else joined
 
 
 def escape_field(kind: str, text: str) -> str:
@@ -644,39 +657,58 @@ def read_runs(api: GitHubApi, ctx: PublishContext, head_sha: str) -> verdict.Run
 # Inline review
 # ---------------------------------------------------------------------------
 
-_FINDING_KEY_RE = re.compile(r"<!-- oc-finding:([0-9a-f]{64}) -->")
+_FINDING_KEY_RE = re.compile(r"<!-- oc-finding:([0-9a-f]{64}) ([0-9a-f]{64}) -->")
 UNTRUSTED_NOTE = "Model output from untrusted input. Check it before you act on it."
 VERIFIED_NOTE = "Verified means only that the quoted text is at that place. It does not mean the claim is true."
 
 
+@dataclass(frozen=True)
+class FindingKeys:
+    """The two keys of a finding, both from the shown (redacted, cut) text.
+
+    `d14` is the SHA-256 of `file\\0side\\0title\\0quote`. It does not change
+    when the line moves or the explanation is worded again, so it is the
+    across-run key. `full` is the SHA-256 of the JSON list of every shown
+    field. Two findings share it only when they show the same text, so it is
+    the in-run key (P3-2)."""
+
+    d14: str
+    full: str
+
+
+def finding_keys(f: verdict.CitedFinding) -> FindingKeys:
+    file, title, quote = (shown_field(k, getattr(f, k)) for k in ("file", "title", "quote"))
+    explanation = shown_field("explanation", f.explanation)
+    d14 = "\0".join((file, f.side, title, quote))
+    # `json.dumps` with its defaults gives the same ASCII text for the same values.
+    full = json.dumps([f.pass_name, f.category, f.severity, f.confidence, file, f.side, f.line,
+                       title, quote, explanation])
+    return FindingKeys(hashlib.sha256(d14.encode("utf-8")).hexdigest(),
+                       hashlib.sha256(full.encode("ascii")).hexdigest())
+
+
 def finding_key(f: verdict.CitedFinding) -> str:
-    """SHA-256 of the JSON list of every field that the reader sees (D14, P3-2).
-
-    Two findings share a key only when they show the same text, so a shared
-    key never hides a different explanation. A cut or a redaction can make
-    two different findings equal in file, title and quote, at any length.
-    The JSON of strings and integers with the default `json.dumps` settings
-    is ASCII and the same on every run, so the key is stable across runs."""
-    fields = [f.pass_name, f.category, f.severity, f.confidence, f.file, f.side, f.line,
-              f.title, f.quote, f.explanation]
-    return hashlib.sha256(json.dumps(fields).encode("ascii")).hexdigest()
+    """The full key, which names a finding in `InlineOutcome`."""
+    return finding_keys(f).full
 
 
-def read_posted_keys(api: GitHubApi, ctx: PublishContext) -> frozenset[str]:
-    """Dedupe keys in the review comments of `github-actions[bot]` on the PR.
-    A read error gives no keys, so findings are posted again, never hidden."""
+def read_posted_keys(api: GitHubApi, ctx: PublishContext) -> dict[str, frozenset[str]]:
+    """The full keys of each D14 key in the review comments of
+    `github-actions[bot]` on the PR. A read error gives no keys, so findings
+    are posted again, never hidden."""
     try:
         items = api.get_pages(f"{ctx.repo_path}/pulls/{ctx.pr_number}/comments")
     except collect.CollectError:
-        return frozenset()
-    keys: set[str] = set()
+        return {}
+    keys: dict[str, set[str]] = {}
     for item in items:
         if not isinstance(item, Mapping):
             continue
         user, body = item.get("user"), item.get("body")
         if isinstance(user, Mapping) and user.get("login") == verdict.BOT_LOGIN and isinstance(body, str):
-            keys.update(_FINDING_KEY_RE.findall(body))
-    return frozenset(keys)
+            for d14, full in _FINDING_KEY_RE.findall(body):
+                keys.setdefault(d14, set()).add(full)
+    return {d14: frozenset(fulls) for d14, fulls in keys.items()}
 
 
 def _diff_path(f: verdict.CitedFinding, files: Sequence[verdict.FileSides]) -> str | None:
@@ -696,10 +728,10 @@ def _finding_line(f: verdict.CitedFinding) -> str:
     return f"**{f.severity} {f.category}**, confidence {f.confidence}, pass {f.pass_name}"
 
 
-def inline_comment_body(f: verdict.CitedFinding, key: str) -> str:
+def inline_comment_body(f: verdict.CitedFinding, keys: FindingKeys) -> str:
     return "\n\n".join(
         (
-            f"<!-- oc-finding:{key} -->",
+            f"<!-- oc-finding:{keys.d14} {keys.full} -->",
             _finding_line(f),
             _esc("title", f.title),
             _esc("explanation", f.explanation),
@@ -710,11 +742,14 @@ def inline_comment_body(f: verdict.CitedFinding, key: str) -> str:
 
 @dataclass(frozen=True)
 class InlineOutcome:
-    """Keys posted by this run, keys already on the PR, and keys that this
-    run could not post (they show in full in the summary, D7)."""
+    """Full keys posted by this run, full keys already on the PR, full keys
+    whose D14 key is on the PR under other full keys (they show in full in
+    the summary), and full keys that this run could not post (they show in
+    full in the summary, D7)."""
 
     posted: frozenset[str] = frozenset()
     earlier: frozenset[str] = frozenset()
+    changed: frozenset[str] = frozenset()
     not_posted: frozenset[str] = frozenset()
     note: str | None = None
 
@@ -722,41 +757,44 @@ class InlineOutcome:
 def build_review(
     result: verdict.GateResult,
     files: Sequence[verdict.FileSides],
-    posted: frozenset[str],
+    posted: Mapping[str, frozenset[str]],
     head_sha: str,
-) -> tuple[dict[str, Any] | None, frozenset[str], frozenset[str]]:
-    """The review request for verified, inline-eligible findings that are not
-    on the PR yet. Returns (request or None, new keys, keys already posted)."""
+) -> tuple[dict[str, Any] | None, InlineOutcome]:
+    """The review request for verified, inline-eligible findings whose D14 key
+    is not on the PR yet, deduped by full key. Returns (request or None, the
+    outcome if the request is posted)."""
     comments = []
     new: set[str] = set()
     earlier: set[str] = set()
+    changed: set[str] = set()
     for f in result.findings:
         if not (f.verified and f.inline):
             continue
-        key = finding_key(f)
-        if key in posted:
-            earlier.add(key)
+        keys = finding_keys(f)
+        if keys.d14 in posted:
+            (earlier if keys.full in posted[keys.d14] else changed).add(keys.full)
             continue
         path = _diff_path(f, files)
-        if key in new or path is None:
+        if keys.full in new or path is None:
             continue
-        new.add(key)
+        new.add(keys.full)
         comments.append(
             {
                 "path": path,
                 "line": f.line,
                 "side": "RIGHT" if f.side == "head" else "LEFT",
-                "body": inline_comment_body(f, key),
+                "body": inline_comment_body(f, keys),
             }
         )
+    outcome = InlineOutcome(posted=frozenset(new), earlier=frozenset(earlier), changed=frozenset(changed))
     if not comments:
-        return None, frozenset(), frozenset(earlier)
+        return None, outcome
     body = (
         f"OC Claude review, run {result.run_id}: {len(comments)} inline finding(s). "
         f"{UNTRUSTED_NOTE} The gate result is in the summary comment."
     )
     request = {"commit_id": head_sha, "event": REVIEW_EVENT, "body": body, "comments": comments}
-    return request, frozenset(new), frozenset(earlier)
+    return request, outcome
 
 
 # ---------------------------------------------------------------------------
@@ -883,7 +921,9 @@ def _finding_block(f: verdict.CitedFinding, inline: InlineOutcome) -> _Block:
         return _Block(f"{head}. See the inline comment.", rank, group)
     if key in inline.earlier:
         return _Block(f"{head}. See the inline comment from an earlier run.", rank, group)
-    if key in inline.not_posted:
+    if key in inline.changed:
+        where = "Differs from the inline comment of an earlier run, shown here."
+    elif key in inline.not_posted:
         where = "Inline comment not posted, shown here."
     elif f.file in verdict.META_PATHS:
         where = "PR title or body, summary only."
@@ -1330,9 +1370,9 @@ def post_inline_review(
     when the fresh snapshot check before the write shows the run stale."""
     if not any(f.verified and f.inline for f in result.findings):
         return InlineOutcome()
-    request, new, earlier = build_review(result, files, read_posted_keys(api, ctx), head_sha)
+    request, outcome = build_review(result, files, read_posted_keys(api, ctx), head_sha)
     if request is None:
-        return InlineOutcome(earlier=earlier)
+        return outcome
     check = check_snapshot(api, ctx, snap)
     if check.blocks_writes:
         print(f"publish: {check.describe()} before the inline review; no more writes", file=sys.stderr)
@@ -1348,8 +1388,10 @@ def post_inline_review(
         else:
             why = "the inline review could not be posted"
         print(f"publish: {why}: {exc}", file=sys.stderr)
-        return InlineOutcome(earlier=earlier, not_posted=new, note=f"{why}; its findings are shown in full here.")
-    return InlineOutcome(posted=new, earlier=earlier)
+        return replace(
+            outcome, posted=frozenset(), not_posted=outcome.posted, note=f"{why}; its findings are shown in full here."
+        )
+    return outcome
 
 
 def _artifact_stale(result: verdict.GateResult) -> bool:

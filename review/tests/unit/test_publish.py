@@ -507,7 +507,7 @@ def test_inline_review_only_verified_and_eligible(tmp_path):
     got = sorted((c["path"], c["line"], c["side"]) for c in rv["comments"])
     assert got == [("src/app.py", 10, "LEFT"), ("src/app.py", 10, "RIGHT")]
     for c in rv["comments"]:
-        assert re.match(r"<!-- oc-finding:[0-9a-f]{64} -->\n\n", c["body"])
+        assert re.match(r"<!-- oc-finding:[0-9a-f]{64} [0-9a-f]{64} -->\n\n", c["body"])
         assert publish.UNTRUSTED_NOTE in c["body"]
     s = r.summary
     assert "in diff head. See the inline comment." in s
@@ -525,27 +525,132 @@ def test_inline_rename_base_side_uses_new_path(tmp_path):
     assert [(c["path"], c["side"]) for c in rv["comments"]] == [("src/new.py", "LEFT")]
 
 
+def marker(f: dict) -> str:
+    keys = publish.finding_keys(verdict.cite_finding("review", f, ()))
+    return f"<!-- oc-finding:{keys.d14} {keys.full} -->"
+
+
+def posted_by(r) -> list[dict]:
+    """The inline comments of run `r`, as the next run reads them back."""
+    return [{"user": {"login": BOT}, "body": c["body"]} for rv in r.gh.bodies("POST", "/reviews") for c in rv["comments"]]
+
+
 def test_dedupe_by_bot_key_only(tmp_path):
     f1 = finding(title="first")
     f2 = finding(title="second", line=11, quote="line 11")
-    key1 = publish.finding_key(verdict.cite_finding("review", f1, ()))
-    key2 = publish.finding_key(verdict.cite_finding("review", f2, ()))
     gh = FakeGitHub(review_comments=[
-        {"user": {"login": BOT}, "body": f"<!-- oc-finding:{key1} -->\n\nold"},
-        {"user": {"login": "attacker"}, "body": f"<!-- oc-finding:{key2} -->"},
+        {"user": {"login": BOT}, "body": f"{marker(f1)}\n\nold"},
+        {"user": {"login": "attacker"}, "body": marker(f2)},
     ])
     r = run(tmp_path, gh, passes=clean_passes(review=[f1, f2, dict(f2)]))
     (rv,) = r.gh.bodies("POST", "/reviews")
-    assert [c["line"] for c in rv["comments"]] == [11]  # key1 skipped; the spoofed key2 is not
+    assert [c["line"] for c in rv["comments"]] == [11]  # f1 skipped; the spoofed f2 is not
     assert "first. See the inline comment from an earlier run." in r.summary
 
 
-def test_finding_key_covers_every_shown_field_and_is_stable():
-    c = verdict.cite_finding("review", finding(), ())
+def test_one_key_marker_is_not_read(tmp_path):
+    # A marker with one key (the format before the two-key marker) is not
+    # read, so its finding is posted again, never hidden.
+    f1 = finding(title="first")
+    d14 = publish.finding_keys(verdict.cite_finding("review", f1, ())).d14
+    gh = FakeGitHub(review_comments=[{"user": {"login": BOT}, "body": f"<!-- oc-finding:{d14} -->"}])
+    r = run(tmp_path, gh, passes=clean_passes(review=[f1]))
+    (rv,) = r.gh.bodies("POST", "/reviews")
+    assert len(rv["comments"]) == 1
+
+
+def test_finding_keys_are_fixed():
+    keys = publish.finding_keys(verdict.cite_finding("review", finding(), ()))
+    # D14: the format before P3-2, so comments posted then still match.
+    assert keys.d14 == hashlib.sha256(b"src/app.py\0head\0t\0shell=True").hexdigest()
     raw = b'["review", "bug", "low", "high", "src/app.py", "head", 10, "t", "shell=True", "e"]'
-    assert publish.finding_key(c) == hashlib.sha256(raw).hexdigest()
-    # A fixed value: a change to the key format re-posts every earlier comment.
-    assert publish.finding_key(c) == "cd2365850b5f3a1b4a9cc356d224471b66f23a5353b3110a0ed072271c55ad52"
+    assert keys.full == hashlib.sha256(raw).hexdigest()
+    # Fixed values: a change to the key format re-posts every earlier comment.
+    assert keys.d14 == "397e93ee9b12a9cb82eb2bcfb2fba39ce085c18618932418e458293ad4e6c29e"
+    assert keys.full == "cd2365850b5f3a1b4a9cc356d224471b66f23a5353b3110a0ed072271c55ad52"
+    assert publish.finding_key(verdict.cite_finding("review", finding(), ())) == keys.full
+
+
+def test_marker_has_a_fixed_size_and_comment_limits_do_not_change(tmp_path):
+    long = finding(explanation="word " * 240)  # at the explanation limit
+    r = run(tmp_path, passes=clean_passes(review=[long]))
+    (rv,) = r.gh.bodies("POST", "/reviews")
+    (c,) = rv["comments"]
+    head, rest = c["body"].split("\n\n", 1)
+    assert len(head) == len("<!-- oc-finding: -->") + 64 + 1 + 64
+    assert rest == publish.inline_comment_body(
+        verdict.cite_finding("review", long, ()), publish.FindingKeys("0" * 64, "0" * 64)).split("\n\n", 1)[1]
+    assert "word " * 239 + "word" in plain(rest) and publish.TRUNCATED not in rest
+    assert publish.LIMITS["explanation"] == 1200 and publish.SUMMARY_LIMIT == 64_000
+
+
+@pytest.mark.parametrize("field", ["title", "quote", "explanation", "file"])
+def test_keys_are_of_the_redacted_text(field):
+    # Review rr-p3-cut-fix2 Minor 1: a published key of the raw text is a
+    # guess check for the redacted part.
+    other = "ghp_" + "Z" * 36
+    def keys(token):
+        return publish.finding_keys(verdict.cite_finding("review", finding(**{field: f"Uses {token} here"}), ()))
+    assert publish.shown_field(field, f"Uses {GH_TOKEN} here") == publish.shown_field(field, f"Uses {other} here")
+    assert keys(GH_TOKEN) == keys(other)
+    assert keys(GH_TOKEN) != keys("nothing")
+
+
+def test_rerun_with_the_same_findings_posts_nothing_new(tmp_path):
+    passes = clean_passes(review=[finding(title="bug", explanation="Same words.")])
+    first = run(tmp_path / "1", passes=passes)
+    assert len(posted_by(first)) == 1
+    second = run(tmp_path / "2", FakeGitHub(review_comments=posted_by(first)), passes=passes)
+    assert second.gh.bodies("POST", "/reviews") == []
+    assert "bug. See the inline comment from an earlier run." in second.summary
+    assert "Same words." not in second.summary
+
+
+def moved_bundle():
+    """The head of `bundle_doc` with one line added at the top: the finding moves from line 10 to 11."""
+    head = "added line\n" + HEAD_TEXT
+    return bundle_doc(files=[{"path": "src/app.py", "old_path": None, "status": "modified",
+                              "base_content": BASE_TEXT, "head_content": head}])
+
+
+def test_rerun_with_new_words_and_a_moved_line_shows_the_finding_in_the_summary(tmp_path):
+    first = run(tmp_path / "1", passes=clean_passes(review=[finding(title="bug", explanation="Old words.")]))
+    assert len(posted_by(first)) == 1
+    moved = finding(title="bug", line=11, explanation="New words: a different claim.")
+    second = run(tmp_path / "2", FakeGitHub(review_comments=posted_by(first)), bundle=moved_bundle(),
+                 passes=clean_passes(review=[moved]))
+    assert second.gh.bodies("POST", "/reviews") == []  # no second inline comment
+    s = plain(second.summary)
+    assert "Differs from the inline comment of an earlier run, shown here." in s
+    assert "New words: a different claim." in s and "**low bug**" in s
+    # The next run with the same words matches the comment of the first run
+    # by D14 key only, so it still shows the new words in full.
+    third = run(tmp_path / "3", FakeGitHub(review_comments=posted_by(first)), bundle=moved_bundle(),
+                passes=clean_passes(review=[moved]))
+    assert "New words: a different claim." in plain(third.summary)
+
+
+def test_moved_line_alone_shows_the_finding_in_the_summary(tmp_path):
+    # The line is a shown field, so the full key differs, and the summary
+    # shows the new place.
+    first = run(tmp_path / "1", passes=clean_passes(review=[finding(title="bug", explanation="Same words.")]))
+    second = run(tmp_path / "2", FakeGitHub(review_comments=posted_by(first)), bundle=moved_bundle(),
+                 passes=clean_passes(review=[finding(title="bug", line=11, explanation="Same words.")]))
+    assert second.gh.bodies("POST", "/reviews") == []
+    assert "src/app.py line 11 (head)" in plain(second.summary)
+    assert "Differs from the inline comment of an earlier run" in plain(second.summary)
+
+
+def test_same_d14_key_in_one_run_after_an_earlier_comment(tmp_path):
+    old = finding("security", "high", title="same", explanation="Old words.")
+    new = finding("malicious", "critical", title="same", explanation="Critical new words.")
+    gh = FakeGitHub(review_comments=[{"user": {"login": BOT}, "body": marker(old)}])
+    r = run(tmp_path, gh, passes=clean_passes(review=[old, new]))
+    assert r.gh.bodies("POST", "/reviews") == []
+    s = plain(r.summary)
+    assert "same. See the inline comment from an earlier run." in s
+    assert "Differs from the inline comment of an earlier run, shown here." in s
+    assert "Critical new words." in s and "Old words." not in s
 
 
 def test_findings_below_the_limits_that_differ_in_explanation_are_both_posted(tmp_path):
@@ -606,21 +711,20 @@ def test_findings_that_differ_past_the_cut_are_both_posted(tmp_path):
     assert any("Second distinct explanation: secret theft." in b for b in bodies)
 
 
-def test_finding_that_differs_past_the_cut_from_an_earlier_one_is_posted(tmp_path):
+def test_finding_that_differs_past_the_cut_from_an_earlier_one_is_shown_in_full(tmp_path):
     first, second = cut_pair()
-    key = publish.finding_key(verdict.cite_finding("review", first, ()))
-    gh = FakeGitHub(review_comments=[{"user": {"login": BOT}, "body": f"<!-- oc-finding:{key} -->"}])
+    gh = FakeGitHub(review_comments=[{"user": {"login": BOT}, "body": marker(first)}])
     r = run(tmp_path, gh, passes=clean_passes(review=[first, second]))
-    (rv,) = r.gh.bodies("POST", "/reviews")
-    assert [c["line"] for c in rv["comments"]] == [10]
-    assert "Second distinct explanation: secret theft." in plain(rv["comments"][0]["body"])
-    assert "See the inline comment from an earlier run." in r.summary
+    assert r.gh.bodies("POST", "/reviews") == []
+    s = plain(r.summary)
+    assert "See the inline comment from an earlier run." in s
+    assert "Differs from the inline comment of an earlier run, shown here." in s
+    assert "Second distinct explanation: secret theft." in s
 
 
 def test_no_review_when_nothing_new(tmp_path):
     f1 = finding(title="first")
-    key = publish.finding_key(verdict.cite_finding("review", f1, ()))
-    gh = FakeGitHub(review_comments=[{"user": {"login": BOT}, "body": f"<!-- oc-finding:{key} -->"}])
+    gh = FakeGitHub(review_comments=[{"user": {"login": BOT}, "body": marker(f1)}])
     r = run(tmp_path, gh, passes=clean_passes(review=[f1]))
     assert r.gh.bodies("POST", "/reviews") == []
     assert r.code == 0
@@ -628,9 +732,8 @@ def test_no_review_when_nothing_new(tmp_path):
 
 def test_review_comments_read_with_paging(tmp_path):
     findings = [finding(title=f"t{i}", line=10) for i in range(3)]
-    keys = [publish.finding_key(verdict.cite_finding("review", f, ())) for f in findings]
     filler = [{"user": {"login": BOT}, "body": "x"} for _ in range(150)]
-    gh = FakeGitHub(review_comments=filler + [{"user": {"login": BOT}, "body": f"<!-- oc-finding:{k} -->"} for k in keys])
+    gh = FakeGitHub(review_comments=filler + [{"user": {"login": BOT}, "body": marker(f)} for f in findings])
     r = run(tmp_path, gh, passes=clean_passes(review=findings))
     assert r.gh.bodies("POST", "/reviews") == []
     assert sum(p.endswith(f"/pulls/{PR}/comments") for p in r.gh.paths()) == 2
