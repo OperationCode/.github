@@ -105,6 +105,32 @@ TEST_TRIGGER_PUSH = {"branches": ["main"]}
 
 EVAL_JOB_PERMISSIONS = {"contents": "read", "id-token": "write"}
 
+# Egress (spec "Workflow details", K-14): every harden-runner step is in audit
+# mode with a non-empty allowlist of host:port entries, so block mode needs
+# only `egress-policy: block` and `disable-telemetry: true` (the action accepts
+# that only in block mode). No disable-sudo-and-containers (V10).
+EGRESS_POLICY = "audit"
+ENDPOINT_RE = re.compile(r"(?:\*\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+:[0-9]{1,5}")
+# The allowlist per central job that V10 measured (kit K3, block mode).
+V10_ALLOWLISTS = {
+    COLLECT: {
+        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443",
+        "release-assets.githubusercontent.com:443", "files.pythonhosted.org:443", "pypi.org:443",
+        "registry.npmjs.org:443", "results-receiver.actions.githubusercontent.com:443", "*.blob.core.windows.net:443",
+    },
+    ANALYZE: {
+        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443",
+        "release-assets.githubusercontent.com:443", "files.pythonhosted.org:443", "api.anthropic.com:443",
+        "*.actions.githubusercontent.com:443", "*.blob.core.windows.net:443",
+    },
+    DEPENDENCY_REVIEW: {"api.github.com:443"},
+    GATE: {
+        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443",
+        "release-assets.githubusercontent.com:443", "files.pythonhosted.org:443",
+        "results-receiver.actions.githubusercontent.com:443", "*.blob.core.windows.net:443",
+    },
+}
+
 TAGS = frozenset({
     "parse", "top-permissions", "jobs", "timeout", "continue-on-error", "credential-separation",
     "anthropic-env", "harden-runner", "unpinned-uses", "version-comment", "cache", "setup-uv",
@@ -228,6 +254,10 @@ def is_false(value: Any) -> bool:
     return value is False or value == "false"
 
 
+def allowed_endpoints(step: dict) -> list[str]:
+    return str(inputs(step).get("allowed-endpoints") or "").split()
+
+
 def effective_permissions(doc: dict, job: dict) -> Any:
     return job["permissions"] if "permissions" in job else doc.get("permissions")
 
@@ -325,10 +355,18 @@ def common_violations(wf: Workflow) -> list[str]:
                 r.add(where, "setup-uv", "setup-uv needs enable-cache: false")
             if a == HARDEN:
                 policy = w.get("egress-policy")
-                if policy not in ("audit", "block"):
-                    r.add(where, "harden-runner", f"egress-policy must be audit or block, got {policy!r}")
-                if policy == "block" and not str(w.get("allowed-endpoints") or "").split():
-                    r.add(where, "harden-runner", "block mode needs allowed-endpoints")
+                if policy != EGRESS_POLICY:
+                    r.add(where, "harden-runner", f"egress-policy must be {EGRESS_POLICY} (K-14), got {policy!r}")
+                endpoints = allowed_endpoints(step)
+                if not endpoints:
+                    r.add(where, "harden-runner", "needs the measured allowed-endpoints list")
+                bad = [e for e in endpoints if not ENDPOINT_RE.fullmatch(e)]
+                if bad:
+                    r.add(where, "harden-runner", f"allowed-endpoints entries are host:port, got {bad!r}")
+                if "disable-sudo-and-containers" in w:
+                    r.add(where, "harden-runner", "no disable-sudo-and-containers (V10)")
+                if "disable-telemetry" in w and not is_false(w["disable-telemetry"]):
+                    r.add(where, "harden-runner", "disable-telemetry: true needs block mode")
     raw_uses = 0
     for lineno, line in enumerate(wf.text.splitlines(), 1):
         m = USES_LINE_RE.match(line)
@@ -700,14 +738,22 @@ def test_publish_stub_check_fails_on_hidden_exit(case, tmp_path):
 
 
 @pytest.mark.release
-def test_harden_runner_blocks_egress():
-    """V10 (live step L8): block mode with the measured list. Fails until then."""
+def test_harden_runner_egress_lists_are_the_v10_lists():
+    """V10 and K-14: audit mode, and each central job keeps the list that V10
+    measured, so a release never ships an allowlist that V10 did not measure.
+    The test.yml and eval.yml lists are not measured; they must not be empty."""
+    for name, job in jobs(central().doc).items():
+        step = steps(job)[0]
+        assert inputs(step).get("egress-policy") == EGRESS_POLICY, name
+        assert set(allowed_endpoints(step)) == V10_ALLOWLISTS[name], name
+        assert len(allowed_endpoints(step)) == len(V10_ALLOWLISTS[name]), name
     for path in workflow_files(WORKFLOWS):
         for name, job in jobs(load_workflow(path).doc).items():
-            w = inputs(steps(job)[0])
-            assert w.get("egress-policy") == "block", f"{path.name} {name}"
-            assert str(w.get("allowed-endpoints") or "").split(), f"{path.name} {name}"
-            assert w.get("disable-telemetry") is True, f"{path.name} {name}"
+            step = steps(job)[0]
+            assert action(step) == HARDEN, f"{path.name} {name}"
+            assert inputs(step).get("egress-policy") == EGRESS_POLICY, f"{path.name} {name}"
+            assert allowed_endpoints(step), f"{path.name} {name}"
+            assert "disable-sudo-and-containers" not in inputs(step), f"{path.name} {name}"
 
 
 # ---------------------------------------------------------------------------

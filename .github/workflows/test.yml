@@ -5,9 +5,11 @@
 # No path filter, so the required check never stays pending. The job name is
 # the required check name: do not rename it.
 #
-# Harden-runner is in audit mode until the endpoints of this job are measured
-# (live step L2); then egress-policy: block, disable-telemetry: true and the
-# allowed-endpoints below.
+# Harden-runner runs in audit mode (spec K-14). The allowlist is not measured
+# for this job: it holds the hosts that the same checkout, setup-uv and uv
+# sync steps, and the runner itself (results-receiver), reached in the V10 run
+# of the central workflow. Measure it in audit mode before block mode (build
+# plan, phase 5).
 
 name: test
 
@@ -32,16 +34,18 @@ jobs:
         uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
         with:
           egress-policy: audit
-          # BLOCK-MODE ALLOWLIST (L2): placeholder until measured.
-          # Expected, to confirm: github.com:443 api.github.com:443
-          # raw.githubusercontent.com:443 release-assets.githubusercontent.com:443
-          # pypi.org:443 files.pythonhosted.org:443
+          allowed-endpoints: >
+            github.com:443
+            raw.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            files.pythonhosted.org:443
+            results-receiver.actions.githubusercontent.com:443
       - name: Check out this repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, released 2026-07-20
         with:
           persist-credentials: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0, released 2026-10-09
+        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2, released 2026-10-22
         with:
           version: 0.13.1
           checksum: eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220

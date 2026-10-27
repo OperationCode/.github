@@ -23,12 +23,12 @@
   expect: [unpinned-uses, dependency-review]
 - id: uses-local-action-eval
   file: eval.yml
-  old: "uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884"
+  old: "uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e"
   new: "uses: ./.github/actions/setup-uv"
   expect: unpinned-uses
 - id: uses-docker
   file: eval.yml
-  old: "uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884"
+  old: "uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e"
   new: "uses: docker://ghcr.io/astral-sh/uv:0.13.1"
   expect: unpinned-uses
 - id: uses-no-version-comment
@@ -55,10 +55,10 @@
 # --- harden-runner, timeouts, scripts (every workflow) ---
 - id: harden-runner-not-first
   file: claude-review.yml
-  old: "    steps:\n      - name: Harden the runner\n        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19\n        with:\n          egress-policy: audit\n          # BLOCK-MODE ALLOWLIST (L8): placeholder until V10 measures it.\n          # Expected, to confirm: github.com:443 api.github.com:443\n      - name: Dependency review"
+  old: "    steps:\n      - name: Harden the runner\n        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19\n        with:\n          egress-policy: audit\n          allowed-endpoints: >\n            api.github.com:443\n      - name: Dependency review"
   new: "    steps:\n      - name: Dependency review"
   expect: harden-runner
-- id: harden-runner-block-without-list
+- id: harden-runner-block-mode
   file: eval.yml
   old: "egress-policy: audit"
   new: "egress-policy: block"
@@ -67,6 +67,31 @@
   file: test.yml
   old: "          egress-policy: audit\n"
   new: ""
+  expect: harden-runner
+- id: harden-runner-list-missing
+  file: test.yml
+  old: "          allowed-endpoints: >\n            github.com:443\n            raw.githubusercontent.com:443\n            release-assets.githubusercontent.com:443\n            files.pythonhosted.org:443\n            results-receiver.actions.githubusercontent.com:443\n"
+  new: ""
+  expect: harden-runner
+- id: harden-runner-list-empty
+  file: claude-review.yml
+  old: "          allowed-endpoints: >\n            api.github.com:443\n      - name: Dependency review"
+  new: "          allowed-endpoints: \"\"\n      - name: Dependency review"
+  expect: harden-runner
+- id: harden-runner-endpoint-without-port
+  file: eval.yml
+  old: "            api.anthropic.com:443\n"
+  new: "            api.anthropic.com\n"
+  expect: harden-runner
+- id: harden-runner-disable-sudo-and-containers
+  file: claude-review.yml
+  old: "          egress-policy: audit\n"
+  new: "          egress-policy: audit\n          disable-sudo-and-containers: true\n"
+  expect: harden-runner
+- id: harden-runner-telemetry-off-in-audit
+  file: test.yml
+  old: "          egress-policy: audit\n"
+  new: "          egress-policy: audit\n          disable-telemetry: true\n"
   expect: harden-runner
 - id: timeout-missing
   file: claude-review.yml
@@ -148,12 +173,12 @@
 - id: extra-job-id-token-with-write
   file: eval.yml
   old: "jobs:\n"
-  new: "jobs:\n  extra:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    permissions:\n      contents: write\n      id-token: write\n    steps:\n      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19\n        with:\n          egress-policy: audit\n      - run: echo hi\n"
+  new: "jobs:\n  extra:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    permissions:\n      contents: write\n      id-token: write\n    steps:\n      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19\n        with:\n          egress-policy: audit\n          allowed-endpoints: api.github.com:443\n      - run: echo hi\n"
   expect: credential-separation
 - id: extra-job-write-all
   file: eval.yml
   old: "jobs:\n"
-  new: "jobs:\n  extra:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    permissions: write-all\n    steps:\n      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19\n        with:\n          egress-policy: audit\n      - run: echo hi\n"
+  new: "jobs:\n  extra:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 30\n    permissions: write-all\n    steps:\n      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19\n        with:\n          egress-policy: audit\n          allowed-endpoints: api.github.com:443\n      - run: echo hi\n"
   expect: credential-separation
 - id: collect-id-token
   file: claude-review.yml
@@ -188,7 +213,7 @@
 - id: job-added
   file: claude-review.yml
   old: "  oc-claude-review:\n"
-  new: "  extra:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    permissions:\n      contents: read\n    steps:\n      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19\n        with:\n          egress-policy: audit\n      - run: echo hi\n  oc-claude-review:\n"
+  new: "  extra:\n    runs-on: ubuntu-24.04\n    timeout-minutes: 10\n    permissions:\n      contents: read\n    steps:\n      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19\n        with:\n          egress-policy: audit\n          allowed-endpoints: api.github.com:443\n      - run: echo hi\n  oc-claude-review:\n"
   expect: jobs
 - id: gate-needs-short
   file: claude-review.yml
@@ -286,12 +311,12 @@
   expect: [forbidden-text, analyze-env]
 - id: github-sha-comment
   file: claude-review.yml
-  old: "# BLOCK-MODE ALLOWLIST (L8): placeholder until V10 measures it."
+  old: "# Exits 0 when it wrote all three pass records, whatever their status."
   new: "# github.sha"
   expect: forbidden-text
 - id: github-workflow-sha-comment
   file: claude-review.yml
-  old: "# BLOCK-MODE ALLOWLIST (L8): placeholder until V10 measures it."
+  old: "# Exits 0 when it wrote all three pass records, whatever their status."
   new: "# github.workflow_sha"
   expect: forbidden-text
 
