@@ -13,8 +13,8 @@ is not trusted (no record can name a snapshot it cannot trust) or the records
 cannot be written.
 
 Federation: the IDs below are not secret. They live in the pinned code, so a
-repo cannot change them, and each release names its own rule. Until the owner
-creates the production rule they are placeholders, and analyze refuses to call.
+repo cannot change them, and each release names its own rule. Placeholder
+(all-zero) IDs make analyze refuse to call.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import base64
 import binascii
 import copy
 import email.utils
+import functools
 import hashlib
 import json
 import os
@@ -42,7 +43,7 @@ from typing import Any, Callable, Mapping, Sequence
 import anthropic
 import httpx2
 
-from . import collect, envelope, render, snapshot
+from . import collect, envelope, publish, render, snapshot
 
 PASS_NAMES = ("review", "security", "supply-chain")
 # Started first; the other passes start when its response begins to stream,
@@ -73,10 +74,11 @@ TOKEN_EXCHANGE_TIMEOUT_SECONDS = 30.0
 CREDENTIAL_HEADERS = frozenset({"x-api-key", "authorization"})
 
 # Production federation rule (spec "Auth and cost", "Each release").
-# Placeholders until the owner creates the rule: analyze refuses to call.
-ANTHROPIC_FEDERATION_RULE_ID = "fdrl_000000000000000000000000"
-ANTHROPIC_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000000"
-ANTHROPIC_SERVICE_ACCOUNT_ID = "svac_000000000000000000000000"
+# Rule R1 `claude-review-prod-r1` and service account `claude-review`, in
+# workspace `claude-review`. Each release names its own rule here.
+ANTHROPIC_FEDERATION_RULE_ID = "fdrl_01N2ZktTiVKqUvvXwywBFfys"
+ANTHROPIC_ORGANIZATION_ID = "2bc920f9-977b-43b2-870a-f840e4ce809c"
+ANTHROPIC_SERVICE_ACCOUNT_ID = "svac_01PiMgfb6qJgNpLZUV8hprCC"
 
 FEDERATION_RULE_ID_RE = re.compile(r"^fdrl_[A-Za-z0-9]{24}$")
 ORGANIZATION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -212,9 +214,14 @@ def schema_digest(schema: Any) -> str:
     return hashlib.sha256(canonical_json(schema)).hexdigest()
 
 
+@functools.cache
+def findings_schema() -> Mapping[str, Any]:
+    """The full findings schema, the contract. Callers must not change it."""
+    return envelope.parse_json((envelope.SCHEMA_DIR / "findings.schema.json").read_bytes())
+
+
 def request_schema() -> dict[str, Any]:
-    full = envelope.parse_json((envelope.SCHEMA_DIR / "findings.schema.json").read_bytes())
-    return strip_schema(full)
+    return strip_schema(findings_schema())
 
 
 def build_request(pass_name: str, *, system_text: str, user_text: str, pass_text: str,
@@ -271,9 +278,61 @@ def usage_of(message: Any) -> dict[str, int] | None:
     return out
 
 
+def cut_string(text: str, limit: int) -> str:
+    """The first `limit` characters of `text`, with no part of a secret.
+
+    The publisher redacts before it cuts, so no part of a secret survives a
+    cut. A cut here comes first, so when the text holds a credential-like
+    string (found the way the publisher finds it: after it removes control
+    and invisible characters), the cut is taken from that redacted text."""
+    cleaned = publish.strip_controls(text)
+    redacted = render.redact_text(cleaned)
+    return (text if redacted == cleaned else redacted)[:limit]
+
+
+# Properties that name a file. A path is an identifier, not prose.
+PATH_FIELDS = frozenset({"file"})
+
+
+def cut_path(text: str, limit: int) -> str:
+    """A cut file path that names no file: `cut_string` to `limit - 1`, then "/".
+
+    A plain prefix of a path can be the path of another changed file, and the
+    citation check would then verify the finding on that file. Git and GitHub
+    never name a file with a final "/", so the cut path names no changed file
+    and the finding stays unverified (and still blocks, P3-2)."""
+    return cut_string(text, limit - 1) + "/"
+
+
+def cut_to_limits(doc: Any, schema: Mapping[str, Any], name: str | None = None) -> Any:
+    """Cut each string over its schema `maxLength` to that limit, in place
+    (spec "Request shape", P3-2). The finding stays, and nothing else changes.
+
+    The API cannot enforce `maxLength`, so one long string would fail the
+    whole pass. The walk follows `properties` and `items`, the only structure
+    keywords of the findings schema (a unit test checks that it reaches every
+    `maxLength`). Every other keyword is left to the schema check. `name` is
+    the property that holds `doc`; a path is cut with `cut_path`."""
+    if isinstance(doc, dict):
+        props = schema.get("properties")
+        for key, sub in props.items() if isinstance(props, Mapping) else ():
+            if key in doc and isinstance(sub, Mapping):
+                doc[key] = cut_to_limits(doc[key], sub, key)
+    elif isinstance(doc, list):
+        items = schema.get("items")
+        if isinstance(items, Mapping):
+            doc[:] = [cut_to_limits(v, items) for v in doc]
+    elif isinstance(doc, str):
+        limit = schema.get("maxLength")
+        if isinstance(limit, int) and len(doc) > limit:
+            return (cut_path if name in PATH_FIELDS else cut_string)(doc, limit)
+    return doc
+
+
 def parse_response(message: Any) -> PassResult:
     """Check `stop_reason` first, then parse the final text block and check it
-    against the full findings schema. Never truncates."""
+    against the full findings schema. Only a string over its `maxLength` is
+    cut (`cut_to_limits`); nothing else is truncated."""
     model = _clip(getattr(message, "model", None), META_MODEL_MAX)
     stop_reason = _clip(getattr(message, "stop_reason", None), META_STOP_REASON_MAX)
     usage = usage_of(message)
@@ -289,6 +348,7 @@ def parse_response(message: Any) -> PassResult:
         doc = envelope.parse_json(texts[-1].text.encode("utf-8"))
     except (envelope.EnvelopeError, UnicodeEncodeError) as exc:
         raise PassFailure(R_BAD_JSON, **info) from exc
+    cut_to_limits(doc, findings_schema())
     try:
         envelope.validate_findings(doc)
     except envelope.EnvelopeError as exc:

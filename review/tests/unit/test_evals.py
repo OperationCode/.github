@@ -174,12 +174,30 @@ def test_eval_ids_are_the_real_eval_rule():
     assert analyze.ids_valid(ids) and not analyze.ids_are_placeholders(ids)
 
 
+TEST_RULE_ID = "fdrl_01DrmQ8SP1yTeAi8icEtQbUD"
+SIMULATION_RULE_ID = "fdrl_01AfACzupW3U4Bx361ZUbsyR"
+TEST_SERVICE_ACCOUNT_ID = "svac_017eR3ohB6rP5MEAsda6U7X6"
+
+
+def test_production_ids_are_the_real_production_rule():
+    assert analyze.federation_ids() == analyze.FederationIds(
+        "fdrl_01N2ZktTiVKqUvvXwywBFfys", "2bc920f9-977b-43b2-870a-f840e4ce809c", "svac_01PiMgfb6qJgNpLZUV8hprCC"
+    )
+
+
 def test_eval_ids_differ_from_production_ids():
     ids, prod = evals.eval_federation(), analyze.federation_ids()
+    assert analyze.ids_valid(prod) and not analyze.ids_are_placeholders(prod)
     assert ids.rule_id != prod.rule_id
     assert ids.service_account_id != prod.service_account_id
-    # production stays a placeholder until phase 3
-    assert analyze.ids_are_placeholders(prod)
+    # one organization, so the workspace and service account separate the rules
+    assert ids.organization_id == prod.organization_id
+
+
+def test_production_ids_differ_from_every_test_id():
+    prod = analyze.federation_ids()
+    assert prod.rule_id not in {evals.eval_federation().rule_id, TEST_RULE_ID, SIMULATION_RULE_ID}
+    assert prod.service_account_id not in {evals.eval_federation().service_account_id, TEST_SERVICE_ACCOUNT_ID}
 
 
 def test_main_uses_the_eval_ids_by_default(tmp_path):

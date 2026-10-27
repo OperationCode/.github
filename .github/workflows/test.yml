@@ -57,3 +57,6 @@ jobs:
       - name: Run the unit tests
         working-directory: review
         run: uv run --locked pytest tests/unit
+      - name: Run the release tests
+        working-directory: review
+        run: uv run --locked pytest tests/unit -m release

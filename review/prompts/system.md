@@ -32,7 +32,7 @@ Code checks every citation against the same text that you see. Each finding cite
 - `file`: the path exactly as the bundle shows it, at most 400 characters. For `side: "base"` on a renamed file, the old path is allowed.
 - `side`: `head` for a line in the PR version. `base` for a line in the merge base version, for example a removed check.
 - `line`: the line number on that side, as the bundle shows it. An integer, 1 or more. Never count lines yourself from the patch.
-- `quote`: text copied exactly from that line, 1 to 300 characters. Do not paraphrase, shorten with "...", or join lines.
+- `quote`: text copied exactly from that line, 1 to 300 characters. When the line is longer, copy the part of it that shows the problem. Do not paraphrase, shorten with "...", or join lines.
 
 Cite the line that shows the problem most directly. When a problem spans several lines, cite the first line that is wrong.
 

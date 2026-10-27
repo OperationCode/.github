@@ -15,7 +15,7 @@ import anthropic
 import httpx2
 import pytest
 
-from oc_review import analyze, collect, envelope, render
+from oc_review import analyze, collect, envelope, publish, render, verdict
 from oc_review.envelope import sha256_hex
 
 FIX = Path(__file__).parent / "fixtures" / "analyze"
@@ -48,6 +48,19 @@ GOOD_JWT = make_jwt()
 @pytest.fixture
 def configured(monkeypatch):
     for name, value in CONFIGURED_IDS.items():
+        monkeypatch.setattr(analyze, name, value)
+
+
+PLACEHOLDER_IDS = {
+    "ANTHROPIC_FEDERATION_RULE_ID": "fdrl_000000000000000000000000",
+    "ANTHROPIC_ORGANIZATION_ID": "00000000-0000-0000-0000-000000000000",
+    "ANTHROPIC_SERVICE_ACCOUNT_ID": "svac_000000000000000000000000",
+}
+
+
+@pytest.fixture
+def placeholders(monkeypatch):
+    for name, value in PLACEHOLDER_IDS.items():
         monkeypatch.setattr(analyze, name, value)
 
 
@@ -420,7 +433,7 @@ def test_stop_reason_other_than_end_turn_fails(tmp_path, configured, stop):
         ('{"summary": "a", "summary": "b", "findings": []}', analyze.R_BAD_JSON),
         ('{"summary": "a", "findings": [], "x": NaN}', analyze.R_BAD_JSON),
         ("", analyze.R_BAD_JSON),
-        (findings_text(title="t" * 121), f"{analyze.R_SCHEMA}: 'findings'/0/'title': [maxLength]"),
+        (findings_text(title=["t" * 121]), f"{analyze.R_SCHEMA}: 'findings'/0/'title': [type]"),
         (findings_text(16), f"{analyze.R_SCHEMA}: 'findings': [maxItems]"),
         ('{"summary": "a"}', f"{analyze.R_SCHEMA}: <root>: [required]"),
     ],
@@ -445,6 +458,202 @@ def test_more_findings_than_the_pass_limit_stay_ok(tmp_path, configured):
     run = run_main(tmp_path, client=FakeClient({"review": Behavior(message=message(findings_text(11)))}))
     rec = run.records["review"]
     assert rec["status"] == "ok" and len(rec["payload"]["findings"]) == 11
+
+
+# --- over-long strings (P3-2) ----------------------------------------------------
+
+
+def schema_limits(schema, path=()):
+    """Every `maxLength` in a schema, by the keyword path to it."""
+    out = {}
+    if isinstance(schema, dict):
+        for key, value in schema.items():
+            if key == "maxLength":
+                out[path] = value
+            else:
+                out.update(schema_limits(value, (*path, key)))
+    elif isinstance(schema, list):
+        for i, value in enumerate(schema):
+            out.update(schema_limits(value, (*path, i)))
+    return out
+
+
+LIMITS = {path[-1]: limit for path, limit in schema_limits(analyze.findings_schema()).items()}
+# One obfuscated line, longer than the quote limit (eval case obfuscated-test-payload).
+LONG_LINE = "const _0x1a = [" + ", ".join(["'\\x65\\x76\\x61\\x6c'"] * 30) + "];  global[_0x1a[0]](payload);"
+LONG_FILE = f"const payload = require('./p');\n{LONG_LINE}\nmodule.exports = {{}};\n"
+GH_TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+
+def long_text(limit, extra=40):
+    return ("plain words " * (limit // 4))[: limit + extra]
+
+
+def long_doc(**override):
+    """A critical malicious finding, with fields set by `override`; `summary` sets the summary."""
+    doc = json.loads(findings_text(category="malicious", severity="critical", file="test/setup.js", line=2))
+    summary = override.pop("summary", None)
+    if summary is not None:
+        doc["summary"] = summary
+    doc["findings"][0].update(override)
+    return doc
+
+
+def cut(doc):
+    return analyze.cut_to_limits(doc, analyze.findings_schema())
+
+
+def cut_value(field, value):
+    """A plain prefix; a path ends in "/" so that it names no file."""
+    if field == "file":
+        return value[: LIMITS[field] - 1] + "/"
+    return value[: LIMITS[field]]
+
+
+def test_the_cut_reaches_every_max_length_in_the_schema():
+    paths = schema_limits(analyze.findings_schema())
+    assert set(LIMITS) == {"summary", "file", "quote", "title", "explanation"}
+    for path in paths:  # only `properties` / `items` steps, the ones the cut walks
+        steps = list(path)
+        while steps:
+            key = steps.pop(0)
+            if key == "properties":
+                steps.pop(0)
+            else:
+                assert key == "items", path
+
+
+@pytest.mark.parametrize("field", sorted(LIMITS))
+def test_over_long_string_is_cut_and_the_finding_stays(tmp_path, configured, field):
+    value = long_text(LIMITS[field])
+    sent = long_doc(**{field: value})
+    client = FakeClient({"supply-chain": Behavior(message=message(json.dumps(sent)))})
+    run = run_main(tmp_path, client=client)
+    assert statuses(run) == {"review": "ok", "security": "ok", "supply-chain": "ok"}
+    rec = run.records["supply-chain"]
+    assert rec["meta"]["reason"] is None
+    want = long_doc(**{field: cut_value(field, value)})
+    assert rec["payload"] == want  # only that string changed: category, severity, flags stay
+    envelope.validate_findings(rec["payload"])  # the record holds the full-schema-valid payload
+
+
+def test_every_string_over_its_limit_at_once_is_cut(tmp_path, configured):
+    sent = long_doc(**{field: long_text(limit) for field, limit in LIMITS.items()})
+    client = FakeClient({"security": Behavior(message=message(json.dumps(sent)))})
+    rec = run_main(tmp_path, client=client).records["security"]
+    assert rec["status"] == "ok"
+    payload = rec["payload"]
+    [f] = payload["findings"]
+    assert len(payload["summary"]) == LIMITS["summary"]
+    assert all(len(f[name]) == LIMITS[name] for name in LIMITS if name != "summary")
+    original = sent["findings"][0]
+    assert {k: f[k] for k in original if k not in LIMITS} == {k: original[k] for k in original if k not in LIMITS}
+    assert (f["category"], f["severity"]) == ("malicious", "critical")
+
+
+@pytest.mark.parametrize("field", sorted(LIMITS))
+def test_string_at_the_limit_is_unchanged(field):
+    value = "q" * LIMITS[field]
+    doc = cut(long_doc(**{field: value}))
+    got = doc["summary"] if field == "summary" else doc["findings"][0][field]
+    assert got == value
+
+
+def test_cut_keeps_no_part_of_a_secret():
+    limit = LIMITS["explanation"]
+    # A token that straddles the limit, with a zero-width space that hides it
+    # from redaction until the publisher removes invisible characters.
+    hidden = GH_TOKEN[:12] + "​" + GH_TOKEN[12:]
+    text = "e" * (limit - 20) + " " + hidden + " tail"
+    assert GH_TOKEN[:18] in publish.strip_controls(text[:limit])  # a plain prefix would leak it
+    got = cut(long_doc(explanation=text))["findings"][0]["explanation"]
+    assert len(got) <= limit and "[REDACTED" in got
+    shown = publish.escape_field("explanation", got)
+    assert not any(GH_TOKEN[i : i + 8] in publish.strip_controls(got) for i in range(len(GH_TOKEN) - 8))
+    assert not any(GH_TOKEN[i : i + 8] in re.sub(r"\\(.)", r"\1", shown) for i in range(len(GH_TOKEN) - 8))
+
+
+def test_cut_without_a_secret_is_a_plain_prefix():
+    text = "zero​width " + long_text(LIMITS["title"])
+    assert cut(long_doc(title=text))["findings"][0]["title"] == text[: LIMITS["title"]]
+
+
+def test_cut_quote_still_passes_the_citation_check():
+    doc = cut(long_doc(quote=LONG_LINE))
+    files = (verdict.FileSides("test/setup.js", head_text=LONG_FILE, head_hunks=((1, 3),)),)
+    c = verdict.cite_finding("supply-chain", doc["findings"][0], files)
+    assert len(c.quote) == LIMITS["quote"]
+    assert c.verified and c.inline and c.blocking
+
+
+def test_cut_inside_a_whitespace_run_still_verifies():
+    line = "x" * (LIMITS["quote"] - 2) + " \t   " + "y" * 50
+    doc = cut(long_doc(quote=line))
+    files = (verdict.FileSides("test/setup.js", head_text=f"a\n{line}\n", head_hunks=((1, 2),)),)
+    assert verdict.cite_finding("supply-chain", doc["findings"][0], files).verified
+
+
+def test_cut_quote_that_is_not_on_the_line_stays_unverified_and_blocking():
+    doc = cut(long_doc(quote="z" * 400))
+    files = (verdict.FileSides("test/setup.js", head_text=LONG_FILE, head_hunks=((1, 3),)),)
+    c = verdict.cite_finding("supply-chain", doc["findings"][0], files)
+    assert not c.verified and c.blocking
+
+
+def test_cut_file_path_stays_unverified_and_blocking():
+    path = "abcde/" * 75 + "setup.js"
+    assert path[LIMITS["file"] - 1] != "/"  # so the plain cut does not end in "/"
+    doc = cut(long_doc(file=path, quote="global[_0x1a[0]](payload);"))
+    f = doc["findings"][0]
+    assert f["file"] == path[: LIMITS["file"] - 1] + "/"
+    files = (verdict.FileSides(path, head_text=LONG_FILE, head_hunks=((1, 3),)),)
+    c = verdict.cite_finding("supply-chain", f, files)
+    assert not c.verified and not c.inline and c.blocking
+
+
+def test_cut_file_path_never_names_another_changed_file():
+    short = "a" * 200 + "/" + "b" * 199  # a changed file whose path is the plain cut of `long`
+    long = short + "X"
+    assert len(short) == LIMITS["file"]
+    files = tuple(verdict.FileSides(p, head_text="danger();\n", head_hunks=((1, 1),)) for p in (short, long))
+    doc = cut(long_doc(file=long, line=1, quote="danger();"))
+    f = doc["findings"][0]
+    assert len(f["file"]) == LIMITS["file"] and f["file"].endswith("/")
+    envelope.validate_findings(doc)
+    c = verdict.cite_finding("supply-chain", f, files)
+    assert (c.verified, c.inline, c.blocking) == (False, False, True)
+    assert c.unverified_reason == "file is not in the changed files"
+
+
+def test_a_path_with_a_final_slash_names_no_file():
+    files = (verdict.FileSides("dir/", head_text="danger();\n", head_hunks=((1, 1),)),)
+    f = json.loads(findings_text(file="dir/", line=1, quote="danger();"))["findings"][0]
+    assert not verdict.cite_finding("review", f, files).verified
+
+
+@pytest.mark.parametrize(
+    "override, reason",
+    [
+        ({"quote": 5}, "'findings'/0/'quote': [type]"),
+        ({"quote": ""}, "'findings'/0/'quote': [minLength]"),
+        ({"file": ""}, "'findings'/0/'file': [minLength]"),
+        ({"title": 121}, "'findings'/0/'title': [type]"),
+        ({"summary": ["s" * 2000]}, "'summary': [type]"),
+        ({"severity": "urgent", "title": "t" * 500}, "'findings'/0/'severity': [enum]"),
+        ({"extra": "x", "explanation": "e" * 2000}, "'findings'/0: [additionalProperties]"),
+    ],
+)
+def test_other_schema_errors_still_fail_the_pass(tmp_path, configured, override, reason):
+    run = run_main(tmp_path, client=FakeClient({"review": Behavior(message=message(json.dumps(long_doc(**override))))}))
+    assert run.records["review"]["status"] == "failed"
+    assert reasons(run)["review"] == f"{analyze.R_SCHEMA}: {reason}"
+
+
+def test_missing_field_still_fails_the_pass(tmp_path, configured):
+    doc = long_doc(explanation="e" * 2000)
+    del doc["findings"][0]["title"]
+    run = run_main(tmp_path, client=FakeClient({"review": Behavior(message=message(json.dumps(doc)))}))
+    assert reasons(run)["review"] == f"{analyze.R_SCHEMA}: 'findings'/0: [required]"
 
 
 def test_final_text_block_after_a_fallback_block_is_parsed(tmp_path, configured):
@@ -994,7 +1203,7 @@ def test_render_error_gives_failed_records(tmp_path, configured, monkeypatch):
     assert run.client.calls == {} and run.oidc.calls == []
 
 
-def test_placeholder_federation_refuses_to_call(tmp_path):
+def test_placeholder_federation_refuses_to_call(tmp_path, placeholders):
     run = run_main(tmp_path)
     assert_three_records(run)
     assert set(statuses(run).values()) == {"failed"}
@@ -1152,7 +1361,7 @@ def test_federation_constants_have_the_id_format():
 
 @pytest.mark.release
 def test_release_federation_ids_are_not_placeholders():
-    """Phase 3 turns this on for every release (`pytest -m release`)."""
+    """CI runs this on every PR (`pytest -m release`)."""
     ids = analyze.federation_ids()
     assert analyze.ids_valid(ids)
     assert not analyze.ids_are_placeholders(ids), "federation IDs are still placeholders"
@@ -1195,7 +1404,7 @@ def test_federation_parameter_reaches_the_client_factory(tmp_path):
         return FakeClient()
 
     results = _analyze_direct(tmp_path, factory, federation=other)
-    assert seen == [other]  # module constants are still placeholders: only the parameter can pass
+    assert seen == [other]  # the parameter, not the module constants, names the IDs here
     assert {r.status for r in results.values()} == {"ok"}
 
 

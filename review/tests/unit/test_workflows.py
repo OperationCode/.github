@@ -756,6 +756,22 @@ def test_harden_runner_egress_lists_are_the_v10_lists():
             assert "disable-sudo-and-containers" not in inputs(step), f"{path.name} {name}"
 
 
+def test_test_workflow_runs_the_release_tests_in_the_unit_tests_job():
+    """Spec "Testing": `pytest -m release` runs on every PR, in the required
+    `unit-tests` job, so the required check name does not change."""
+    wf = load_workflow(WORKFLOWS / TEST)
+    job = jobs(wf.doc)["unit-tests"]
+    runs = [step.get("run", "") for step in steps(job)]
+    assert "uv run --locked pytest tests/unit" in runs
+    release = [r for r in runs if "-m release" in r]
+    assert release == ["uv run --locked pytest tests/unit -m release"]
+    assert runs.index(release[0]) > runs.index("uv run --locked pytest tests/unit")
+    step = next(s for s in steps(job) if s.get("run") == release[0])
+    assert step.get("working-directory") == "review"
+    assert "if" not in step and "continue-on-error" not in step
+    assert "if" not in job and "continue-on-error" not in job
+
+
 # ---------------------------------------------------------------------------
 # Tests: fixtures prove that each check fails on its violation
 # ---------------------------------------------------------------------------
