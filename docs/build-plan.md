@@ -204,7 +204,7 @@ Exit criteria:
 - [ ] Owner: CODEOWNERS in each supported repo.
 - [ ] Owner: Dependabot alerts with npm malware detection on active repos.
 - [ ] Re-run the key acceptance tests on the current release: V6 a, V8 a, V22 b, V23 and the outage process.
-- [ ] Revisit harden-runner block mode (spec K-14): re-test block mode on the current harden-runner release, or after StepSecurity fixes the "Complete job" hang. Measure the `test.yml` and `eval.yml` lists in audit mode. If no job hangs, set `egress-policy: block` and `disable-telemetry: true` in every job, and update the unit tests and the spec.
+- [ ] Revisit harden-runner block mode (spec K-14): switch to block when harden-runner [issue 708](https://github.com/step-security/harden-runner/issues/708) is fixed in a harden-runner release. Pin that release, measure the `test.yml` and `eval.yml` lists in audit mode, and re-test block mode. If no job hangs, set `egress-policy: block` and `disable-telemetry: true` in every job, and update the unit tests and the spec.
 
 Depends on: phase 4; V6, V8, V22, V23.
 

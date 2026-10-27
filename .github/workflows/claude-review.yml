@@ -18,7 +18,8 @@
 # - no ${{ }} inside run: scripts; values reach scripts through env:
 #
 # Harden-runner runs in audit mode (spec K-14): in V10, block mode hung 2 of
-# 24 jobs in "Complete job". Each job keeps the allowlist that V10 measured,
+# 24 jobs in "Complete job" (harden-runner issue 708, open, no fix in
+# v2.22.2). Each job keeps the allowlist that V10 measured,
 # so block mode needs only egress-policy: block plus disable-telemetry: true
 # (the action accepts that only in block mode). Block mode is revisited
 # before org-wide enforcement (build plan, phase 5).
@@ -49,6 +50,7 @@ jobs:
       - name: Harden the runner
         uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
         with:
+          # Audit until https://github.com/step-security/harden-runner/issues/708 is fixed (spec K-14).
           egress-policy: audit
           allowed-endpoints: >
             api.github.com:443
@@ -113,6 +115,7 @@ jobs:
       - name: Harden the runner
         uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
         with:
+          # Audit until https://github.com/step-security/harden-runner/issues/708 is fixed (spec K-14).
           egress-policy: audit
           allowed-endpoints: >
             api.github.com:443
@@ -207,6 +210,7 @@ jobs:
       - name: Harden the runner
         uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
         with:
+          # Audit until https://github.com/step-security/harden-runner/issues/708 is fixed (spec K-14).
           egress-policy: audit
           allowed-endpoints: >
             api.github.com:443
@@ -238,6 +242,7 @@ jobs:
       - name: Harden the runner
         uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
         with:
+          # Audit until https://github.com/step-security/harden-runner/issues/708 is fixed (spec K-14).
           egress-policy: audit
           allowed-endpoints: >
             api.github.com:443

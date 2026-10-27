@@ -55,7 +55,7 @@
 # --- harden-runner, timeouts, scripts (every workflow) ---
 - id: harden-runner-not-first
   file: claude-review.yml
-  old: "    steps:\n      - name: Harden the runner\n        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19\n        with:\n          egress-policy: audit\n          allowed-endpoints: >\n            api.github.com:443\n      - name: Dependency review"
+  old: "    steps:\n      - name: Harden the runner\n        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19\n        with:\n          # Audit until https://github.com/step-security/harden-runner/issues/708 is fixed (spec K-14).\n          egress-policy: audit\n          allowed-endpoints: >\n            api.github.com:443\n      - name: Dependency review"
   new: "    steps:\n      - name: Dependency review"
   expect: harden-runner
 - id: harden-runner-block-mode
