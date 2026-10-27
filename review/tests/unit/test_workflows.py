@@ -766,6 +766,10 @@ def test_test_workflow_runs_the_release_tests_in_the_unit_tests_job():
     release = [r for r in runs if "-m release" in r]
     assert release == ["uv run --locked pytest tests/unit -m release"]
     assert runs.index(release[0]) > runs.index("uv run --locked pytest tests/unit")
+    step = next(s for s in steps(job) if s.get("run") == release[0])
+    assert step.get("working-directory") == "review"
+    assert "if" not in step and "continue-on-error" not in step
+    assert "if" not in job and "continue-on-error" not in job
 
 
 # ---------------------------------------------------------------------------

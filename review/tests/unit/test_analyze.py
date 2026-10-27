@@ -1165,7 +1165,7 @@ def test_federation_constants_have_the_id_format():
 
 @pytest.mark.release
 def test_release_federation_ids_are_not_placeholders():
-    """Phase 3 turns this on for every release (`pytest -m release`)."""
+    """CI runs this on every PR (`pytest -m release`)."""
     ids = analyze.federation_ids()
     assert analyze.ids_valid(ids)
     assert not analyze.ids_are_placeholders(ids), "federation IDs are still placeholders"
