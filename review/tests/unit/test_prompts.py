@@ -127,6 +127,7 @@ SYSTEM_RULES = [
     ("Citation rules", "Report a finding even when you are not sure that its citation will check out"),
     ("Citation rules", "Never count lines yourself"),
     ("Citation rules", "Do not paraphrase"),
+    ("Citation rules", "When the line is longer, copy the part of it that shows the problem"),
 ]
 
 

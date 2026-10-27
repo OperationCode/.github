@@ -15,7 +15,7 @@ import anthropic
 import httpx2
 import pytest
 
-from oc_review import analyze, collect, envelope, render
+from oc_review import analyze, collect, envelope, render, verdict
 from oc_review.envelope import sha256_hex
 
 FIX = Path(__file__).parent / "fixtures" / "analyze"
@@ -458,6 +458,76 @@ def test_more_findings_than_the_pass_limit_stay_ok(tmp_path, configured):
     run = run_main(tmp_path, client=FakeClient({"review": Behavior(message=message(findings_text(11)))}))
     rec = run.records["review"]
     assert rec["status"] == "ok" and len(rec["payload"]["findings"]) == 11
+
+
+# --- over-long quote (P3-2) -------------------------------------------------------
+
+# One obfuscated line, longer than the quote limit (eval case obfuscated-test-payload).
+LONG_LINE = "const _0x1a = [" + ", ".join(["'\\x65\\x76\\x61\\x6c'"] * 30) + "];  global[_0x1a[0]](payload);"
+LONG_FILE = f"const payload = require('./p');\n{LONG_LINE}\nmodule.exports = {{}};\n"
+
+
+def long_quote_text(quote):
+    return findings_text(category="malicious", severity="critical", file="test/setup.js", line=2, quote=quote)
+
+
+def test_quote_max_is_the_schema_limit():
+    schema = envelope.parse_json((envelope.SCHEMA_DIR / "findings.schema.json").read_bytes())
+    assert analyze.QUOTE_MAX == schema["properties"]["findings"]["items"]["properties"]["quote"]["maxLength"]
+
+
+def test_over_long_quote_is_cut_and_the_finding_stays(tmp_path, configured):
+    assert len(LONG_LINE) > analyze.QUOTE_MAX
+    client = FakeClient({"supply-chain": Behavior(message=message(long_quote_text(LONG_LINE)))})
+    run = run_main(tmp_path, client=client)
+    assert statuses(run) == {"review": "ok", "security": "ok", "supply-chain": "ok"}
+    rec = run.records["supply-chain"]
+    assert rec["meta"]["reason"] is None
+    [f] = rec["payload"]["findings"]
+    want = {**json.loads(long_quote_text(LONG_LINE))["findings"][0], "quote": LONG_LINE[: analyze.QUOTE_MAX]}
+    assert f == want  # only the quote changed: category, severity and text stay
+    envelope.validate_findings(rec["payload"])  # the record holds the full-schema-valid payload
+
+
+def test_cut_quote_still_passes_the_citation_check():
+    doc = analyze.shorten_quotes(json.loads(long_quote_text(LONG_LINE)))
+    files = (verdict.FileSides("test/setup.js", head_text=LONG_FILE, head_hunks=((1, 3),)),)
+    c = verdict.cite_finding("supply-chain", doc["findings"][0], files)
+    assert len(c.quote) == analyze.QUOTE_MAX
+    assert c.verified and c.inline and c.blocking
+
+
+def test_cut_inside_a_whitespace_run_still_verifies():
+    line = "x" * (analyze.QUOTE_MAX - 2) + " \t   " + "y" * 50
+    doc = analyze.shorten_quotes(json.loads(long_quote_text(line)))
+    files = (verdict.FileSides("test/setup.js", head_text=f"a\n{line}\n", head_hunks=((1, 2),)),)
+    assert verdict.cite_finding("supply-chain", doc["findings"][0], files).verified
+
+
+def test_cut_quote_that_is_not_on_the_line_stays_unverified_and_blocking():
+    doc = analyze.shorten_quotes(json.loads(long_quote_text("z" * 400)))
+    files = (verdict.FileSides("test/setup.js", head_text=LONG_FILE, head_hunks=((1, 3),)),)
+    c = verdict.cite_finding("supply-chain", doc["findings"][0], files)
+    assert not c.verified and c.blocking
+
+
+def test_quote_at_the_limit_is_unchanged():
+    quote = "q" * analyze.QUOTE_MAX
+    doc = analyze.shorten_quotes(json.loads(long_quote_text(quote)))
+    assert doc["findings"][0]["quote"] == quote
+
+
+@pytest.mark.parametrize(
+    "override, reason",
+    [
+        ({"quote": 5}, f"{analyze.R_SCHEMA}: 'findings'/0/'quote': [type]"),
+        ({"quote": ""}, f"{analyze.R_SCHEMA}: 'findings'/0/'quote': [minLength]"),
+        ({"quote": "q" * 400, "explanation": "e" * 1201}, f"{analyze.R_SCHEMA}: 'findings'/0/'explanation': [maxLength]"),
+    ],
+)
+def test_only_the_quote_length_is_cut(tmp_path, configured, override, reason):
+    run = run_main(tmp_path, client=FakeClient({"review": Behavior(message=message(findings_text(**override)))}))
+    assert reasons(run)["review"] == reason
 
 
 def test_final_text_block_after_a_fallback_block_is_parsed(tmp_path, configured):

@@ -152,6 +152,7 @@ Run the spec's workflow acceptance tests under a test org ruleset that requires 
 
 - [x] Production IDs in `analyze.py` and the release tests in CI (the candidate S1). R1 `claude-review-prod-r1` (`fdrl_01N2ZktTiVKqUvvXwywBFfys`) and the production service account are set; `test.yml` runs `pytest tests/unit -m release`.
 - [x] V26 a: R1 created at the placeholder SHA and accepted by the Console (2026-10-27); R2 `claude-review-p3-r2` created the same way, inert until the release simulation.
+- [x] P3-2: an over-long `quote` no longer fails a pass. Release eval run 40517202830 at S1 matched 12 of 13: one supply-chain quote went over 300 characters, which the API cannot enforce. Analyze now cuts such a quote to 300 characters and keeps the finding (spec P3-2). A candidate with this change needs its own eval.
 - [ ] V26 b, before the acceptance tests: after the owner sets the production rule to the candidate SHA, a run at that SHA gets a token and a run at another SHA is denied.
 - [ ] V26 c, before V22 b: release steps 1 to 6 with a scratch rule R2 on the test workspace, R1 unchanged. Include the second exchange at the release SHA, and check that the workflows rule accepts a scratch ruleset pinned to a SHA that is only on a non-default branch of `.github`.
 - [ ] A fork PR from an account outside the org, including a draft that later becomes ready. The review starts with no approval click (V8 b).
