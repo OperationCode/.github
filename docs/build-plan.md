@@ -134,16 +134,17 @@ The fixture eval calls the live API and costs money. The owner runs it on reques
 - [x] Eval runner: expectation format v2 and the rendered summary per case (spec "Testing", P2-5).
 - [x] Fixture builder `review/tests/eval_fixtures.py` and the 13 cases of the spec's minimum set in `review/tests/fixtures`, with expected outcomes. Unit tests: each bundle equals a rebuild, and each hard-block case fails the gate whatever Claude returns.
 - [x] Move the smoke case to `review/tests/unit/fixtures/eval-smoke`, out of the live run (spec P2-3).
-- [ ] Owner: run `eval.yml` on the PR branch and approve the `eval` environment, with the eval federation rule and the test workspace (reused for evals) from phase 0. Check the PR first (see phase 0). Record the results in the PR that changed the prompts or code. Passing evals gate the merge of a prompt or model change, and a release pin moves only to a SHA whose tree has passed the evals (a merge SHA with the same tree as the tested candidate counts). No required check enforces the merge gate, so the owner holds the merge until the evals pass.
-- [ ] Fix prompts or code for each miss, then run the full set again on request. An expectation changes only with a written reason in the PR (spec P2-4).
+- [x] Owner: run `eval.yml` on the PR branch and approve the `eval` environment, with the eval federation rule and the test workspace (reused for evals) from phase 0. Check the PR first (see phase 0). Record the results in the PR that changed the prompts or code. Done 2026-10-27: [run 40445885087](https://github.com/OperationCode/.github/actions/runs/40445885087), commit 3a03ae8, run by the coordinator under the owner's delegation and approved in the `eval` environment; 13 of 13 cases matched with every pass ok, 207890 input and 20729 output tokens. Passing evals gate the merge of a prompt or model change, and a release pin moves only to a SHA whose tree has passed the evals (a merge SHA with the same tree as the tested candidate counts). No required check enforces the merge gate, so the owner holds the merge until the evals pass.
+- [x] Fix prompts or code for each miss, then run the full set again on request. An expectation changes only with a written reason in the PR (spec P2-4). No misses in run 1, so no fix and no second run.
+- [ ] Later phase (not required by the spec): keep the per-case `summary.md` that the runner writes to `--out-dir`. Run 1 uploaded no artifact, so nobody can read the rendered summaries. Add an `actions/upload-artifact` step to `eval.yml` (same pinned SHA as `claude-review.yml`, attempt in the name, short retention, `if: always()`), extend the workflow unit test, and check the harden-runner allowlist. Needs a spec change first (spec "Testing", eval runner).
 
 Depends on: phase 1; V27.
 
 Exit criteria:
 
 - [x] V27 passes.
-- [ ] Every fixture in the minimum set gives its expected outcome: one full run with all 13 cases matched (spec P2-4).
-- [ ] The hard-block fixtures (bidi, git URL lockfile) block whatever Claude returns.
+- [x] Every fixture in the minimum set gives its expected outcome: one full run with all 13 cases matched (spec P2-4; run 40445885087).
+- [x] The hard-block fixtures (bidi, git URL lockfile) block whatever Claude returns. The unit tests prove that both fail the gate whatever Claude returns, and run 1 confirms it.
 
 ## Phase 3: smoke test on claude-review-test
 
