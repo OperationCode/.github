@@ -18,8 +18,8 @@
 # - no ${{ }} inside run: scripts; values reach scripts through env:
 #
 # Harden-runner runs in audit mode (spec K-14): in V10, block mode hung 2 of
-# 24 jobs in "Complete job" (harden-runner issue 708, open, no fix in
-# v2.22.2). Each job keeps the allowlist that V10 measured,
+# 24 jobs in "Complete job" (symptoms match open harden-runner issue 708;
+# no fix in v2.22.2). Each job keeps the allowlist that V10 measured,
 # so block mode needs only egress-policy: block plus disable-telemetry: true
 # (the action accepts that only in block mode). Block mode is revisited
 # before org-wide enforcement (build plan, phase 5).

@@ -109,7 +109,7 @@ Depends on: V3, V5, V9 (analyze); V6, V16, V24 (publish).
 - [ ] `.github/workflows/eval.yml`: manual fixture evals. The job uses `environment: eval` and has `contents: read` and `id-token: write` only. A workflow unit test reads every workflow file and fails if a workflow other than `eval.yml` uses `environment: eval`, or if a job that uses `eval` sets no explicit job-level `permissions` or has any `write` permission other than `id-token: write`. Job-level `permissions` is required even if the workflow level sets it. `write-all` at either level fails the test, and so do `read-all` and a missing job-level block, because the job must state `contents: read` and `id-token: write` itself.
 - [ ] `review/src/oc_review/evals.py`: the runner that `eval.yml` calls (`python -m oc_review.evals --fixtures-dir ... --out-dir ...`), with placeholder eval federation IDs and one smoke fixture. The phase 2 fixtures and IDs come later. `analyze` takes an optional federation IDs parameter for it.
 - [ ] Prefilter run budget: the prefilter line diff has a budget of 40,000,000 steps per run next to its 2,000,000 per file (spec "Coverage limits").
-- [x] V10: harden-runner in audit mode for a full run, then block mode (`disable-telemetry: true`) with the measured allowlist. Done 2026-10-27 (spec V10): block mode passed, but 2 of 24 block-mode jobs hung in "Complete job" (a harden-runner race). Ruling K-14: every job runs in audit mode with its measured list and no `disable-sudo-and-containers`; the `release`-marked test holds the central lists to the V10 lists. The `test.yml` and `eval.yml` lists are not measured (phase 5).
+- [x] V10: harden-runner in audit mode for a full run, then block mode (`disable-telemetry: true`) with the measured allowlist. Done 2026-10-27 (spec V10): block mode passed, but 2 of 24 block-mode jobs hung in "Complete job" (the symptoms match open harden-runner issue 708). Ruling K-14: every job runs in audit mode with its measured list and no `disable-sudo-and-containers`; the `release`-marked test holds the central lists to the V10 lists. The `test.yml` and `eval.yml` lists are not measured (phase 5).
 
 Depends on: V2, V4, V13, V18 (workflow); V10 needs a full run, so it runs here.
 
@@ -122,7 +122,7 @@ Owner:
 Exit criteria:
 
 - [ ] Unit tests pass in CI on `.github`.
-- [x] A full run in claude-review-test succeeds with egress in block mode (V10). Done 2026-10-27 with the test federation rule: a clean PR passed and a vulnerable one failed in block mode; 2 of 24 jobs hung and passed on a re-run. The workflows ship in audit mode (spec K-14).
+- [x] A full run in claude-review-test succeeds with egress in block mode (V10). Done 2026-10-27 with the test federation rule: a clean PR passed and a vulnerable one failed in block mode; 2 of 24 jobs hung; the K3 failed run passed on a re-run. The workflows ship in audit mode (spec K-14).
 - [ ] Each change was reviewed through a PR with code owner approval.
 
 ## Phase 2: fixture evals
