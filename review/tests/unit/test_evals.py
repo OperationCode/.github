@@ -96,14 +96,19 @@ def make_case(root, name="case1", expected=None):
     return d
 
 
-def run(tmp_path, client, *, federation=CONFIGURED, seen=None):
+def run(tmp_path, client, *, federation=CONFIGURED, seen=None, oidc_calls=None):
+    def oidc_transport(url, request_token):
+        if oidc_calls is not None:
+            oidc_calls.append(url)
+        return oidc(url, request_token)
+
     env = {"JOB_WORKFLOW_SHA": JOB_SHA, "RUNNER_TEMP": str(tmp_path / "rt"),
            "ACTIONS_ID_TOKEN_REQUEST_URL": "https://pipelines.actions.githubusercontent.com/oidc?api-version=2.0",
            "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "t"}
     (tmp_path / "rt").mkdir(exist_ok=True)
     return evals.main(
         ["--fixtures-dir", str(tmp_path / "fixtures"), "--out-dir", str(tmp_path / "out")],
-        environ=env, oidc_transport=oidc, client_factory=factory_for(client, seen), federation=federation,
+        environ=env, oidc_transport=oidc_transport, client_factory=factory_for(client, seen), federation=federation,
         sleep=lambda s: None,
     )
 
@@ -292,6 +297,57 @@ def test_invalid_expectation_is_a_failed_case_before_any_call(tmp_path, expected
     [r] = result_lines(tmp_path)
     assert not r["matched"] and r["mismatches"][0].startswith("EvalError: expected.json:")
     assert seen == []
+
+
+def calls_for_one_good_case(tmp_path):
+    make_case(tmp_path / "fixtures", "b-good")
+    client, seen, oidc_calls = FakeClient(), [], []
+    assert run(tmp_path, client, seen=seen, oidc_calls=oidc_calls) == 0
+    return oidc_calls, seen, client.calls
+
+
+def assert_bad_case_makes_no_call(tmp_path, raw, error):
+    """A bad `expected.json` fails its case before OIDC, client or model
+    calls, and a valid later case still runs."""
+    baseline = calls_for_one_good_case(tmp_path / "baseline")
+    fx = tmp_path / "fixtures"
+    make_case(fx, "a-bad")
+    (fx / "a-bad" / "expected.json").write_text(raw)
+    make_case(fx, "b-good")
+    client, seen, oidc_calls = FakeClient(), [], []
+    assert run(tmp_path, client, seen=seen, oidc_calls=oidc_calls) == 1
+    bad, good = result_lines(tmp_path)
+    assert not bad["matched"] and bad["mismatches"] == [error]
+    assert good["matched"]
+    assert (oidc_calls, seen, client.calls) == baseline
+
+
+# Each of these matched with no mismatch when json.loads kept the last value.
+@pytest.mark.parametrize("raw, key", [
+    ('{"findings": [{"category": "bug", "severity": "critical"}], "findings": []}', "findings"),
+    ('{"max_severity": "low", "max_severity": "critical"}', "max_severity"),
+    ('{"findings": "wrong type", "findings": []}', "findings"),
+    ('{"findings": [{"category": "bug", "category": "security", "severity": "high"}]}', "category"),
+    ('{"gate": "fail", "summary_excludes": ["x"], "summary_excludes": []}', "summary_excludes"),
+])
+def test_duplicate_key_in_expectation_fails_before_any_call(tmp_path, raw, key):
+    assert_bad_case_makes_no_call(tmp_path, raw, f"EvalError: expected.json: ValueError: duplicate key {key!r}")
+
+
+def test_null_gate_fails_before_any_call(tmp_path):
+    # null is a wrong type, not an absent key: absent means "do not check"
+    assert_bad_case_makes_no_call(tmp_path, '{"gate": null}', "EvalError: expected.json: gate must be pass or fail")
+
+
+@pytest.mark.parametrize("hard_blocks", [["bidi-control", "bidi-control"], [""]])
+def test_hard_blocks_that_can_never_match_fail_before_any_call(tmp_path, hard_blocks):
+    assert_bad_case_makes_no_call(tmp_path, json.dumps({"hard_blocks": hard_blocks}),
+                                  "EvalError: expected.json: hard_blocks must be a list of distinct check IDs")
+
+
+def test_absent_gate_is_not_checked(tmp_path):
+    make_case(tmp_path / "fixtures", expected={"findings": [{"category": "security", "severity": "high"}]})
+    assert run(tmp_path, FakeClient()) == 0
 
 
 def test_results_are_written_per_case(tmp_path, monkeypatch):

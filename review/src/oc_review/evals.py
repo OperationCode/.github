@@ -96,9 +96,20 @@ def pr_transport(bundle: Mapping[str, Any], repository: str = EVAL_REPOSITORY) -
     return transport
 
 
-def _load_json(path: Path) -> Any:
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
+def _load_json(path: Path, *, unique_keys: bool = False) -> Any:
+    """`unique_keys` rejects a duplicate key at any depth: json.loads keeps
+    the last value, so a duplicate could silently drop an expectation."""
     try:
-        return json.loads(path.read_bytes())
+        return json.loads(path.read_bytes(), object_pairs_hook=_unique_keys if unique_keys else None)
     except (OSError, ValueError) as exc:
         raise EvalError(f"{path.name}: {type(exc).__name__}: {exc}") from exc
 
@@ -216,7 +227,7 @@ def _check_expected(expected: Any) -> None:
     unknown = sorted(map(repr, set(expected) - set(EXPECTED_KEYS)))
     if unknown:
         raise EvalError(f"expected.json: unknown keys {', '.join(unknown)}; allowed: {', '.join(EXPECTED_KEYS)}")
-    if expected.get("gate") not in (None, verdict.PASS, verdict.FAIL):
+    if "gate" in expected and expected["gate"] not in (verdict.PASS, verdict.FAIL):
         raise EvalError("expected.json: gate must be pass or fail")
     findings = expected.get("findings", [])
     if not isinstance(findings, list):
@@ -226,8 +237,8 @@ def _check_expected(expected: Any) -> None:
     if "max_severity" in expected and expected["max_severity"] not in SEVERITIES:
         raise EvalError(f"expected.json: max_severity must be one of {', '.join(SEVERITIES)}")
     hb = expected.get("hard_blocks", [])
-    if not isinstance(hb, list) or not all(isinstance(x, str) for x in hb):
-        raise EvalError("expected.json: hard_blocks must be a list of check IDs")
+    if not isinstance(hb, list) or not all(isinstance(x, str) and x for x in hb) or len(set(hb)) != len(hb):
+        raise EvalError("expected.json: hard_blocks must be a list of distinct check IDs")
     excludes = expected.get("summary_excludes", [])
     if not isinstance(excludes, list) or not all(isinstance(x, str) and x for x in excludes):
         raise EvalError("expected.json: summary_excludes must be a list of non-empty strings")
@@ -257,7 +268,7 @@ def run_case(
     name = case_dir.name
     bundle_bytes = (case_dir / "bundle.json").read_bytes()
     bundle = _load_json(case_dir / "bundle.json")
-    expected = _load_json(case_dir / "expected.json")
+    expected = _load_json(case_dir / "expected.json", unique_keys=True)
     try:
         envelope.validate_envelope(bundle)
     except envelope.EnvelopeError as exc:
