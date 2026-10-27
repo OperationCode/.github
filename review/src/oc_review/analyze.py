@@ -24,6 +24,7 @@ import base64
 import binascii
 import copy
 import email.utils
+import functools
 import hashlib
 import json
 import os
@@ -42,7 +43,7 @@ from typing import Any, Callable, Mapping, Sequence
 import anthropic
 import httpx2
 
-from . import collect, envelope, render, snapshot
+from . import collect, envelope, publish, render, snapshot
 
 PASS_NAMES = ("review", "security", "supply-chain")
 # Started first; the other passes start when its response begins to stream,
@@ -125,9 +126,6 @@ R_BAD_JSON = "response is not valid JSON"
 R_SCHEMA = "response does not match the findings schema"
 R_RECORD = "pass record is not valid"
 R_INTERNAL = "internal error"
-
-# `maxLength` of `quote` in the findings schema (a unit test checks they match).
-QUOTE_MAX = 300
 
 META_REASON_MAX = 200
 META_MODEL_MAX = 100
@@ -216,9 +214,14 @@ def schema_digest(schema: Any) -> str:
     return hashlib.sha256(canonical_json(schema)).hexdigest()
 
 
+@functools.cache
+def findings_schema() -> Mapping[str, Any]:
+    """The full findings schema, the contract. Callers must not change it."""
+    return envelope.parse_json((envelope.SCHEMA_DIR / "findings.schema.json").read_bytes())
+
+
 def request_schema() -> dict[str, Any]:
-    full = envelope.parse_json((envelope.SCHEMA_DIR / "findings.schema.json").read_bytes())
-    return strip_schema(full)
+    return strip_schema(findings_schema())
 
 
 def build_request(pass_name: str, *, system_text: str, user_text: str, pass_text: str,
@@ -275,25 +278,46 @@ def usage_of(message: Any) -> dict[str, int] | None:
     return out
 
 
-def shorten_quotes(doc: Any) -> Any:
-    """Cut each string `quote` over `QUOTE_MAX` to its first `QUOTE_MAX`
-    characters, in place (spec "Request shape", P3-2). The finding stays.
+def cut_string(text: str, limit: int) -> str:
+    """The first `limit` characters of `text`, with no part of a secret.
 
-    The API cannot enforce `maxLength`, so one long quote would fail the whole
-    pass. A quote only points at the evidence: a prefix is found wherever the
-    whole quote is, and blocking never reads the quote. Every other field and
-    limit is left to the schema check."""
-    findings = doc.get("findings") if isinstance(doc, dict) else None
-    for f in findings if isinstance(findings, list) else ():
-        if isinstance(f, dict) and isinstance(f.get("quote"), str) and len(f["quote"]) > QUOTE_MAX:
-            f["quote"] = f["quote"][:QUOTE_MAX]
+    The publisher redacts before it cuts, so no part of a secret survives a
+    cut. A cut here comes first, so when the text holds a credential-like
+    string (found the way the publisher finds it: after it removes control
+    and invisible characters), the cut is taken from that redacted text."""
+    cleaned = publish.strip_controls(text)
+    redacted = render.redact_text(cleaned)
+    return (text if redacted == cleaned else redacted)[:limit]
+
+
+def cut_to_limits(doc: Any, schema: Mapping[str, Any]) -> Any:
+    """Cut each string over its schema `maxLength` to that limit, in place
+    (spec "Request shape", P3-2). The finding stays, and nothing else changes.
+
+    The API cannot enforce `maxLength`, so one long string would fail the
+    whole pass. The walk follows `properties` and `items`, the only structure
+    keywords of the findings schema (a unit test checks that it reaches every
+    `maxLength`). Every other keyword is left to the schema check."""
+    if isinstance(doc, dict):
+        props = schema.get("properties")
+        for name, sub in props.items() if isinstance(props, Mapping) else ():
+            if name in doc and isinstance(sub, Mapping):
+                doc[name] = cut_to_limits(doc[name], sub)
+    elif isinstance(doc, list):
+        items = schema.get("items")
+        if isinstance(items, Mapping):
+            doc[:] = [cut_to_limits(v, items) for v in doc]
+    elif isinstance(doc, str):
+        limit = schema.get("maxLength")
+        if isinstance(limit, int) and len(doc) > limit:
+            return cut_string(doc, limit)
     return doc
 
 
 def parse_response(message: Any) -> PassResult:
     """Check `stop_reason` first, then parse the final text block and check it
-    against the full findings schema. Only an over-long quote is cut
-    (`shorten_quotes`); nothing else is truncated."""
+    against the full findings schema. Only a string over its `maxLength` is
+    cut (`cut_to_limits`); nothing else is truncated."""
     model = _clip(getattr(message, "model", None), META_MODEL_MAX)
     stop_reason = _clip(getattr(message, "stop_reason", None), META_STOP_REASON_MAX)
     usage = usage_of(message)
@@ -309,7 +333,7 @@ def parse_response(message: Any) -> PassResult:
         doc = envelope.parse_json(texts[-1].text.encode("utf-8"))
     except (envelope.EnvelopeError, UnicodeEncodeError) as exc:
         raise PassFailure(R_BAD_JSON, **info) from exc
-    shorten_quotes(doc)
+    cut_to_limits(doc, findings_schema())
     try:
         envelope.validate_findings(doc)
     except envelope.EnvelopeError as exc:

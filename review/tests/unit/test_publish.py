@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 import pytest
 
-from oc_review import collect, envelope, linediff, publish, verdict
+from oc_review import analyze, collect, envelope, linediff, publish, verdict
 from oc_review.collect import HttpRequest, HttpResponse
 from oc_review.publish import GitHubApi, PublishContext
 
@@ -627,6 +627,41 @@ def test_untrusted_text_is_escaped_in_summary(tmp_path):
     c = rv["comments"][0]["body"]
     assert GH_TOKEN not in c and "@user" not in c and "‮" not in c
     assert not re.search(r"(?<!\\)<img", c) and "[x]" not in c
+
+
+def test_strings_cut_by_analyze_render_escaped(tmp_path):
+    """Analyze cuts an over-long string at its limit (P3-2), so the cut can end
+    inside Markdown, HTML, an escape or a reference. Each one still shows as
+    plain escaped text, and the comment keeps its structure."""
+    tail = "\\`<!--&amp;@user #12 ["
+
+    def over(kind):
+        limit = publish.LIMITS[kind]
+        return "w" * (limit - len(tail)) + tail + "**bold** <b>more</b>"
+
+    payload = {"summary": over("summary"), "findings": [finding(
+        "malicious", "high", file=over("file"), quote=over("quote"), title=over("title"),
+        explanation=over("explanation"))]}
+    analyze.cut_to_limits(payload, analyze.findings_schema())
+    envelope.validate_findings(payload)
+    [f] = payload["findings"]
+    cut = {"summary": payload["summary"], **{k: f[k] for k in ("file", "quote", "title", "explanation")}}
+    assert all(v.endswith(tail) and len(v) == publish.LIMITS[k] for k, v in cut.items())
+
+    passes = clean_passes()
+    passes["review"] = pass_doc("review", findings=payload["findings"], summary=payload["summary"])
+    r = run(tmp_path, passes=passes)
+    s = r.summary
+    assert r.code == 1 and s.startswith(verdict.STICKY_MARKER)
+    assert "Not verified: file is not in the changed files" in plain(s)
+    for kind, value in cut.items():
+        shown = publish.escape_field(kind, value)
+        assert shown in s, kind
+        assert not shown.endswith(publish.TRUNCATED)
+        assert plain(shown) == value, kind  # every character shows as text
+        assert shown.endswith(r"\\\`\<\!\-\-\&amp\;\@" + ZWSP + r"user \#" + ZWSP + r"12 \["), kind
+    body = s.replace(verdict.STICKY_MARKER, "")
+    assert not re.search(r"(?<!\\)<!--", body) and "<b>" not in body and "**bold**" not in body
 
 
 def test_summary_under_limit_and_cut_in_order(tmp_path):

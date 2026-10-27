@@ -15,7 +15,7 @@ import anthropic
 import httpx2
 import pytest
 
-from oc_review import analyze, collect, envelope, render, verdict
+from oc_review import analyze, collect, envelope, publish, render, verdict
 from oc_review.envelope import sha256_hex
 
 FIX = Path(__file__).parent / "fixtures" / "analyze"
@@ -433,7 +433,7 @@ def test_stop_reason_other_than_end_turn_fails(tmp_path, configured, stop):
         ('{"summary": "a", "summary": "b", "findings": []}', analyze.R_BAD_JSON),
         ('{"summary": "a", "findings": [], "x": NaN}', analyze.R_BAD_JSON),
         ("", analyze.R_BAD_JSON),
-        (findings_text(title="t" * 121), f"{analyze.R_SCHEMA}: 'findings'/0/'title': [maxLength]"),
+        (findings_text(title=["t" * 121]), f"{analyze.R_SCHEMA}: 'findings'/0/'title': [type]"),
         (findings_text(16), f"{analyze.R_SCHEMA}: 'findings': [maxItems]"),
         ('{"summary": "a"}', f"{analyze.R_SCHEMA}: <root>: [required]"),
     ],
@@ -460,74 +460,172 @@ def test_more_findings_than_the_pass_limit_stay_ok(tmp_path, configured):
     assert rec["status"] == "ok" and len(rec["payload"]["findings"]) == 11
 
 
-# --- over-long quote (P3-2) -------------------------------------------------------
+# --- over-long strings (P3-2) ----------------------------------------------------
 
+
+def schema_limits(schema, path=()):
+    """Every `maxLength` in a schema, by the keyword path to it."""
+    out = {}
+    if isinstance(schema, dict):
+        for key, value in schema.items():
+            if key == "maxLength":
+                out[path] = value
+            else:
+                out.update(schema_limits(value, (*path, key)))
+    elif isinstance(schema, list):
+        for i, value in enumerate(schema):
+            out.update(schema_limits(value, (*path, i)))
+    return out
+
+
+LIMITS = {path[-1]: limit for path, limit in schema_limits(analyze.findings_schema()).items()}
 # One obfuscated line, longer than the quote limit (eval case obfuscated-test-payload).
 LONG_LINE = "const _0x1a = [" + ", ".join(["'\\x65\\x76\\x61\\x6c'"] * 30) + "];  global[_0x1a[0]](payload);"
 LONG_FILE = f"const payload = require('./p');\n{LONG_LINE}\nmodule.exports = {{}};\n"
+GH_TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
 
 
-def long_quote_text(quote):
-    return findings_text(category="malicious", severity="critical", file="test/setup.js", line=2, quote=quote)
+def long_text(limit, extra=40):
+    return ("plain words " * (limit // 4))[: limit + extra]
 
 
-def test_quote_max_is_the_schema_limit():
-    schema = envelope.parse_json((envelope.SCHEMA_DIR / "findings.schema.json").read_bytes())
-    assert analyze.QUOTE_MAX == schema["properties"]["findings"]["items"]["properties"]["quote"]["maxLength"]
+def long_doc(**override):
+    """A critical malicious finding, with fields set by `override`; `summary` sets the summary."""
+    doc = json.loads(findings_text(category="malicious", severity="critical", file="test/setup.js", line=2))
+    summary = override.pop("summary", None)
+    if summary is not None:
+        doc["summary"] = summary
+    doc["findings"][0].update(override)
+    return doc
 
 
-def test_over_long_quote_is_cut_and_the_finding_stays(tmp_path, configured):
-    assert len(LONG_LINE) > analyze.QUOTE_MAX
-    client = FakeClient({"supply-chain": Behavior(message=message(long_quote_text(LONG_LINE)))})
+def cut(doc):
+    return analyze.cut_to_limits(doc, analyze.findings_schema())
+
+
+def test_the_cut_reaches_every_max_length_in_the_schema():
+    paths = schema_limits(analyze.findings_schema())
+    assert set(LIMITS) == {"summary", "file", "quote", "title", "explanation"}
+    for path in paths:  # only `properties` / `items` steps, the ones the cut walks
+        steps = list(path)
+        while steps:
+            key = steps.pop(0)
+            if key == "properties":
+                steps.pop(0)
+            else:
+                assert key == "items", path
+
+
+@pytest.mark.parametrize("field", sorted(LIMITS))
+def test_over_long_string_is_cut_and_the_finding_stays(tmp_path, configured, field):
+    value = long_text(LIMITS[field])
+    sent = long_doc(**{field: value})
+    client = FakeClient({"supply-chain": Behavior(message=message(json.dumps(sent)))})
     run = run_main(tmp_path, client=client)
     assert statuses(run) == {"review": "ok", "security": "ok", "supply-chain": "ok"}
     rec = run.records["supply-chain"]
     assert rec["meta"]["reason"] is None
-    [f] = rec["payload"]["findings"]
-    want = {**json.loads(long_quote_text(LONG_LINE))["findings"][0], "quote": LONG_LINE[: analyze.QUOTE_MAX]}
-    assert f == want  # only the quote changed: category, severity and text stay
+    want = long_doc(**{field: value[: LIMITS[field]]})
+    assert rec["payload"] == want  # only that string changed: category, severity, flags stay
     envelope.validate_findings(rec["payload"])  # the record holds the full-schema-valid payload
 
 
+def test_every_string_over_its_limit_at_once_is_cut(tmp_path, configured):
+    sent = long_doc(**{field: long_text(limit) for field, limit in LIMITS.items()})
+    client = FakeClient({"security": Behavior(message=message(json.dumps(sent)))})
+    rec = run_main(tmp_path, client=client).records["security"]
+    assert rec["status"] == "ok"
+    payload = rec["payload"]
+    [f] = payload["findings"]
+    assert len(payload["summary"]) == LIMITS["summary"]
+    assert all(len(f[name]) == LIMITS[name] for name in LIMITS if name != "summary")
+    original = sent["findings"][0]
+    assert {k: f[k] for k in original if k not in LIMITS} == {k: original[k] for k in original if k not in LIMITS}
+    assert (f["category"], f["severity"]) == ("malicious", "critical")
+
+
+@pytest.mark.parametrize("field", sorted(LIMITS))
+def test_string_at_the_limit_is_unchanged(field):
+    value = "q" * LIMITS[field]
+    doc = cut(long_doc(**{field: value}))
+    got = doc["summary"] if field == "summary" else doc["findings"][0][field]
+    assert got == value
+
+
+def test_cut_keeps_no_part_of_a_secret():
+    limit = LIMITS["explanation"]
+    # A token that straddles the limit, with a zero-width space that hides it
+    # from redaction until the publisher removes invisible characters.
+    hidden = GH_TOKEN[:12] + "​" + GH_TOKEN[12:]
+    text = "e" * (limit - 20) + " " + hidden + " tail"
+    assert GH_TOKEN[:18] in publish.strip_controls(text[:limit])  # a plain prefix would leak it
+    got = cut(long_doc(explanation=text))["findings"][0]["explanation"]
+    assert len(got) <= limit and "[REDACTED" in got
+    shown = publish.escape_field("explanation", got)
+    assert not any(GH_TOKEN[i : i + 8] in publish.strip_controls(got) for i in range(len(GH_TOKEN) - 8))
+    assert not any(GH_TOKEN[i : i + 8] in re.sub(r"\\(.)", r"\1", shown) for i in range(len(GH_TOKEN) - 8))
+
+
+def test_cut_without_a_secret_is_a_plain_prefix():
+    text = "zero​width " + long_text(LIMITS["title"])
+    assert cut(long_doc(title=text))["findings"][0]["title"] == text[: LIMITS["title"]]
+
+
 def test_cut_quote_still_passes_the_citation_check():
-    doc = analyze.shorten_quotes(json.loads(long_quote_text(LONG_LINE)))
+    doc = cut(long_doc(quote=LONG_LINE))
     files = (verdict.FileSides("test/setup.js", head_text=LONG_FILE, head_hunks=((1, 3),)),)
     c = verdict.cite_finding("supply-chain", doc["findings"][0], files)
-    assert len(c.quote) == analyze.QUOTE_MAX
+    assert len(c.quote) == LIMITS["quote"]
     assert c.verified and c.inline and c.blocking
 
 
 def test_cut_inside_a_whitespace_run_still_verifies():
-    line = "x" * (analyze.QUOTE_MAX - 2) + " \t   " + "y" * 50
-    doc = analyze.shorten_quotes(json.loads(long_quote_text(line)))
+    line = "x" * (LIMITS["quote"] - 2) + " \t   " + "y" * 50
+    doc = cut(long_doc(quote=line))
     files = (verdict.FileSides("test/setup.js", head_text=f"a\n{line}\n", head_hunks=((1, 2),)),)
     assert verdict.cite_finding("supply-chain", doc["findings"][0], files).verified
 
 
 def test_cut_quote_that_is_not_on_the_line_stays_unverified_and_blocking():
-    doc = analyze.shorten_quotes(json.loads(long_quote_text("z" * 400)))
+    doc = cut(long_doc(quote="z" * 400))
     files = (verdict.FileSides("test/setup.js", head_text=LONG_FILE, head_hunks=((1, 3),)),)
     c = verdict.cite_finding("supply-chain", doc["findings"][0], files)
     assert not c.verified and c.blocking
 
 
-def test_quote_at_the_limit_is_unchanged():
-    quote = "q" * analyze.QUOTE_MAX
-    doc = analyze.shorten_quotes(json.loads(long_quote_text(quote)))
-    assert doc["findings"][0]["quote"] == quote
+def test_cut_file_path_stays_unverified_and_blocking():
+    path = "a/" * 250 + "setup.js"
+    doc = cut(long_doc(file=path, quote="global[_0x1a[0]](payload);"))
+    f = doc["findings"][0]
+    assert f["file"] == path[: LIMITS["file"]]
+    files = (verdict.FileSides(path, head_text=LONG_FILE, head_hunks=((1, 3),)),)
+    c = verdict.cite_finding("supply-chain", f, files)
+    assert not c.verified and not c.inline and c.blocking
 
 
 @pytest.mark.parametrize(
     "override, reason",
     [
-        ({"quote": 5}, f"{analyze.R_SCHEMA}: 'findings'/0/'quote': [type]"),
-        ({"quote": ""}, f"{analyze.R_SCHEMA}: 'findings'/0/'quote': [minLength]"),
-        ({"quote": "q" * 400, "explanation": "e" * 1201}, f"{analyze.R_SCHEMA}: 'findings'/0/'explanation': [maxLength]"),
+        ({"quote": 5}, "'findings'/0/'quote': [type]"),
+        ({"quote": ""}, "'findings'/0/'quote': [minLength]"),
+        ({"file": ""}, "'findings'/0/'file': [minLength]"),
+        ({"title": 121}, "'findings'/0/'title': [type]"),
+        ({"summary": ["s" * 2000]}, "'summary': [type]"),
+        ({"severity": "urgent", "title": "t" * 500}, "'findings'/0/'severity': [enum]"),
+        ({"extra": "x", "explanation": "e" * 2000}, "'findings'/0: [additionalProperties]"),
     ],
 )
-def test_only_the_quote_length_is_cut(tmp_path, configured, override, reason):
-    run = run_main(tmp_path, client=FakeClient({"review": Behavior(message=message(findings_text(**override)))}))
-    assert reasons(run)["review"] == reason
+def test_other_schema_errors_still_fail_the_pass(tmp_path, configured, override, reason):
+    run = run_main(tmp_path, client=FakeClient({"review": Behavior(message=message(json.dumps(long_doc(**override))))}))
+    assert run.records["review"]["status"] == "failed"
+    assert reasons(run)["review"] == f"{analyze.R_SCHEMA}: {reason}"
+
+
+def test_missing_field_still_fails_the_pass(tmp_path, configured):
+    doc = long_doc(explanation="e" * 2000)
+    del doc["findings"][0]["title"]
+    run = run_main(tmp_path, client=FakeClient({"review": Behavior(message=message(json.dumps(doc)))}))
+    assert reasons(run)["review"] == f"{analyze.R_SCHEMA}: 'findings'/0: [required]"
 
 
 def test_final_text_block_after_a_fallback_block_is_parsed(tmp_path, configured):

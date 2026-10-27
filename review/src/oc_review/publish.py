@@ -115,7 +115,7 @@ def _invisible(ch: str) -> bool:
     )
 
 
-def _strip_controls(text: str) -> str:
+def strip_controls(text: str) -> str:
     text = _LINE_BREAKS.sub("\n", text).replace("\t", " ")
     out: list[str] = []
     marks = 0
@@ -158,7 +158,7 @@ def escape_text(text: str, limit: int, *, multiline: bool = False) -> str:
         raise TypeError("escape_text takes a str")
     if not isinstance(limit, int) or limit < 1:
         raise ValueError("limit must be a positive int")
-    text = redact_text(_strip_controls(text))
+    text = redact_text(strip_controls(text))
     lines = [" ".join(line.split()) for line in text.split("\n")]
     lines = [line for line in lines if line]
     joined = "\n".join(lines) if multiline else " ".join(lines)
