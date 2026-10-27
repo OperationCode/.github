@@ -51,6 +51,19 @@ def configured(monkeypatch):
         monkeypatch.setattr(analyze, name, value)
 
 
+PLACEHOLDER_IDS = {
+    "ANTHROPIC_FEDERATION_RULE_ID": "fdrl_000000000000000000000000",
+    "ANTHROPIC_ORGANIZATION_ID": "00000000-0000-0000-0000-000000000000",
+    "ANTHROPIC_SERVICE_ACCOUNT_ID": "svac_000000000000000000000000",
+}
+
+
+@pytest.fixture
+def placeholders(monkeypatch):
+    for name, value in PLACEHOLDER_IDS.items():
+        monkeypatch.setattr(analyze, name, value)
+
+
 # --- fake Anthropic client --------------------------------------------------
 
 
@@ -994,7 +1007,7 @@ def test_render_error_gives_failed_records(tmp_path, configured, monkeypatch):
     assert run.client.calls == {} and run.oidc.calls == []
 
 
-def test_placeholder_federation_refuses_to_call(tmp_path):
+def test_placeholder_federation_refuses_to_call(tmp_path, placeholders):
     run = run_main(tmp_path)
     assert_three_records(run)
     assert set(statuses(run).values()) == {"failed"}
@@ -1195,7 +1208,7 @@ def test_federation_parameter_reaches_the_client_factory(tmp_path):
         return FakeClient()
 
     results = _analyze_direct(tmp_path, factory, federation=other)
-    assert seen == [other]  # module constants are still placeholders: only the parameter can pass
+    assert seen == [other]  # the parameter, not the module constants, names the IDs here
     assert {r.status for r in results.values()} == {"ok"}
 
 

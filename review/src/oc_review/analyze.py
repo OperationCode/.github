@@ -13,8 +13,8 @@ is not trusted (no record can name a snapshot it cannot trust) or the records
 cannot be written.
 
 Federation: the IDs below are not secret. They live in the pinned code, so a
-repo cannot change them, and each release names its own rule. Until the owner
-creates the production rule they are placeholders, and analyze refuses to call.
+repo cannot change them, and each release names its own rule. Placeholder
+(all-zero) IDs make analyze refuse to call.
 """
 
 from __future__ import annotations
@@ -73,10 +73,11 @@ TOKEN_EXCHANGE_TIMEOUT_SECONDS = 30.0
 CREDENTIAL_HEADERS = frozenset({"x-api-key", "authorization"})
 
 # Production federation rule (spec "Auth and cost", "Each release").
-# Placeholders until the owner creates the rule: analyze refuses to call.
-ANTHROPIC_FEDERATION_RULE_ID = "fdrl_000000000000000000000000"
-ANTHROPIC_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000000"
-ANTHROPIC_SERVICE_ACCOUNT_ID = "svac_000000000000000000000000"
+# Rule R1 `claude-review-prod-r1` and service account `claude-review`, in
+# workspace `claude-review`. Each release names its own rule here.
+ANTHROPIC_FEDERATION_RULE_ID = "fdrl_01N2ZktTiVKqUvvXwywBFfys"
+ANTHROPIC_ORGANIZATION_ID = "2bc920f9-977b-43b2-870a-f840e4ce809c"
+ANTHROPIC_SERVICE_ACCOUNT_ID = "svac_01PiMgfb6qJgNpLZUV8hprCC"
 
 FEDERATION_RULE_ID_RE = re.compile(r"^fdrl_[A-Za-z0-9]{24}$")
 ORGANIZATION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
