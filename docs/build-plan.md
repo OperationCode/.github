@@ -57,7 +57,7 @@ Owner:
 - [x] Owner: create a scratch source repo in the org for the V tests, separate from claude-review-test ([claude-review-p0-source](https://github.com/OperationCode/claude-review-p0-source)).
 - [ ] Owner: Anthropic Console: a dedicated workspace with a hard monthly spend limit and a service account. Create the production federation rule as in spec "Auth and cost": pattern mode, subject prefix `repo:OperationCode@10479364/*`, scope `workspace:developer`, the review workspace only, and the placeholder SHA `0000000000000000000000000000000000000000` in `job_workflow_ref`. Read it back; if the Console rejects the placeholder, stop and resolve the order of rule ID and SHA first (spec V26 a). Its ID goes into the central code; phase 3 sets the candidate SHA. No API key.
 - [ ] Owner: the test workspace (reused for evals, spec P2-1), and a federation rule for `workflow_dispatch` runs in `OperationCode/.github` whose job uses the environment `eval`: pattern mode, the same subject prefix, exact claims `repository_owner_id`, `repository_id`, `event_name` and `environment`, scope `workspace:developer`, that workspace only (spec "Auth and cost"). Its IDs are in `evals.py`. The rule cannot name `eval.yml`: any `.github` workflow that uses `eval` can match, so the owner's approval and the workflow unit test (1c) hold it to `eval.yml`. Test it as in spec V27 before phase 2.
-- [ ] Owner: on `.github`, create the GitHub environment `eval`: the owner is a required reviewer for every run, and any branch may deploy to it. Turn on "prevent self-review" so the PR author cannot approve their own eval run. Before approving a run, check the run that waits for approval: the workflow file and commit it runs, every job in it that uses `eval`, and their effective permissions (no GitHub write). Also check that the PR does not change `eval.yml`, any other workflow file, the eval code, the prompts, the fixtures or the federation setup in a harmful way, and that `test.yml` passed. The approval is the control; the residual risk is an approver who approves without reading. Exception to the no-execute rule (K-4): evals of PRs to this repo may run that PR's code, only after an owner approves the `eval` environment run. Needed before phase 2.
+- [ ] Owner: on `.github`, create the GitHub environment `eval`: the owner is a required reviewer for every run, and any branch may deploy to it. "Prevent self-review" is off temporarily (owner, 2026-10-26), so that the coordinator, which runs with the owner's token, can approve eval runs it started from reviewed branches; the owner turns it on again in phase 5. Admin bypass stays on. During phase 2 the coordinator's approval stands in for the owner's under the owner's delegation. Before approving a run, check the run that waits for approval: the workflow file and commit it runs, every job in it that uses `eval`, and their effective permissions (no GitHub write). Also check that the PR does not change `eval.yml`, any other workflow file, the eval code, the prompts, the fixtures or the federation setup in a harmful way, and that `test.yml` passed. The approval is the control; the residual risk is an approver who approves without reading. Exception to the no-execute rule (K-4): evals of PRs to this repo may run that PR's code, only after an owner approves the `eval` environment run. Needed before phase 2.
 - [x] Owner: a test workspace with a very small spend limit for V9.
 - [ ] Owner: the test org ruleset for V6 that targets only claude-review-test.
 - [ ] Owner: a Dependabot PR in claude-review-test for V4.
@@ -129,11 +129,11 @@ Exit criteria:
 
 The fixture eval calls the live API and costs money. The owner runs it on request only. It is the one exception to the no-execute rule: it may run a PR's code, only after an owner approves the `eval` environment run (K-4).
 
-- [ ] V27, before the first eval: test the eval federation rule (an approved `eval.yml` run gets a token; the deny cases in the spec get none, including a dispatch run in claude-review-test with its own `eval` environment, spec P2-2).
-- [ ] Real eval federation IDs in `evals.py`, checked by a unit test against the production placeholders (spec P2-1).
-- [ ] Eval runner: expectation format v2 and the rendered summary per case (spec "Testing", P2-5).
-- [ ] Fixture builder `review/tests/eval_fixtures.py` and the 13 cases of the spec's minimum set in `review/tests/fixtures`, with expected outcomes. Unit tests: each bundle equals a rebuild, and each hard-block case fails the gate whatever Claude returns.
-- [ ] Move the smoke case to `review/tests/unit/fixtures/eval-smoke`, out of the live run (spec P2-3).
+- [x] V27, before the first eval (passed 2026-10-27, throwaway branch `v27-probe`, never merged; Console deny reasons and the P1 scope are pending owner confirmation): test the eval federation rule (an approved `eval.yml` run gets a token; the deny cases in the spec get none, including a dispatch run in claude-review-test with its own `eval` environment, spec P2-2).
+- [x] Real eval federation IDs in `evals.py`, checked by a unit test against the production placeholders (spec P2-1).
+- [x] Eval runner: expectation format v2 and the rendered summary per case (spec "Testing", P2-5).
+- [x] Fixture builder `review/tests/eval_fixtures.py` and the 13 cases of the spec's minimum set in `review/tests/fixtures`, with expected outcomes. Unit tests: each bundle equals a rebuild, and each hard-block case fails the gate whatever Claude returns.
+- [x] Move the smoke case to `review/tests/unit/fixtures/eval-smoke`, out of the live run (spec P2-3).
 - [ ] Owner: run `eval.yml` on the PR branch and approve the `eval` environment, with the eval federation rule and the test workspace (reused for evals) from phase 0. Check the PR first (see phase 0). Record the results in the PR that changed the prompts or code. Passing evals gate the merge of a prompt or model change, and a release pin moves only to a SHA whose tree has passed the evals (a merge SHA with the same tree as the tested candidate counts). No required check enforces the merge gate, so the owner holds the merge until the evals pass.
 - [ ] Fix prompts or code for each miss, then run the full set again on request. An expectation changes only with a written reason in the PR (spec P2-4).
 
@@ -141,7 +141,7 @@ Depends on: phase 1; V27.
 
 Exit criteria:
 
-- [ ] V27 passes.
+- [x] V27 passes.
 - [ ] Every fixture in the minimum set gives its expected outcome: one full run with all 13 cases matched (spec P2-4).
 - [ ] The hard-block fixtures (bidi, git URL lockfile) block whatever Claude returns.
 
@@ -205,6 +205,7 @@ Exit criteria:
 - [ ] Owner: read the org ruleset back and check the workflow entry (`repository_id`, path, `sha`, no `ref`).
 - [ ] Build the supported repo inventory (spec "Supported repos") as a list in this repo.
 - [ ] Owner: CODEOWNERS in each supported repo.
+- [ ] Owner: turn "prevent self-review" back on for the `eval` environment (it is off during phase 2), and decide whether admin bypass stays on.
 - [ ] Owner: Dependabot alerts with npm malware detection on active repos.
 - [ ] Re-run the key acceptance tests on the current release: V6 a, V8 a, V22 b, V23 and the outage process.
 - [ ] Revisit harden-runner block mode (spec K-14): switch to block when harden-runner [issue 708](https://github.com/step-security/harden-runner/issues/708) is fixed in a harden-runner release. Pin that release, measure the `test.yml` and `eval.yml` lists in audit mode, and re-test block mode. If no job hangs, set `egress-policy: block` and `disable-telemetry: true` in every job, and update the unit tests and the spec.

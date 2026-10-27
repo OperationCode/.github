@@ -61,7 +61,7 @@ def bundle_of(case: str) -> dict:
 
 
 def expected_of(case: str) -> dict:
-    return json.loads((BY_NAME[case] / "expected.json").read_text(encoding="utf-8"))
+    return evals._load_json(BY_NAME[case] / "expected.json", unique_keys=True)
 
 
 def finding(category: str, severity: str, file: str, line: int, quote: str, side: str = "head") -> dict:
@@ -178,7 +178,7 @@ def test_blob_shas_are_real_git_object_ids():
 
 @pytest.mark.parametrize("case_dir", CASES, ids=CASE_IDS)
 def test_expected_passes_the_runner_check(case_dir):
-    expected = json.loads((case_dir / "expected.json").read_text())
+    expected = evals._load_json(case_dir / "expected.json", unique_keys=True)
     evals._check_expected(expected)
     # every case states its hard blocks: only code decides them
     assert "hard_blocks" in expected
@@ -186,7 +186,7 @@ def test_expected_passes_the_runner_check(case_dir):
 
 @pytest.mark.parametrize("case_dir", CASES, ids=CASE_IDS)
 def test_expected_hard_blocks_equal_the_bundle(case_dir):
-    expected = json.loads((case_dir / "expected.json").read_text())
+    expected = evals._load_json(case_dir / "expected.json", unique_keys=True)
     assert sorted(expected["hard_blocks"]) == evals._bundle_hard_block_ids(json.loads((case_dir / ef.BUNDLE_NAME).read_text()))
 
 
