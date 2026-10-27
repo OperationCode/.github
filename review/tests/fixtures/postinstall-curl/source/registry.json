@@ -1,0 +1,20 @@
+{
+  "https://registry.npmjs.org/oc-fixture-colorize": {
+    "status": 200,
+    "json": {
+      "name": "oc-fixture-colorize",
+      "time": {
+        "1.1.0": "2025-11-02T09:15:00.000Z",
+        "1.2.0": "2026-02-10T14:30:00.000Z"
+      },
+      "versions": {
+        "1.1.0": {"name": "oc-fixture-colorize", "version": "1.1.0"},
+        "1.2.0": {
+          "name": "oc-fixture-colorize",
+          "version": "1.2.0",
+          "scripts": {"postinstall": "node scripts/setup.js"}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "number": 13,
+  "title": "CI: publish build metrics",
+  "body": "Sends build metrics to our dashboard after each release build.\n",
+  "author_association": "CONTRIBUTOR"
+}

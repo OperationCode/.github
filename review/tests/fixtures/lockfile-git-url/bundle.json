@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "kind": "bundle",
+  "run_id": 123456,
+  "run_attempt": 1,
+  "repository_id": 42,
+  "pr_number": 12,
+  "head_sha": "7744f277bea9238582984623556377b168ae97ba",
+  "base_repository_id": 42,
+  "base_ref": "main",
+  "base_tip_sha": "77924584c1d0b70762a3fe23cd734e1f2834456e",
+  "merge_base_sha": "77924584c1d0b70762a3fe23cd734e1f2834456e",
+  "status": "ok",
+  "payload": {
+    "pr": {
+      "repository": "OperationCode/eval-fixtures",
+      "repository_id": 42,
+      "number": 12,
+      "title": "Refresh the lockfile",
+      "body": "Regenerated package-lock.json.\n",
+      "author_login": "eval-author",
+      "author_association": "CONTRIBUTOR",
+      "labels": [],
+      "changed_files": 1
+    },
+    "files": [
+      {
+        "path": "package-lock.json",
+        "old_path": null,
+        "status": "modified",
+        "base_mode": "100644",
+        "head_mode": "100644",
+        "additions": 4,
+        "deletions": 0,
+        "base_blob_sha": "efc91fef89551f44d4e3d7633d973c18b96e387e",
+        "head_blob_sha": "4a0d4af0a8fd728ba7bae8d496c741df9bf4a615",
+        "binary": false,
+        "size": 540,
+        "coverage": "full",
+        "patch": "@@ -14,6 +14,10 @@\n     \"node_modules/left-pad\": {\n       \"version\": \"1.3.0\",\n       \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"\n+    },\n+    \"node_modules/is-odd\": {\n+      \"version\": \"3.0.1\",\n+      \"resolved\": \"git+https://github.com/attacker/is-odd.git#0123456789abcdef0123456789abcdef01234567\"\n     }\n   }\n }\n",
+        "patch_redaction": "blob-context",
+        "content": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"lockfileVersion\": 3,\n  \"requires\": true,\n  \"packages\": {\n    \"\": {\n      \"name\": \"demo\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": {\n        \"left-pad\": \"^1.3.0\"\n      }\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"\n    },\n    \"node_modules/is-odd\": {\n      \"version\": \"3.0.1\",\n      \"resolved\": \"git+https://github.com/attacker/is-odd.git#0123456789abcdef0123456789abcdef01234567\"\n    }\n  }\n}\n",
+        "head_content": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"lockfileVersion\": 3,\n  \"requires\": true,\n  \"packages\": {\n    \"\": {\n      \"name\": \"demo\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": {\n        \"left-pad\": \"^1.3.0\"\n      }\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"\n    },\n    \"node_modules/is-odd\": {\n      \"version\": \"3.0.1\",\n      \"resolved\": \"git+https://github.com/attacker/is-odd.git#0123456789abcdef0123456789abcdef01234567\"\n    }\n  }\n}\n",
+        "base_content": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"lockfileVersion\": 3,\n  \"requires\": true,\n  \"packages\": {\n    \"\": {\n      \"name\": \"demo\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": {\n        \"left-pad\": \"^1.3.0\"\n      }\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"\n    }\n  }\n}\n"
+      }
+    ],
+    "dependency_delta": {
+      "changes": [
+        {
+          "path": "package-lock.json",
+          "ecosystem": "npm",
+          "name": "is-odd",
+          "old_versions": [],
+          "new_version": "3.0.1",
+          "source": {
+            "kind": "git",
+            "normalized": "git+https://github.com/attacker/is-odd.git#0123456789abcdef0123456789abcdef01234567",
+            "host": "github.com",
+            "official": false
+          },
+          "direct": false,
+          "has_install_script": false,
+          "registry": null
+        }
+      ],
+      "new_global_sources": [],
+      "failures": []
+    },
+    "prefilter": {
+      "signals": [],
+      "hard_blocks": [
+        {
+          "id": "foreign-source",
+          "level": "hard_block",
+          "detail": "git source is not the official registry",
+          "file": "package-lock.json",
+          "subject": "is-odd@3.0.1 from git+https://github.com/attacker/is-odd.git#0123456789abcdef0123456789abcdef01234567",
+          "lines": [],
+          "count": 1
+        }
+      ]
+    },
+    "coverage": {
+      "trees_complete": true,
+      "files_in_comparison": 1,
+      "files_collected": 1,
+      "files": [
+        {
+          "path": "package-lock.json",
+          "coverage": "full",
+          "reason": null
+        }
+      ],
+      "complete": true
+    },
+    "size": {
+      "estimated_tokens": 868,
+      "limit_tokens": 150000
+    }
+  }
+}

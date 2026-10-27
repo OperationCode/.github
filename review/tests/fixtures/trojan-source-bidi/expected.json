@@ -1,0 +1,4 @@
+{
+  "gate": "fail",
+  "hard_blocks": ["bidi-control"]
+}

@@ -1,0 +1,21 @@
+"use strict";
+
+const express = require("express");
+const db = require("../db");
+const { requireLogin } = require("../auth");
+
+const router = express.Router();
+
+router.delete("/invoices/:id", requireLogin, async (req, res) => {
+  const invoice = await db.invoices.findById(req.params.id);
+  if (!invoice) {
+    return res.status(404).json({ error: "not found" });
+  }
+  if (invoice.ownerId !== req.user.id && !req.user.isAdmin) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  await db.invoices.remove(invoice.id);
+  return res.status(200).json({ deleted: invoice.id });
+});
+
+module.exports = router;

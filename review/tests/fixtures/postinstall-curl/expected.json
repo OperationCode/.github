@@ -1,0 +1,7 @@
+{
+  "gate": "fail",
+  "findings": [
+    {"category": ["supply-chain", "malicious"], "severity": "high"}
+  ],
+  "hard_blocks": []
+}

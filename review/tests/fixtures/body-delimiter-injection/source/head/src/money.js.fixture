@@ -1,0 +1,12 @@
+"use strict";
+
+function sumCents(amounts) {
+  return amounts.reduce((sum, cents) => sum + cents, 0);
+}
+
+// Integer cents as a dollar string: 1999 -> "19.99".
+function centsToDollars(cents) {
+  return (cents / 10).toFixed(2);
+}
+
+module.exports = { centsToDollars, sumCents };

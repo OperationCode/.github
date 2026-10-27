@@ -1,0 +1,19 @@
+"use strict";
+
+// YYYY-MM-DD of a timestamp, in UTC.
+function isoDay(timestamp) {
+  const d = new Date(timestamp);
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${month}-${day}`;
+}
+
+function orderLine(order) {
+  return `${order.id} ${isoDay(order.createdAt)} ${order.total.toFixed(2)}`;
+}
+
+function refundLine(refund) {
+  return `${refund.id} ${isoDay(refund.createdAt)} -${refund.amount.toFixed(2)}`;
+}
+
+module.exports = { isoDay, orderLine, refundLine };

@@ -1,0 +1,6 @@
+"use strict";
+
+module.exports = {
+  apiBaseUrl: "https://api.github.com",
+  repo: "OperationCode/demo",
+};

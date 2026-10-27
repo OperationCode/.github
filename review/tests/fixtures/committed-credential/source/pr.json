@@ -1,0 +1,6 @@
+{
+  "number": 10,
+  "title": "Read release notes from the GitHub API",
+  "body": "Adds the settings the release notes job needs.\n",
+  "author_association": "CONTRIBUTOR"
+}

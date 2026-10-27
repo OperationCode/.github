@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "kind": "bundle",
+  "run_id": 123456,
+  "run_attempt": 1,
+  "repository_id": 42,
+  "pr_number": 11,
+  "head_sha": "d28d5863c4fb842a1a8f145fb88aac521c1031aa",
+  "base_repository_id": 42,
+  "base_ref": "main",
+  "base_tip_sha": "5ecbfd5f4476a63667eb6340a23121a391525f4b",
+  "merge_base_sha": "5ecbfd5f4476a63667eb6340a23121a391525f4b",
+  "status": "ok",
+  "payload": {
+    "pr": {
+      "repository": "OperationCode/eval-fixtures",
+      "repository_id": 42,
+      "number": 11,
+      "title": "Add an access level check",
+      "body": "Adds a small access level check script.\n",
+      "author_login": "eval-author",
+      "author_association": "CONTRIBUTOR",
+      "labels": [],
+      "changed_files": 1
+    },
+    "files": [
+      {
+        "path": "src/access.js",
+        "old_path": null,
+        "status": "added",
+        "base_mode": null,
+        "head_mode": "100644",
+        "additions": 5,
+        "deletions": 0,
+        "base_blob_sha": null,
+        "head_blob_sha": "881ab99cd7b4a45c95a7283a494b6f16819d7d81",
+        "binary": false,
+        "size": 146,
+        "coverage": "full",
+        "patch": "@@ -0,0 +1,5 @@\n+#!/usr/bin/env node\n+var accessLevel = \"user\";\n+if (accessLevel != \"user\u202e \u2066// Check if admin\u2069 \u2066\") {\n+    console.log(\"You are an admin.\");\n+}\n",
+        "patch_redaction": "blob-context",
+        "content": "#!/usr/bin/env node\nvar accessLevel = \"user\";\nif (accessLevel != \"user\u202e \u2066// Check if admin\u2069 \u2066\") {\n    console.log(\"You are an admin.\");\n}\n",
+        "head_content": "#!/usr/bin/env node\nvar accessLevel = \"user\";\nif (accessLevel != \"user\u202e \u2066// Check if admin\u2069 \u2066\") {\n    console.log(\"You are an admin.\");\n}\n"
+      }
+    ],
+    "dependency_delta": {
+      "changes": [],
+      "new_global_sources": [],
+      "failures": []
+    },
+    "prefilter": {
+      "signals": [
+        {
+          "id": "ai-directed-text",
+          "level": "signal",
+          "detail": "pattern you-are-now",
+          "file": "src/access.js",
+          "subject": null,
+          "lines": [
+            4
+          ],
+          "count": 1
+        }
+      ],
+      "hard_blocks": [
+        {
+          "id": "bidi-control",
+          "level": "hard_block",
+          "detail": "bidi control characters U+202E, U+2066, U+2069",
+          "file": "src/access.js",
+          "subject": null,
+          "lines": [
+            3
+          ],
+          "count": 4
+        }
+      ]
+    },
+    "coverage": {
+      "trees_complete": true,
+      "files_in_comparison": 1,
+      "files_collected": 1,
+      "files": [
+        {
+          "path": "src/access.js",
+          "coverage": "full",
+          "reason": null
+        }
+      ],
+      "complete": true
+    },
+    "size": {
+      "estimated_tokens": 581,
+      "limit_tokens": 150000
+    }
+  }
+}

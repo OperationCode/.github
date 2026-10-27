@@ -1,0 +1,6 @@
+{
+  "number": 3,
+  "title": "Add a member search endpoint",
+  "body": "Adds `GET /members/search?name=...` so the directory page can look members up by name.\n",
+  "author_association": "CONTRIBUTOR"
+}

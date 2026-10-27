@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "kind": "bundle",
+  "run_id": 123456,
+  "run_attempt": 1,
+  "repository_id": 42,
+  "pr_number": 10,
+  "head_sha": "2731528ac4a15b42787fd7d541d496fd061afd4f",
+  "base_repository_id": 42,
+  "base_ref": "main",
+  "base_tip_sha": "23fc030e0165951239eaf6f0f236af647cff3b59",
+  "merge_base_sha": "23fc030e0165951239eaf6f0f236af647cff3b59",
+  "status": "ok",
+  "payload": {
+    "pr": {
+      "repository": "OperationCode/eval-fixtures",
+      "repository_id": 42,
+      "number": 10,
+      "title": "Read release notes from the GitHub API",
+      "body": "Adds the settings the release notes job needs.\n",
+      "author_login": "eval-author",
+      "author_association": "CONTRIBUTOR",
+      "labels": [],
+      "changed_files": 1
+    },
+    "files": [
+      {
+        "path": "config/settings.js",
+        "old_path": null,
+        "status": "modified",
+        "base_mode": "100644",
+        "head_mode": "100644",
+        "additions": 2,
+        "deletions": 0,
+        "base_blob_sha": "60c7be191d7aaad6a49f9b6893975b27c584327f",
+        "head_blob_sha": "0ba75b49c4928ec182bde35562f8688209edca3d",
+        "binary": false,
+        "size": 204,
+        "coverage": "full",
+        "patch": "@@ -3,4 +3,6 @@\n module.exports = {\n   apiBaseUrl: \"https://api.github.com\",\n   repo: \"OperationCode/demo\",\n+  githubToken: \"[REDACTED:github-token]\",\n+  releaseNotesLabel: \"release-notes\",\n };\n",
+        "patch_redaction": "blob-context",
+        "content": "\"use strict\";\n\nmodule.exports = {\n  apiBaseUrl: \"https://api.github.com\",\n  repo: \"OperationCode/demo\",\n  githubToken: \"ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8\",\n  releaseNotesLabel: \"release-notes\",\n};\n",
+        "head_content": "\"use strict\";\n\nmodule.exports = {\n  apiBaseUrl: \"https://api.github.com\",\n  repo: \"OperationCode/demo\",\n  githubToken: \"ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8\",\n  releaseNotesLabel: \"release-notes\",\n};\n",
+        "base_content": "\"use strict\";\n\nmodule.exports = {\n  apiBaseUrl: \"https://api.github.com\",\n  repo: \"OperationCode/demo\",\n};\n"
+      }
+    ],
+    "dependency_delta": {
+      "changes": [],
+      "new_global_sources": [],
+      "failures": []
+    },
+    "prefilter": {
+      "signals": [
+        {
+          "id": "credential-like-string",
+          "level": "signal",
+          "detail": "credential-assignment (value redacted)",
+          "file": "config/settings.js",
+          "subject": null,
+          "lines": [
+            6
+          ],
+          "count": 1
+        },
+        {
+          "id": "credential-like-string",
+          "level": "signal",
+          "detail": "github-token (value redacted)",
+          "file": "config/settings.js",
+          "subject": null,
+          "lines": [
+            6
+          ],
+          "count": 1
+        }
+      ],
+      "hard_blocks": []
+    },
+    "coverage": {
+      "trees_complete": true,
+      "files_in_comparison": 1,
+      "files_collected": 1,
+      "files": [
+        {
+          "path": "config/settings.js",
+          "coverage": "full",
+          "reason": null
+        }
+      ],
+      "complete": true
+    },
+    "size": {
+      "estimated_tokens": 625,
+      "limit_tokens": 150000
+    }
+  }
+}

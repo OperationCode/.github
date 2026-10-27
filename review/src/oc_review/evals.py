@@ -6,20 +6,29 @@ expected results.
 Each case is a directory of `D` with:
 
 - `bundle.json`: an `ok` bundle envelope (the collect output);
-- `expected.json`: `{"gate": "pass" | "fail", "findings": [{"category": ...,
-  "severity": ...}], "hard_blocks": ["<check id>", ...]}`. `findings` are the
-  ones that must be present (extra findings do not fail a case). `hard_blocks`
-  are exactly the prefilter hard block check IDs of the bundle. Both keys are
-  optional.
+- `expected.json` (format v2, every key optional):
+  - `gate`: `pass` or `fail`;
+  - `findings`: the findings that must be present, each
+    `{"category", "severity", "file"?, "side"?, "verified"?}`. `category` is a
+    category or a list of categories (any of them matches). `severity` means
+    that severity or higher. `file`, `side` and `verified` match exactly when
+    given. Extra findings never fail a case;
+  - `max_severity`: the highest severity allowed for any finding, verified or
+    not;
+  - `hard_blocks`: exactly the prefilter hard block check IDs of the bundle;
+  - `summary_excludes`: strings that must not appear in the rendered summary.
+  Another key, or a wrong type or value, fails the case before any call.
 
 For each case the runner calls `analyze.analyze` with the eval federation IDs
 and a GitHub client on an in-memory transport (no GitHub read), writes the
 three pass records, and computes the gate with the same code the publisher
 uses and synthetic trusted inputs: every job `success`, dependency review
-`success`, a current snapshot, no overrides. It writes one JSON line per case
-to stdout and to `O/results.jsonl`. It exits 0 only when at least one case ran
-and every case matched. A case matches only when all three passes are `ok`: a
-failed call is an infrastructure failure, never a match.
+`success`, a current snapshot, no overrides. It renders the sticky summary
+with the publisher's code (no inline comment is posted, so every finding shows
+in full) and writes it to `O/<case>/summary.md`. It writes one JSON line per
+case to stdout and to `O/results.jsonl`. It exits 0 only when at least one case
+ran and every case matched. A case matches only when all three passes are
+`ok`: a failed call is an infrastructure failure, never a match.
 
 Only token counts are reported, never a price. The runner runs trusted code on
 fixture data; it never executes a bundle's content.
@@ -30,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -39,16 +49,21 @@ from typing import Any
 
 from oc_review import analyze, collect, envelope, publish, snapshot, verdict
 
-# Placeholders until the eval federation rule exists. While any ID is a
-# placeholder, `analyze` makes no call and every case fails with
-# "federation not configured".
-EVAL_FEDERATION_RULE_ID = "fdrl_000000000000000000000000"
-EVAL_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000000"
-EVAL_SERVICE_ACCOUNT_ID = "svac_000000000000000000000000"
+# The eval federation rule, bound to the test workspace `claude-review-p0-test`
+# (never the review workspace; spec "Fixture eval credential"). They are
+# separate from the production IDs in `analyze`.
+EVAL_FEDERATION_RULE_ID = "fdrl_01BL4n1gQzkrroCmDZoXUePm"
+EVAL_ORGANIZATION_ID = "2bc920f9-977b-43b2-870a-f840e4ce809c"
+EVAL_SERVICE_ACCOUNT_ID = "svac_017eR3ohB6rP5MEAsda6U7X6"
 
 EVAL_REPOSITORY = "OperationCode/eval-fixtures"
 EVAL_PR_AUTHOR = "eval-author"
 USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+# The enums of schema/findings.schema.json; SEVERITIES is in rising order.
+CATEGORIES = ("bug", "security", "supply-chain", "malicious", "prompt-injection")
+SEVERITIES = ("low", "medium", "high", "critical")
+SIDES = ("head", "base")
+SUMMARY_FILE_NAME = "summary.md"
 
 
 class EvalError(Exception):
@@ -81,9 +96,20 @@ def pr_transport(bundle: Mapping[str, Any], repository: str = EVAL_REPOSITORY) -
     return transport
 
 
-def _load_json(path: Path) -> Any:
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
+def _load_json(path: Path, *, unique_keys: bool = False) -> Any:
+    """`unique_keys` rejects a duplicate key at any depth: json.loads keeps
+    the last value, so a duplicate could silently drop an expectation."""
     try:
-        return json.loads(path.read_bytes())
+        return json.loads(path.read_bytes(), object_pairs_hook=_unique_keys if unique_keys else None)
     except (OSError, ValueError) as exc:
         raise EvalError(f"{path.name}: {type(exc).__name__}: {exc}") from exc
 
@@ -110,41 +136,121 @@ def _bundle_hard_block_ids(bundle: Mapping[str, Any]) -> list[str]:
     return sorted({str(b["id"]) for b in payload["prefilter"]["hard_blocks"]})
 
 
-def compare(expected: Mapping[str, Any], gate: verdict.GateResult, bundle: Mapping[str, Any]) -> list[str]:
-    """What differs between `expected` and the result; empty when they match."""
+def _rank(severity: str) -> int:
+    return SEVERITIES.index(severity)
+
+
+def _finding_matches(want: Mapping[str, Any], f: verdict.CitedFinding) -> bool:
+    categories = [want["category"]] if isinstance(want["category"], str) else want["category"]
+    return (
+        f.category in categories
+        and f.severity in SEVERITIES
+        and _rank(f.severity) >= _rank(want["severity"])
+        and all(getattr(f, key) == want[key] for key in ("file", "side", "verified") if key in want)
+    )
+
+
+def _describe(want: Mapping[str, Any]) -> str:
+    category = want["category"] if isinstance(want["category"], str) else "|".join(want["category"])
+    text = f"{category}/{want['severity']}+"
+    for key in ("file", "side", "verified"):
+        if key in want:
+            text += f" {key}={json.dumps(want[key])}"
+    return text
+
+
+def _unescape(summary: str) -> str:
+    """The summary as a reader sees it: without the publisher's backslash
+    escapes and zero-width spaces, so an escaped copy of a string still counts."""
+    return re.sub(r"\\(.)", r"\1", summary.replace(publish.ZWSP, ""), flags=re.DOTALL)
+
+
+def compare(
+    expected: Mapping[str, Any], gate: verdict.GateResult, bundle: Mapping[str, Any], summary: str
+) -> list[str]:
+    """What differs between a checked `expected` (see `_check_expected`) and
+    the result; empty when they match."""
     out: list[str] = []
     if "gate" in expected and expected["gate"] != gate.status:
         out.append(f"gate: expected {expected['gate']}, got {gate.status}")
-    have = {(f.category, f.severity) for f in gate.findings}
     for want in expected.get("findings", []):
-        if not isinstance(want, Mapping) or not {"category", "severity"} <= want.keys():
-            out.append(f"bad expected finding: {json.dumps(want, default=str)[:80]}")
-        elif (want["category"], want["severity"]) not in have:
-            out.append(f"missing finding {want['category']}/{want['severity']}")
+        if not any(_finding_matches(want, f) for f in gate.findings):
+            out.append(f"missing finding {_describe(want)}")
+    if "max_severity" in expected:
+        limit = _rank(expected["max_severity"])
+        over = [f for f in gate.findings if f.severity not in SEVERITIES or _rank(f.severity) > limit]
+        for f in over:
+            out.append(f"finding above max_severity {expected['max_severity']}: {f.category}/{f.severity} "
+                       f"({f.pass_name}, {'verified' if f.verified else 'unverified'})")
     if "hard_blocks" in expected:
         actual = _bundle_hard_block_ids(bundle)
         if sorted(expected["hard_blocks"]) != actual:
             out.append(f"hard blocks: expected {sorted(expected['hard_blocks'])}, got {actual}")
+    plain = _unescape(summary)
+    for i, text in enumerate(expected.get("summary_excludes", [])):
+        if text in summary or text in plain:
+            # never echo the string: it may be the credential the case checks
+            out.append(f"summary contains summary_excludes[{i}]")
     return out
 
 
-EXPECTED_KEYS = frozenset({"gate", "findings", "hard_blocks"})
+EXPECTED_KEYS = ("gate", "findings", "max_severity", "hard_blocks", "summary_excludes")
+FINDING_KEYS = ("category", "severity", "file", "side", "verified")
+
+
+def _check_expected_finding(i: int, want: Any) -> None:
+    where = f"expected.json: findings[{i}]"
+    if not isinstance(want, dict):
+        raise EvalError(f"{where} must be an object")
+    unknown = sorted(map(repr, set(want) - set(FINDING_KEYS)))
+    if unknown:
+        raise EvalError(f"{where}: unknown keys {', '.join(unknown)}; allowed: {', '.join(FINDING_KEYS)}")
+    category = want.get("category")
+    categories = [category] if isinstance(category, str) else category
+    if not isinstance(categories, list) or not categories or not all(c in CATEGORIES for c in categories):
+        raise EvalError(f"{where}: category must be one of {', '.join(CATEGORIES)}, or a non-empty list of them")
+    if want.get("severity") not in SEVERITIES:
+        raise EvalError(f"{where}: severity must be one of {', '.join(SEVERITIES)}")
+    if "file" in want and (not isinstance(want["file"], str) or not want["file"]):
+        raise EvalError(f"{where}: file must be a non-empty string")
+    if "side" in want and want["side"] not in SIDES:
+        raise EvalError(f"{where}: side must be head or base")
+    if "verified" in want and not isinstance(want["verified"], bool):
+        raise EvalError(f"{where}: verified must be true or false")
 
 
 def _check_expected(expected: Any) -> None:
-    """Reject an expectation that would silently skip a check: an unknown key or a wrong type."""
+    """Reject an expectation that would silently skip a check: an unknown key,
+    a wrong type or an unknown value."""
     if not isinstance(expected, dict):
         raise EvalError("expected.json: must be a JSON object")
-    unknown = sorted(map(repr, set(expected) - EXPECTED_KEYS))
+    unknown = sorted(map(repr, set(expected) - set(EXPECTED_KEYS)))
     if unknown:
-        raise EvalError(f"expected.json: unknown keys {', '.join(unknown)}; allowed: gate, findings, hard_blocks")
-    if expected.get("gate") not in (None, verdict.PASS, verdict.FAIL):
+        raise EvalError(f"expected.json: unknown keys {', '.join(unknown)}; allowed: {', '.join(EXPECTED_KEYS)}")
+    if "gate" in expected and expected["gate"] not in (verdict.PASS, verdict.FAIL):
         raise EvalError("expected.json: gate must be pass or fail")
-    if not isinstance(expected.get("findings", []), list):
+    findings = expected.get("findings", [])
+    if not isinstance(findings, list):
         raise EvalError("expected.json: findings must be a list")
+    for i, want in enumerate(findings):
+        _check_expected_finding(i, want)
+    if "max_severity" in expected and expected["max_severity"] not in SEVERITIES:
+        raise EvalError(f"expected.json: max_severity must be one of {', '.join(SEVERITIES)}")
     hb = expected.get("hard_blocks", [])
-    if not isinstance(hb, list) or not all(isinstance(x, str) for x in hb):
-        raise EvalError("expected.json: hard_blocks must be a list of check IDs")
+    if not isinstance(hb, list) or not all(isinstance(x, str) and x for x in hb) or len(set(hb)) != len(hb):
+        raise EvalError("expected.json: hard_blocks must be a list of distinct check IDs")
+    excludes = expected.get("summary_excludes", [])
+    if not isinstance(excludes, list) or not all(isinstance(x, str) and x for x in excludes):
+        raise EvalError("expected.json: summary_excludes must be a list of non-empty strings")
+
+
+def render_summary(gate: verdict.GateResult, bundle: Mapping[str, Any]) -> str:
+    """The sticky summary body the publisher would write. Nothing is posted
+    inline, so every inline finding counts as not posted and shows in full."""
+    ctx = publish.PublishContext(EVAL_REPOSITORY, bundle["repository_id"], bundle["pr_number"], bundle["head_sha"],
+                                 EVAL_PR_AUTHOR, bundle["run_id"], bundle["run_attempt"])
+    inline = publish.InlineOutcome(not_posted=frozenset(publish.finding_key(f) for f in gate.findings if f.inline))
+    return publish.render_summary(ctx, gate, bundle=bundle, inline=inline).body
 
 
 def run_case(
@@ -162,7 +268,7 @@ def run_case(
     name = case_dir.name
     bundle_bytes = (case_dir / "bundle.json").read_bytes()
     bundle = _load_json(case_dir / "bundle.json")
-    expected = _load_json(case_dir / "expected.json")
+    expected = _load_json(case_dir / "expected.json", unique_keys=True)
     try:
         envelope.validate_envelope(bundle)
     except envelope.EnvelopeError as exc:
@@ -198,7 +304,10 @@ def run_case(
         overrides=verdict.OverrideInputs((), verdict.Timeline((), True), {}, EVAL_PR_AUTHOR),
     ))
 
-    mismatches = compare(expected, gate, bundle)
+    summary = render_summary(gate, bundle_read.envelope or bundle)
+    (out_dir / name / SUMMARY_FILE_NAME).write_text(summary, encoding="utf-8")
+
+    mismatches = compare(expected, gate, bundle, summary)
     for pass_name in analyze.PASS_NAMES:
         r = results[pass_name]
         if r.status != "ok":
@@ -210,8 +319,8 @@ def run_case(
         "expected_gate": expected.get("gate"),
         "mismatches": mismatches,
         "passes": {n: {"status": results[n].status, "reason": results[n].reason} for n in analyze.PASS_NAMES},
-        "findings": [{"pass": f.pass_name, "category": f.category, "severity": f.severity, "verified": f.verified}
-                     for f in gate.findings],
+        "findings": [{"pass": f.pass_name, "category": f.category, "severity": f.severity, "file": f.file,
+                      "side": f.side, "verified": f.verified} for f in gate.findings],
         "usage": _usage_total(results),
     }
 
