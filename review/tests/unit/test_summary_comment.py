@@ -358,6 +358,7 @@ def test_a_waiver_applied_is_a_green_pass_and_the_findings_stay_listed(tmp_path)
     s = r.summary
     assert r.code == 0 and "## 🟢 PASS: OC Claude review\n" in s and callout_kind(s) == "TIP"
     assert "A maintainer waiver was applied by maintainer. Findings stay listed." in s
+    assert s.lower().count("never approves") == 1
     [row] = table_rows(s, "| Severity |")
     assert row[1] == "Blocks, waived"
     assert ("blocking-finding", True) in [(c, w) for c, w, _ in reason_rows(s)]

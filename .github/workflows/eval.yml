@@ -76,5 +76,7 @@ jobs:
           path: |
             ${{ runner.temp }}/eval/results.jsonl
             ${{ runner.temp }}/eval/*/summary.md
-          if-no-files-found: error
+          # warn, not error: if an earlier step failed before any result exists,
+          # a second red step would bury the real cause.
+          if-no-files-found: warn
           retention-days: 14
