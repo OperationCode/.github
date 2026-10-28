@@ -1362,7 +1362,7 @@ def _callout(result: verdict.GateResult, rows: list[_Row], hard: list[_Row], has
             return "\n".join(f"> {x}" for x in ("[!NOTE]", *lines))
         else:
             lines = ["**No findings. This review found no reason to block.** Nothing to do for this review."]
-        lines.append("The merge box shows whether the other required checks pass. This bot never approves a PR.")
+        lines.append("The merge box shows whether the other required checks pass.")
         return "\n".join(f"> {x}" for x in ("[!TIP]", *lines))
 
     blocking = [r for r in model if r.effect != EFFECT_NONE]

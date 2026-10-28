@@ -43,6 +43,7 @@ jobs:
             files.pythonhosted.org:443
             api.anthropic.com:443
             *.actions.githubusercontent.com:443
+            *.blob.core.windows.net:443
       - name: Check out the dispatched branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, released 2026-07-20
         with:
@@ -64,3 +65,16 @@ jobs:
           uv run --no-sync --project review python -m oc_review.evals
           --fixtures-dir review/tests/fixtures
           --out-dir "$RUNNER_TEMP/eval"
+      # results.jsonl and each case's summary.md only. The per-case data/ dirs
+      # (bundle and pass records) stay out. No file holds a credential: the
+      # Anthropic token lives in memory only (spec "Fixture eval credential").
+      - name: Upload the eval results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, released 2026-10-07
+        with:
+          name: eval-results-a${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/eval/results.jsonl
+            ${{ runner.temp }}/eval/*/summary.md
+          if-no-files-found: error
+          retention-days: 14
