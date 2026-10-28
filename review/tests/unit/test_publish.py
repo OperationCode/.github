@@ -355,8 +355,23 @@ def plain(text: str) -> str:
     return re.sub(r"\\(.)", r"\1", text, flags=re.S).replace(ZWSP, "")
 
 
+LABEL_CODE = {label: code for code, label in publish.REASON_LABELS.items()}
+_REASON_ROW = re.compile(r"^\| (.+?) \| (✅ yes(?:, waived)?|🚫 no) \| (.*) \|$", re.M)
+
+
+def reason_rows(text: str) -> list[tuple[str, bool, str]]:
+    """The rows of the reasons table of the record, as (code, waivable, detail)."""
+    m = re.search(r"\*\*Reasons the gate failed\*\*\n\n(.*?)(?:\n\n|\Z)", text, re.S)
+    assert m, "no reasons section"
+    return [(LABEL_CODE[label], flag.startswith("✅"), plain(detail)) for label, flag, detail in _REASON_ROW.findall(m.group(1))]
+
+
 def reason_codes(text: str) -> set[str]:
-    return set(re.findall(r"^- ([a-z-]+) \((?:not waivable|waivable by override)\)", text, re.M))
+    return {code for code, _, _ in reason_rows(text)}
+
+
+def has_reason(text: str, code: str, waivable: bool, detail: str | None = None) -> bool:
+    return any(c == code and w == waivable and (detail is None or detail in d) for c, w, d in reason_rows(text))
 
 
 # ---------------------------------------------------------------- happy path
@@ -369,7 +384,7 @@ def test_clean_run_passes_and_posts_summary(tmp_path):
     assert not r.gh.bodies("POST", "/reviews")
     s = r.summary
     assert s.startswith(verdict.STICKY_MARKER)
-    assert "## OC Claude review: pass" in s
+    assert "## 🟢 PASS: OC Claude review" in s
     assert r.record["result"] == "pass"
 
 
@@ -377,34 +392,34 @@ def test_summary_has_every_required_field(tmp_path):
     passes = clean_passes(security=[finding("security", "high", title="Shell call")])
     gh = FakeGitHub(issue_comments=[override(1)])
     r = run(tmp_path, gh, passes=passes, bundle=bundle_doc(signals=[
-        {"id": "workflow-change", "level": "signal", "detail": "changes a workflow", "file": ".github/workflows/x.yml",
+        {"id": "sensitive-path", "level": "signal", "detail": "changes a workflow", "file": ".github/workflows/x.yml",
          "subject": None, "lines": [], "count": 1}]))
     s = r.summary
     assert r.code == 0  # waived by the override
     for text in (
         verdict.STICKY_MARKER,
-        f"Result for run [{RUN_ID}]",
-        f"attempt {ATTEMPT}",
-        f"head SHA `{HEAD}`",
-        f"merge base `{MB}`",
-        "base ref main",
-        "### Reasons",
-        "blocking-finding (waivable by override)",
-        "Override applied: yes. Waived reasons: blocking-finding.",
-        f"by {MAINT}",
-        f"([comment](https://github.com/{REPO}/pull/{PR}#issuecomment-1))",
-        "### Prefilter (code, no LLM)",
-        "workflow\\-change",
-        "Coverage: complete",
-        "### Dependency delta",
-        "### Findings per pass",
+        f"Run [{RUN_ID}, attempt {ATTEMPT}](https://github.com/{REPO}/actions/runs/{RUN_ID}/attempts/{ATTEMPT})",
+        f"head `{HEAD[:7]}` into main",
+        f"| `{HEAD}` | `{MB}` | main |",  # full SHAs and base ref, in the record
+        "**Reasons the gate failed**",
+        "| Blocking finding | ✅ yes, waived |",
+        "**Maintainer waivers**",
+        f"| {MAINT} |",
+        f"[comment](https://github.com/{REPO}/pull/{PR}#issuecomment-1)",
+        "| yes | Blocking finding |",
+        "**Checks (code, no model)**",
+        "⚠️ Sensitive path changed: changes a workflow, in",
+        "| Coverage | ✅ complete | files in comparison 1, files collected 1, trees complete |",
+        "**Dependency changes**",
+        "**Finding details**",
         publish.UNTRUSTED_NOTE,
         publish.VERIFIED_NOTE,
-        "### Token usage",
-        "input 12000, output 900, cache write 11000, cache read 0, attempts 1",
-        "total: input 36000",
-        f"[Workflow run](https://github.com/{REPO}/actions/runs/{RUN_ID}/attempts/{ATTEMPT})",
-        "The result that counts is the required workflow in the merge box.",
+        "**Model summaries**",
+        "**Token usage**",
+        "| Review | 12000 | 900 | 11000 | 0 | 1 |",
+        "| **Total** | 36000 | 2700 | 33000 | 0 | 3 |",
+        "The required workflow in the merge box is the result that counts.",
+        "This bot never approves a PR.",
     ):
         assert text in s, text
 
@@ -483,7 +498,7 @@ def test_base_not_default_branch_fails_not_waivable(tmp_path):
     gh = FakeGitHub(default_branch="develop", issue_comments=[override(1)])
     r = run(tmp_path, gh)
     assert r.code == 1
-    assert "base-not-default-branch (not waivable)" in r.summary
+    assert has_reason(r.summary, "base-not-default-branch", False)
 
 
 # ---------------------------------------------------------------- inline review
@@ -511,10 +526,10 @@ def test_inline_review_only_verified_and_eligible(tmp_path):
         assert re.match(r"<!-- oc-finding:[0-9a-f]{64} [0-9a-f]{64} -->\n\n", c["body"])
         assert publish.UNTRUSTED_NOTE in c["body"]
     s = r.summary
-    assert "in diff head. See the inline comment." in s
+    assert "in diff head <sub>See the inline comment." in s
     assert "Outside the diff, summary only." in s
     assert "PR title or body, summary only." in s
-    assert "### Unverified findings" in s and "Not verified: quote not found" in plain(s)
+    assert "Not verified: quote not found" in plain(s)
 
 
 def test_inline_rename_base_side_uses_new_path(tmp_path):
@@ -556,7 +571,7 @@ def test_dedupe_by_bot_key_only(tmp_path):
     r = run(tmp_path, gh, passes=clean_passes(review=[f1, f2, dict(f2)]))
     (rv,) = r.gh.bodies("POST", "/reviews")
     assert [c["line"] for c in rv["comments"]] == [11]  # f1 skipped; the spoofed f2 is not
-    assert "first. See the inline comment from an earlier run." in r.summary
+    assert "first <sub>See the inline comment from an earlier run.</sub>" in r.summary
 
 
 SPOOFED = finding("malicious", "critical", title="Steals the token", explanation="Critical evidence not in the forged comment.")
@@ -684,7 +699,7 @@ def test_rerun_with_the_same_findings_posts_nothing_new(tmp_path):
     assert len(posted_by(first)) == 1
     second = run(tmp_path / "2", FakeGitHub(review_comments=posted_by(first)), passes=passes)
     assert second.gh.bodies("POST", "/reviews") == []
-    assert "bug. See the inline comment from an earlier run." in second.summary
+    assert "bug <sub>See the inline comment from an earlier run.</sub>" in second.summary
     assert "Same words." not in second.summary
 
 
@@ -730,7 +745,9 @@ def test_same_d14_key_in_one_run_after_an_earlier_comment(tmp_path):
     r = run(tmp_path, gh, passes=clean_passes(review=[old, new]))
     assert r.gh.bodies("POST", "/reviews") == []
     s = plain(r.summary)
-    assert "same. See the inline comment from an earlier run." in s
+    # Both findings share one row (same place and effect). The old one has an inline
+    # comment from an earlier run; the new one differs from it, so its text is shown.
+    assert "| inline, earlier run |" in s and "| differs from the inline comment of an earlier run |" in s
     assert "Differs from the inline comment of an earlier run, shown here." in s
     assert "Critical new words." in s and "Old words." not in s
 
@@ -799,7 +816,7 @@ def test_finding_that_differs_past_the_cut_from_an_earlier_one_is_shown_in_full(
     r = run(tmp_path, gh, passes=clean_passes(review=[first, second]))
     assert r.gh.bodies("POST", "/reviews") == []
     s = plain(r.summary)
-    assert "See the inline comment from an earlier run." in s
+    assert "| inline, earlier run |" in s
     assert "Differs from the inline comment of an earlier run, shown here." in s
     assert "Second distinct explanation: secret theft." in s
 
@@ -884,7 +901,7 @@ def test_untrusted_text_is_escaped_in_summary(tmp_path):
     assert not re.search(r"(?<!\\)<img", body) and "\\<img" in body
     assert "[x]" not in body and "\\[x\\]" in body
     assert "‮" not in s and "zero​width" not in s
-    plain = s.replace(HEAD, "").replace(MB, "").replace("f" * 64, "")
+    plain = s.replace(HEAD, "").replace(MB, "").replace("f" * 64, "").replace(HEAD[:7], "")
     assert not re.search(r"[0-9a-f]{7,}", plain)
     # The inline comment is escaped the same way.
     (rv,) = r.gh.bodies("POST", "/reviews")
@@ -954,10 +971,9 @@ def test_summary_under_limit_and_cut_in_order(tmp_path):
     assert len(s) < publish.SUMMARY_MAX_CHARS
     assert publish.TRUNCATED_NOTE in s
     # Never cut: result, reasons, SHAs.
-    assert "## OC Claude review: fail" in s and f"`{HEAD}`" in s
-    assert "blocking-finding (waivable by override)" in s
+    assert "## 🔴 FAIL: OC Claude review" in s and f"`{HEAD}`" in s
+    assert has_reason(s, "blocking-finding", True)
     # Cut first: unverified findings; high findings stay.
-    assert "### Unverified findings" in s
     assert "low bug 0" not in s
     for i in range(5):
         assert f"high malicious {i}" in s
@@ -1024,9 +1040,10 @@ def test_reasons_kept_when_cuttable_data_is_cut(tmp_path, capsys):
     s = r.summary
     assert r.code == 1
     assert publish.TRUNCATED_NOTE in s and "pkg699" not in s
-    shown = re.findall(r"^- prefilter-hard-block \(not waivable\): foreign-source in p(\d{4})/", plain(s), re.M)
+    shown = [m.group(1) for c, w, d in reason_rows(s) if c == "prefilter-hard-block" and not w
+             for m in [re.match(r"foreign-source in p(\d{4})/", d)] if m]
     assert shown == [f"{i:04d}" for i in range(60)]
-    assert s.rstrip().endswith("The result that counts is the required workflow in the merge box.")
+    assert "Some details were truncated, see the run log." in s and s.rstrip().endswith("</details>")
 
 
 CUT_PATH = "abcde/" * 75 + "setup.js"  # over the file limit: analyze cuts it to a final "/"
@@ -1056,7 +1073,7 @@ def test_critical_findings_with_a_cut_path_are_never_cut_from_the_summary(tmp_pa
     r = run(tmp_path, passes=passes)
     assert r.code == 1 and r.gh.bodies("POST", "/reviews") == []
     s = plain(r.summary)
-    assert publish.OVERFLOW_NOTE in s and "### Summary too large" in s
+    assert publish.OVERFLOW_NOTE in s and "could not publish" in s
     assert not any(c in s for c in claims(passes))  # no partial list
     assert r.record["result"] == "fail" and r.record["publish_error"]
     rec = full_record_from_log(capsys.readouterr().out)
@@ -1095,9 +1112,9 @@ def test_reasons_that_do_not_fit_fail_closed(tmp_path, capsys):
     s = r.summary
     assert r.code == 1
     assert len(s) < publish.SUMMARY_MAX_CHARS
-    assert "## OC Claude review: fail" in s and publish.OVERFLOW_NOTE in s
-    assert f"head SHA `{HEAD}`" in s and f"merge base `{MB}`" in s
-    assert "- prefilter-hard-block (not waivable): 400 reason(s)" in s
+    assert "## 🔴 FAIL: OC Claude review" in s and publish.OVERFLOW_NOTE in s
+    assert f"| `{HEAD}` | `{MB}` | main |" in s
+    assert "| Hard block from the file checks | 🚫 no | 400 reason(s) |" in s
     # No partial reason list: either every reason or none.
     assert "p0000" not in s
     rec = full_record_from_log(capsys.readouterr().out)
@@ -1125,8 +1142,8 @@ def test_many_overrides_that_fit_are_all_listed(tmp_path):
     s = r.summary
     assert publish.TRUNCATED_NOTE in s
     for i in range(1, 101):
-        assert f"reason {i:03d} ([comment]" in s, i
-    assert s.rstrip().endswith("The result that counts is the required workflow in the merge box.")
+        assert f"| reason {i:03d} | [comment](" in s, i
+    assert s.rstrip().endswith("</details>")
 
 
 def test_cut_data_is_in_the_run_log(tmp_path, capsys):
@@ -1173,7 +1190,7 @@ def test_stale_before_final_summary_update_writes_nothing(tmp_path, trigger):
         kw["passes"] = clean_passes(supply_chain=[BLOCKING])
     r = run(tmp_path, gh, **kw)
     assert r.code == 1
-    assert len(r.gh.summary_bodies()) == 1 and "## OC Claude review: pass" in r.summary
+    assert len(r.gh.summary_bodies()) == 1 and "## 🟢 PASS: OC Claude review" in r.summary
     assert r.gh.paths("PATCH") == []
     assert "stale" in r.record["reasons"]
 
@@ -1208,7 +1225,7 @@ def test_override_from_fetched_data_and_permission_reads(tmp_path):
     assert r.code == 0
     perms = sorted(p.split("/")[-2] for p in r.gh.paths() if "/collaborators/" in p)
     assert perms == sorted([MAINT, MAINT2] * 2)  # before the gate and at the final check
-    assert f"by {MAINT}" in r.summary and "by admin\\-user" in r.summary
+    assert f"| {MAINT} |" in r.summary and "| admin\\-user |" in r.summary
 
 
 def test_timeline_not_read_fully_gives_no_override(tmp_path):
@@ -1238,7 +1255,7 @@ def test_override_never_clears_hard_block(tmp_path):
            "subject": None, "lines": [], "count": 1}]
     r = run(tmp_path, FakeGitHub(issue_comments=[override(1)]), bundle=bundle_doc(hard_blocks=hb))
     assert r.code == 1
-    assert "prefilter-hard-block (not waivable)" in r.summary
+    assert has_reason(r.summary, "prefilter-hard-block", False)
 
 
 def test_grant_deleted_before_final_check(tmp_path):
@@ -1250,7 +1267,7 @@ def test_grant_deleted_before_final_check(tmp_path):
     r = run(tmp_path, gh, passes=clean_passes(supply_chain=[BLOCKING]))
     assert r.code == 1
     assert len(r.gh.summary_bodies()) == 2  # pass summary, then the update to fail
-    assert "## OC Claude review: fail" in r.summary
+    assert "## 🔴 FAIL: OC Claude review" in r.summary
 
 
 # ---------------------------------------------------------------- final check
@@ -1261,8 +1278,8 @@ def test_newer_run_supersedes_and_updates_summary(tmp_path):
     r = run(tmp_path, gh)
     assert r.code == 1
     first, last = r.gh.summary_bodies()
-    assert "## OC Claude review: pass" in first
-    assert "## OC Claude review: fail" in last and "superseded (not waivable)" in last
+    assert "## 🟢 PASS: OC Claude review" in first
+    assert "## 🔴 FAIL: OC Claude review" in last and has_reason(last, "superseded", False)
     assert r.gh.paths("PATCH")  # the update edits the comment the run posted
 
 
@@ -1296,7 +1313,7 @@ def test_run_list_read_in_part_is_superseded(tmp_path, kind):
         gh.runs = [{"id": RUN_ID, "path": WORKFLOW}, {"id": "x", "path": "ci.yml"}]
     r = run(tmp_path, gh)
     assert r.code == 1
-    assert "superseded (not waivable)" in r.summary
+    assert has_reason(r.summary, "superseded", False)
 
 
 # ---------------------------------------------------------------- reasons and exit code
@@ -1348,8 +1365,8 @@ def test_missing_needs_and_outcome_fail_with_summary(tmp_path):
     r = run(tmp_path, needs=needs)
     assert r.code == 1
     s = r.summary
-    assert "job-result (not waivable): analyze: missing" in plain(s)
-    assert "dependency-review (not waivable): step outcome missing" in plain(s)
+    assert has_reason(s, "job-result", False, "analyze: missing")
+    assert has_reason(s, "dependency-review", False, "step outcome missing")
 
 
 def test_outcome_from_env_and_conflict(tmp_path):
@@ -1363,7 +1380,7 @@ def test_outcome_from_env_and_conflict(tmp_path):
 def test_dependency_review_failure_with_job_success(tmp_path):
     r = run(tmp_path, needs=needs_ok("failure"), gh=FakeGitHub(issue_comments=[override(1)]))
     assert r.code == 1
-    assert "dependency-review (not waivable): step outcome failure" in plain(r.summary)
+    assert has_reason(r.summary, "dependency-review", False, "step outcome failure")
 
 
 @pytest.mark.parametrize("missing", ["bundle", "review", "supply-chain", "all"])
@@ -1378,7 +1395,7 @@ def test_missing_artifact_dirs_fail_and_still_post_summary(tmp_path, missing):
         r = run(tmp_path, passes=passes)
     assert r.code == 1
     s = r.summary
-    assert "artifact (not waivable)" in s
+    assert has_reason(s, "artifact", False)
     if missing in ("bundle", "all"):
         assert f"No valid bundle. Event head SHA `{HEAD}`" in s
     else:
@@ -1404,9 +1421,9 @@ def test_spend_limit_reason_from_meta(tmp_path):
     r = run(tmp_path, passes=passes, gh=FakeGitHub(issue_comments=[override(1)]))
     assert r.code == 1
     s = r.summary
-    assert "pass-records (not waivable): pass security failed: workspace spend limit reached" in plain(s)
-    assert "#### security: failed, workspace spend limit reached" in plain(s)
-    assert "- security: no usage recorded" in s
+    assert has_reason(s, "pass-records", False, "pass security failed: workspace spend limit reached")
+    assert "| Security | ❌ failed |  | No summary. Reason: workspace spend limit reached |" in s
+    assert "| Security | not recorded | not recorded | not recorded | not recorded | not recorded |" in s
     rec = r.record
     assert rec["passes"]["review"]["usage"] == USAGE
     assert rec["passes"]["security"]["usage"] == {}

@@ -524,7 +524,7 @@ def test_max_severity_counts_unverified_findings(tmp_path):
 def test_summary_is_written_per_case(tmp_path):
     r = run_with_file(tmp_path, {}, [HEAD_HIGH])
     summary = (tmp_path / "out" / "case1" / evals.SUMMARY_FILE_NAME).read_text()
-    assert r["matched"] and "### Findings per pass" in summary
+    assert r["matched"] and "**Finding details**" in summary
     # nothing is posted inline, so the inline finding shows in full
     assert "Inline comment not posted, shown here." in summary and "Quote: eval\\(user\\_input\\)" in summary
 
@@ -558,8 +558,8 @@ def test_summary_labels_a_suggested_shell_command_untrusted(tmp_path):
     r = run_with_file(tmp_path, {"findings": [{"category": "prompt-injection", "severity": "low"}]}, [f])
     summary = (tmp_path / "out" / "case1" / evals.SUMMARY_FILE_NAME).read_text()
     assert r["matched"]
-    findings_part = summary.split("### Findings per pass", 1)[1]
-    assert findings_part.lstrip().startswith(f"_{publish.UNTRUSTED_NOTE}")
+    findings_part = summary.split("**Finding details**", 1)[1]
+    assert findings_part.lstrip().startswith(f"> **{publish.UNTRUSTED_NOTE}**")
     # escaped prose, not a code block: the command never shows as written
     assert cmd not in findings_part and cmd in evals._unescape(findings_part)
-    assert "```" not in findings_part.split("### Token usage")[0]
+    assert "```" not in findings_part.split("**Token usage**")[0]

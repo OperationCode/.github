@@ -135,6 +135,12 @@ def strip_controls(text: str) -> str:
     return "".join(out)
 
 
+def _defang(line: str) -> str:
+    """Steps 5 of `escape_text`: break references, autolinks and commit SHAs."""
+    line = _HEX_RUN.sub(_break_hex, _DEFANG.sub(ZWSP, line))
+    return "".join(ch + ZWSP if ch in _AT_SIGNS else ch for ch in line)
+
+
 def _escape_line(line: str) -> str:
     line = _HEX_RUN.sub(_break_hex, _DEFANG.sub(ZWSP, line))
     out: list[str] = []
@@ -877,53 +883,6 @@ CUT_SIGNALS = 3
 CUT_ORDER = (CUT_UNVERIFIED, CUT_LOW_MEDIUM, CUT_DEPENDENCY, CUT_SIGNALS)
 
 
-@dataclass
-class _Block:
-    text: str
-    rank: int | None = None  # None: never cut
-    group: str = ""
-
-
-def _cut_note(n: int) -> str:
-    return f"- {n} item(s) {TRUNCATED_NOTE}."
-
-
-def _fit(blocks: Sequence[_Block], limit: int) -> tuple[str | None, bool]:
-    """Join blocks; cut by rank in `CUT_ORDER`, from the end of each rank,
-    until it fits. Each group that lost blocks gets one note where its first
-    cut block was. The space left after the never-cut blocks is the budget of
-    the cut ranks. Returns (None, True) when the never-cut blocks alone do not
-    fit: the caller fails closed (D8)."""
-    keep = [True] * len(blocks)
-    cut: dict[str, int] = {}
-    size = sum(len(b.text) + 1 for b in blocks) - 1  # joined with "\n"
-    for rank in CUT_ORDER:
-        for i in reversed(range(len(blocks))):
-            if size <= limit:
-                break
-            b = blocks[i]
-            if b.rank != rank:
-                continue
-            keep[i] = False
-            n = cut.get(b.group, 0)
-            size -= len(b.text) + 1
-            size += len(_cut_note(n + 1)) + 1 - (len(_cut_note(n)) + 1 if n else 0)
-            cut[b.group] = n + 1
-    if size > limit:
-        return None, True
-    out: list[str] = []
-    for b, k in zip(blocks, keep):
-        if k:
-            out.append(b.text)
-        elif b.group in cut:
-            out.append(_cut_note(cut.pop(b.group)))
-    return "\n".join(out), not all(keep)
-
-
-def _waivable(r: verdict.Reason) -> str:
-    return "waivable by override" if r.waivable else "not waivable"
-
-
 def _usage_numbers(meta: Mapping[str, Any]) -> dict[str, int]:
     usage = meta.get("usage")
     out: dict[str, int] = {}
@@ -943,59 +902,307 @@ USAGE_FIELDS = (
 )
 
 
-def _usage_text(nums: Mapping[str, int]) -> str:
-    parts = [f"{label} {nums[k]}" for k, label in USAGE_FIELDS if k in nums]
-    return ", ".join(parts) if parts else "no usage recorded"
+@dataclass
+class _Block:
+    text: str
+    rank: int | None = None  # None: never cut
+    group: str = ""
+    cols: int = 0  # table columns of a table row; 0 for any other block
 
 
-def _finding_where(f: verdict.CitedFinding) -> str:
-    return f"{_esc('file', f.file)} line {f.line} ({f.side})"
+def _cut_note(n: int, cols: int = 0) -> str:
+    if cols:
+        return f"| {n} item(s) {TRUNCATED_NOTE}. |" + " |" * (cols - 1)
+    return f"- {n} item(s) {TRUNCATED_NOTE}."
 
 
-def _finding_block(f: verdict.CitedFinding, inline: InlineOutcome) -> _Block:
+def _fit(blocks: Sequence[_Block], limit: int) -> tuple[str | None, bool]:
+    """Join blocks; cut by rank in `CUT_ORDER`, from the end of each rank,
+    until it fits. Each group that lost blocks gets one note where its first
+    cut block was (a table row for a table group, so the table stays whole).
+    The space left after the never-cut blocks is the budget of the cut ranks.
+    Returns (None, True) when the never-cut blocks alone do not fit: the
+    caller fails closed (D8)."""
+    keep = [True] * len(blocks)
+    cut: dict[str, int] = {}
+    cols_of: dict[str, int] = {}
+    size = sum(len(b.text) + 1 for b in blocks) - 1  # joined with "\n"
+    for rank in CUT_ORDER:
+        for i in reversed(range(len(blocks))):
+            if size <= limit:
+                break
+            b = blocks[i]
+            if b.rank != rank:
+                continue
+            keep[i] = False
+            n = cut.get(b.group, 0)
+            cols_of.setdefault(b.group, b.cols)
+            size -= len(b.text) + 1
+            size += len(_cut_note(n + 1, b.cols)) + 1 - (len(_cut_note(n, b.cols)) + 1 if n else 0)
+            cut[b.group] = n + 1
+    if size > limit:
+        return None, True
+    out: list[str] = []
+    for b, k in zip(blocks, keep):
+        if k:
+            out.append(b.text)
+        elif b.group in cut:
+            out.append(_cut_note(cut.pop(b.group), b.cols))
+    return "\n".join(out), not all(keep)
+
+
+# ---------------------------------------------------------------------------
+# Labels. Reason codes and check IDs never show: each maps to a fixed label.
+# ---------------------------------------------------------------------------
+
+REASON_LABELS: Mapping[str, str] = {
+    verdict.R_JOB_RESULT: "A required job did not succeed",
+    verdict.R_ARTIFACT: "Review data could not be read",
+    verdict.R_PASS_RECORDS: "A review pass failed",
+    verdict.R_STALE: "Stale review",
+    verdict.R_SUPERSEDED: "A newer required run exists",
+    verdict.R_BASE_NOT_DEFAULT: "Wrong base branch",
+    verdict.R_HARD_BLOCK: "Hard block from the file checks",
+    verdict.R_DEPENDENCY_REVIEW: "Dependency review did not succeed",
+    verdict.R_SIZE_GATE: "Change too large for the model review",
+    verdict.R_BLOCKING_FINDING: "Blocking finding",
+}
+REASON_FALLBACK = "A required check failed"
+
+CHECK_LABELS: Mapping[str, str] = {
+    "bidi-control": "Hidden text-direction control",
+    "bidi-control-in-path": "Hidden text-direction control in a file name",
+    "foreign-source": "Dependency from a new source",
+    "fresh-publish": "Recently published dependency",
+    "incomplete-coverage": "Incomplete file coverage",
+    "incomplete-dependency-data": "Incomplete dependency data",
+    "base-dependency-file-unparsed": "Dependency file could not be read",
+    "zero-width": "Hidden zero-width character",
+    "invisible-character": "Hidden invisible character",
+    "ai-directed-text": "Text aimed at an AI reviewer",
+    "credential-like-string": "Credential-like string",
+    "dependency-install-script": "Dependency with an install script",
+    "package-json-install-script": "Install script added to package.json",
+    "pypi-sdist-only": "Python package with source distribution only",
+    "manifest-without-lockfile": "Dependency manifest without a lock file",
+    "unsupported-dependency-file": "Dependency file type not checked",
+    "sensitive-path": "Sensitive path changed",
+    "pyproject-build-system": "Build system changed",
+    "binary-file": "Binary file added",
+    "submodule-change": "Submodule changed",
+    "became-executable": "File became executable",
+    "minified-js": "Minified script",
+    "long-line": "Very long line",
+    "encoded-blob": "Encoded blob",
+    "first-time-contributor": "First-time contributor",
+}
+# Signals that point at a sensitive place get the warning mark. All other
+# signals are context only.
+_WARN_SIGNALS = frozenset({"sensitive-path"})
+
+PASS_LABELS: Mapping[str, str] = {"review": "Review", "security": "Security", "supply-chain": "Supply chain"}
+CODE_ROW = "Workflow (code, no model)"
+FILE_CHECKS_ROW = "File checks (code, no model)"
+
+SEVERITY_CELLS: Mapping[str, str] = {
+    "critical": "⛔ **Critical**",
+    "high": "🔴 **High**",
+    "medium": "🟠 **Medium**",
+    "low": "🟡 **Low**",
+}
+_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+_PASS_ORDER = {name: i for i, name in enumerate(verdict.PASS_NAMES)}
+
+EFFECT_WAIVABLE = "Blocks, waivable"
+EFFECT_NO_WAIVER = "Blocks, no waiver"
+EFFECT_WAIVED = "Blocks, waived"
+# Gate truth: a medium finding in a blocking category does not block, so it
+# reads "Does not block" (coordinator ruling 6).
+EFFECT_NONE = "Does not block"
+
+HARD_BLOCK_CELL = "🚫 **Hard block**"
+NOT_RUN_CELL = "⚠️ **Not run**"
+BLOCKED_CELL = "🚫 **Blocked**"
+
+# Reasons that mean part of the review did not complete.
+_INCOMPLETE_CODES = frozenset(
+    {verdict.R_PASS_RECORDS, verdict.R_ARTIFACT, verdict.R_JOB_RESULT, verdict.R_DEPENDENCY_REVIEW}
+)
+
+_WAIVER_NEXT = 'fix and push, or ask a maintainer to post the waiver line (under "Waiver" below).'
+
+
+def _reason_label(code: str) -> str:
+    return REASON_LABELS.get(code, REASON_FALLBACK)
+
+
+def _check_label(check_id: Any) -> str:
+    label = CHECK_LABELS.get(check_id) if isinstance(check_id, str) else None
+    return label or _esc("label", check_id)
+
+
+def _n(count: int, word: str) -> str:
+    return f"{count} {word}" + ("" if count == 1 else "s")
+
+
+def _code_span(kind: str, text: str, suffix: str = "") -> str:
+    """A code span that is safe in a table cell. `escape_field` backslash-escapes
+    punctuation, which would show inside a code span, so a span is cleaned
+    and cut here instead: redacted, cut to the field limit, no backticks."""
+    return _span_of(*_clean_text(text, LIMITS[kind], False), suffix)
+
+
+def _span_of(joined: str, cut: bool, suffix: str = "") -> str:
+    """The code span of text that `_clean_text` already cut: one marker only."""
+    joined = _defang(joined).replace("`", "'").replace("<", "‹").replace("|", "\\|") + ("…" if cut else "")
+    return f"`{joined or 'unknown'}{suffix}`"
+
+
+def _cell(text: str) -> str:
+    return text.replace("\n", " ")
+
+
+def _row(*cells: str) -> str:
+    return "| " + " | ".join(_cell(c) for c in cells) + " |"
+
+
+# ---------------------------------------------------------------------------
+# Findings
+# ---------------------------------------------------------------------------
+
+_POSTING_TEXT: Mapping[str, str] = {
+    "inline": "inline",
+    "earlier": "inline, earlier run",
+    "changed": "differs from the inline comment of an earlier run",
+    "not-posted": "inline comment not posted",
+    "meta": "PR title or body",
+    "outside": "outside the diff",
+    "unverified": "not posted",
+}
+_INLINE_STATES = frozenset({"inline", "earlier"})
+
+
+def _posting_state(f: verdict.CitedFinding, inline: InlineOutcome) -> str:
+    if not f.verified:
+        return "unverified"
     key = finding_key(f)
-    head = f"- {_finding_line(f)}, at {_finding_where(f)}: {_esc('title', f.title)}"
+    if key in inline.posted:
+        return "inline"
+    if key in inline.earlier:
+        return "earlier"
+    if key in inline.changed:
+        return "changed"
+    if key in inline.not_posted:
+        return "not-posted"
+    return "meta" if f.file in verdict.META_PATHS else "outside"
+
+
+def _finding_effect(f: verdict.CitedFinding, result: verdict.GateResult) -> str:
+    if not f.blocking:
+        return EFFECT_NONE
+    if result.override_applied:
+        return EFFECT_WAIVED
+    return EFFECT_WAIVABLE if verdict.WAIVABLE[verdict.R_BLOCKING_FINDING] else EFFECT_NO_WAIVER
+
+
+def _cuttable(f: verdict.CitedFinding) -> bool:
     # A high or critical finding is never cut, also when it is unverified
     # (a cut file path makes it so).
-    protected = f.severity in verdict.BLOCKING_SEVERITIES
-    rank = None if protected else CUT_LOW_MEDIUM
-    group = f"findings-{f.pass_name}"
-    if not f.verified:
-        return _Block(
-            "\\\n  ".join(
-                (
-                    head,
-                    f"Not verified: {_esc('reason', f.unverified_reason or 'unknown')}",
-                    _esc("explanation", f.explanation),
-                    f"Quote: {_esc('quote', f.quote)}",
-                )
-            ),
-            None if protected else CUT_UNVERIFIED,
-            "unverified",
-        )
-    if key in inline.posted:
-        return _Block(f"{head}. See the inline comment.", rank, group)
-    if key in inline.earlier:
-        return _Block(f"{head}. See the inline comment from an earlier run.", rank, group)
-    if key in inline.changed:
-        where = "Differs from the inline comment of an earlier run, shown here."
-    elif key in inline.not_posted:
-        where = "Inline comment not posted, shown here."
-    elif f.file in verdict.META_PATHS:
-        where = "PR title or body, summary only."
-    else:
-        where = "Outside the diff, summary only."
-    return _Block(
-        "\\\n  ".join((head, where, _esc("explanation", f.explanation), f"Quote: {_esc('quote', f.quote)}")),
-        rank,
-        group,
+    return f.severity not in verdict.BLOCKING_SEVERITIES
+
+
+def _by_pass_then_severity(members: Sequence[verdict.CitedFinding]) -> list[verdict.CitedFinding]:
+    return sorted(
+        members,
+        key=lambda f: (_PASS_ORDER.get(f.pass_name, len(_PASS_ORDER)), _SEVERITY_ORDER.get(f.severity, 9)),
     )
 
 
-def _check_block(item: Any, rank: int | None, group: str) -> _Block | None:
-    if not isinstance(item, Mapping):
-        return None
-    text = f"- {_esc('label', item.get('id'))}: {_esc('evidence', item.get('detail'))}"
+@dataclass
+class _Row:
+    """One visible row of the findings table: a hard block, a pass or job that
+    did not run, or the model findings of one place that share one gate effect."""
+
+    sort: tuple
+    severity: str
+    effect: str
+    where: str
+    claim: str
+    found_by: str
+    rank: int | None = None
+    members: tuple[verdict.CitedFinding, ...] = ()
+    is_model: bool = False
+    label: str = ""  # a hard block row: its fixed label
+
+
+def _found_by(pass_name: str, members: Sequence[verdict.CitedFinding]) -> str:
+    """One pass of a merged row: its name, its highest severity and, when it
+    reported more than one finding there, how many."""
+    best = min(members, key=lambda f: _SEVERITY_ORDER.get(f.severity, 9)).severity
+    more = f", {len(members)} findings" if len(members) > 1 else ""
+    return f"{PASS_LABELS.get(pass_name, pass_name)} ({best}{more})"
+
+
+def _merge_findings(result: verdict.GateResult, inline: InlineOutcome) -> list[_Row]:
+    """Model findings, merged into one row per (shown file, side, line, gate
+    effect), worst first. Different effects stay on separate rows (ruling 3).
+    A merged row can be cut only when every member can be cut."""
+    groups: dict[tuple[str, bool, str, int, str], list[verdict.CitedFinding]] = {}
+    for f in result.findings:
+        file, cut = _clean_text(f.file, LIMITS["file"], False)
+        groups.setdefault((file, cut, f.side, f.line, _finding_effect(f, result)), []).append(f)
+    rows: list[_Row] = []
+    for (file, cut, side, line, effect), members in groups.items():
+        members = _by_pass_then_severity(members)
+        top = min(members, key=lambda f: _SEVERITY_ORDER.get(f.severity, 9))  # first of the best: pass order breaks ties
+        unverified = [f for f in members if not f.verified]
+        severity = SEVERITY_CELLS.get(top.severity, _esc("label", top.severity))
+        if unverified:
+            severity += " ❌ not checked"
+        where = _span_of(file, cut, f":{line}") + (" (base side)" if side == "base" else "")
+        states = [_posting_state(f, inline) for f in members]
+        if all(s in _INLINE_STATES for s in states):
+            pointer = (
+                "See the inline comment from an earlier run."
+                if all(s == "earlier" for s in states)
+                else "See the inline comment."
+            )
+        elif any(s in _INLINE_STATES for s in states):
+            pointer = "See the inline comment. Other findings here are in the record only."
+        else:
+            names = [PASS_LABELS.get(f.pass_name, f.pass_name) for f in members]
+            pointer = "Summary only for " + ", ".join(dict.fromkeys(names)) + ". Details are in the record."
+        claim = f"{_esc('title', top.title)} <sub>{pointer}</sub>"
+        found_by = ", ".join(_found_by(name, [f for f in members if f.pass_name == name]) for name in dict.fromkeys(f.pass_name for f in members))
+        if all(_cuttable(f) for f in members):
+            rank = CUT_UNVERIFIED if len(unverified) == len(members) else CUT_LOW_MEDIUM
+        else:
+            rank = None
+        rows.append(
+            _Row(
+                (2, _SEVERITY_ORDER.get(top.severity, 9), bool(len(unverified) == len(members)), file, line, effect),
+                severity,
+                effect,
+                where,
+                claim,
+                found_by,
+                rank,
+                tuple(members),
+                True,
+            )
+        )
+    return rows
+
+
+def _hard_block_items(payload: Mapping[str, Any] | None) -> list[Mapping[str, Any]]:
+    pre = payload.get("prefilter") if isinstance(payload, Mapping) else None
+    items = pre.get("hard_blocks") if isinstance(pre, Mapping) else None
+    return [i for i in items or () if isinstance(i, Mapping)]
+
+
+def _check_evidence(item: Mapping[str, Any]) -> str:
+    """The label, detail, file, subject and lines of a prefilter item, as one line."""
+    text = f"{_check_label(item.get('id'))}: {_esc('evidence', item.get('detail'))}"
     if item.get("file"):
         text += f", in {_esc('path', item.get('file'))}"
     if item.get("subject"):
@@ -1005,7 +1212,356 @@ def _check_block(item: Any, rank: int | None, group: str) -> _Block | None:
         nums = [str(n) for n in lines[:10] if isinstance(n, int) and not isinstance(n, bool)]
         if nums:
             text += ", lines " + " ".join(nums) + (" and more" if len(lines) > 10 else "")
-    return _Block(text, rank, group)
+    return text
+
+
+def _hard_block_label_of(item: Mapping[str, Any]) -> str:
+    """The same text as `verdict._hard_block_label`, to match a reason to its item."""
+    label = str(item.get("id"))
+    file = item.get("file")
+    return f"{label} in {file}" if isinstance(file, str) and file else label
+
+
+def _hard_rows(result: verdict.GateResult, payload: Mapping[str, Any] | None) -> list[_Row]:
+    """A row for each hard block. Items come from the bundle; a hard block
+    reason with no item (missing evidence, unbound result) gets a row from the
+    reason, so no hard block is ever left out of the table."""
+    items = _hard_block_items(payload)
+    out: list[_Row] = []
+    for n, item in enumerate(items):
+        file = item.get("file")
+        lines = item.get("lines")
+        first = next((x for x in lines if isinstance(x, int) and not isinstance(x, bool)), None) if isinstance(lines, list) else None
+        if isinstance(file, str) and file:
+            where = _code_span("path", file, f":{first}" if first is not None else "")
+        else:
+            where = "Whole PR"
+        out.append(
+            _Row((0, n), HARD_BLOCK_CELL, EFFECT_NO_WAIVER, where, _check_evidence(item), FILE_CHECKS_ROW,
+                 label=_check_label(item.get("id")))
+        )
+    known = {_hard_block_label_of(i) for i in items}
+    has_incomplete_item = any(i.get("id") == "incomplete-coverage" for i in items)
+    for n, r in enumerate(x for x in result.reasons if x.code == verdict.R_HARD_BLOCK):
+        if r.detail in known:
+            continue
+        if r.detail.startswith("incomplete-coverage") and has_incomplete_item:
+            continue
+        label = "Incomplete file coverage" if r.detail.startswith("incomplete-coverage") else "File check result"
+        out.append(
+            _Row((0, len(items) + n), HARD_BLOCK_CELL, EFFECT_NO_WAIVER, "Whole PR",
+                 f"{label}: {_esc('reason', r.detail)}", FILE_CHECKS_ROW, label=label)
+        )
+    return out
+
+
+def _not_run_rows(result: verdict.GateResult) -> list[_Row]:
+    """Rows for every pass or job that did not complete, and for every other
+    reason that is not a finding or a hard block."""
+    out: list[_Row] = []
+    by_pass = {p.name: p for p in result.passes}
+    size_gate = any(r.code == verdict.R_SIZE_GATE for r in result.reasons)
+    pass_rows = 0
+    for name in verdict.PASS_NAMES:
+        info = by_pass.get(name)
+        label = PASS_LABELS[name]
+        if info is None:
+            claim = f"No valid record of the {label} pass. The pass returned no result."
+        elif info.status == "ok" or (info.status == "skipped-size" and size_gate):
+            continue
+        else:
+            reason = info.meta.get("reason")
+            why = reason.strip().rstrip(".") if isinstance(reason, str) and reason.strip() else info.status
+            claim = f"{_esc('reason', why)}. The pass returned no result."
+        pass_rows += 1
+        out.append(_Row((1, pass_rows), NOT_RUN_CELL, EFFECT_NO_WAIVER, f"{label} pass", claim, CODE_ROW))
+    n = 0
+    for r in result.reasons:
+        if r.code in (verdict.R_HARD_BLOCK, verdict.R_BLOCKING_FINDING):
+            continue
+        if r.code == verdict.R_PASS_RECORDS and pass_rows:
+            continue
+        n += 1
+        if r.code == verdict.R_SIZE_GATE:
+            effect = EFFECT_WAIVED if result.override_applied else EFFECT_WAIVABLE
+            out.append(
+                _Row((1, 100 + n), NOT_RUN_CELL, effect, "Model passes",
+                     "Too large for automatic review. File checks ran, model checks did not.", CODE_ROW)
+            )
+            continue
+        cell = BLOCKED_CELL if r.code in (verdict.R_STALE, verdict.R_SUPERSEDED, verdict.R_BASE_NOT_DEFAULT) else NOT_RUN_CELL
+        out.append(
+            _Row((1, 100 + n), cell, EFFECT_NO_WAIVER, "Gate", f"{_reason_label(r.code)}: {_esc('reason', r.detail)}", CODE_ROW)
+        )
+    return out
+
+
+def _findings_table(rows: list[_Row]) -> list[_Block]:
+    if not rows:
+        return []
+    out = [
+        _Block("\n| Severity | Effect | Where | Finding | Found by |"),
+        _Block("|---|---|---|---|---|"),
+    ]
+    for r in rows:
+        out.append(_Block(_row(r.severity, r.effect, r.where, r.claim, r.found_by), r.rank, "findings-table", 5))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Result heading, callout, checks strip, provenance
+# ---------------------------------------------------------------------------
+
+
+def _payload_of(bundle: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    if bundle is not None and bundle.get("status") in verdict.BUNDLE_PAYLOAD_STATUSES:
+        payload = bundle.get("payload")
+        if isinstance(payload, Mapping):
+            return payload
+    return None
+
+
+def _model_rows(rows: list[_Row]) -> list[_Row]:
+    return [r for r in rows if r.is_model]
+
+
+def _status_heading(result: verdict.GateResult, model_rows: list[_Row]) -> str:
+    if result.status != verdict.FAIL:
+        if model_rows and not result.override_applied:
+            return f"## 🟡 PASS: OC Claude review, {_n(len(model_rows), 'finding')} to consider"
+        return "## 🟢 PASS: OC Claude review"
+    if result.codes & _INCOMPLETE_CODES:
+        return "## 🔴 FAIL: OC Claude review did not complete"
+    return "## 🔴 FAIL: OC Claude review"
+
+
+def _blocking_phrase(model_rows: list[_Row]) -> str:
+    blocking = [r for r in model_rows if r.effect != EFFECT_NONE]
+    if len(blocking) == 1:
+        top = min(blocking[0].members, key=lambda f: _SEVERITY_ORDER.get(f.severity, 9))
+        return f"One {top.severity}-severity {top.category.replace('-', ' ')} finding"
+    return f"{len(blocking)} findings"
+
+
+def _callout(result: verdict.GateResult, rows: list[_Row], hard: list[_Row], has_payload: bool) -> str:
+    """The colored callout. Kind: TIP for a pass with no findings, NOTE for a
+    pass with findings, CAUTION for every fail, waivable or not (ruling 1).
+    The text says whether a waiver can clear it."""
+    model = _model_rows(rows)
+    codes = result.codes
+    if result.status != verdict.FAIL:
+        if result.override_applied:
+            login = _esc("login", result.valid_overrides[0].author_login) if result.valid_overrides else "a maintainer"
+            lines = [f"**A maintainer waiver was applied by {login}. Findings stay listed.** Nothing to do for this review."]
+        elif model:
+            one = len(model) == 1
+            lines = [
+                f"**{_n(len(model), 'finding')} to consider. {'It does' if one else 'They do'} not block this PR.**",
+                f"**Next step for the author:** read the finding{'' if one else 's'} and fix what you agree with.",
+            ]
+            return "\n".join(f"> {x}" for x in ("[!NOTE]", *lines))
+        else:
+            lines = ["**No findings. This review found no reason to block.** Nothing to do for this review."]
+        lines.append("The merge box shows whether the other required checks pass. This bot never approves a PR.")
+        return "\n".join(f"> {x}" for x in ("[!TIP]", *lines))
+
+    blocking = [r for r in model if r.effect != EFFECT_NONE]
+    also = f" {_blocking_phrase(model)} also blocks." if blocking else ""
+    failed = [
+        PASS_LABELS[name]
+        for name in verdict.PASS_NAMES
+        if not any(p.name == name and p.status == "ok" for p in result.passes)
+        and not (any(p.name == name and p.status == "skipped-size" for p in result.passes) and verdict.R_SIZE_GATE in codes)
+    ]
+    if hard and has_payload:  # with no bundle the hard rows are synthetic: the author cannot fix a missing artifact
+        label = hard[0].label
+        if len(hard) == 1:
+            first = f"**{label} blocks this PR. No waiver can clear it.**{also}"
+        else:
+            first = f"**{label} and {len(hard) - 1} other hard block(s) block this PR. No waiver can clear them.**{also}"
+        nxt = "**Next step for the author:** fix the cause named in the row, then push. The review runs again on the new commit."
+    elif codes & _INCOMPLETE_CODES:
+        if failed and verdict.R_PASS_RECORDS in codes:
+            who = " and ".join(failed) if len(failed) <= 2 else "Review, Security and Supply chain"
+            first = f"**The {who} {'review' if len(failed) == 1 else 'reviews'} did not run, so this PR could not be judged. No waiver can clear this.**{also}"
+        else:
+            first = f"**A required check did not complete, so this PR could not be judged. No waiver can clear this.**{also}"
+        nxt = "**Next step:** a maintainer re-runs the newest run of the required workflow once the cause is fixed. "
+        nxt += (
+            f"The author also fixes or waives the finding{'' if len(blocking) == 1 else 's'}."
+            if blocking
+            else "The author does not need to change anything."
+        )
+    elif verdict.R_BASE_NOT_DEFAULT in codes:
+        ref = _esc("ref", result.snapshot.base_ref) if result.snapshot else "another branch"
+        first = f"**This PR targets {ref}, not the default branch. No waiver can clear this.**{also}"
+        nxt = "**Next step for the author:** retarget the PR to the default branch."
+    elif verdict.R_SUPERSEDED in codes:
+        first = f"**A newer required run exists for this commit. No waiver can clear this.**{also}"
+        nxt = "**Next step:** read the newest run in the merge box."
+    elif verdict.R_STALE in codes:
+        first = f"**This review is out of date. No waiver can clear this.**{also}"
+        nxt = "**Next step:** read the newest run in the merge box."
+    elif verdict.R_SIZE_GATE in codes:
+        first = "**The change is too large for the model review. A maintainer can waive this.** File checks ran, model checks did not."
+        nxt = '**Next step for the author:** split the change, or ask a maintainer for a waiver (under "Waiver" below).'
+    else:
+        phrase = _blocking_phrase(model)
+        verb = "blocks" if phrase.startswith("One") else "block"
+        who = "it" if phrase.startswith("One") else "them"
+        first = f"**{phrase} {verb} this PR.** A maintainer can waive {who}."
+        nxt = f"**Next step for the author:** {_WAIVER_NEXT}"
+    return "\n".join(f"> {x}" for x in ("[!CAUTION]", first, nxt))
+
+
+def _checks_strip(result: verdict.GateResult, payload: Mapping[str, Any] | None, hard_count: int) -> _Block:
+    """One-row table: what ran. Never cut."""
+    if payload is None:
+        file_cell, coverage_cell = "❌ no result", "❌ unknown"
+    else:
+        pre = payload.get("prefilter") if isinstance(payload.get("prefilter"), Mapping) else {}
+        signals = len([s for s in pre.get("signals") or () if isinstance(s, Mapping)])
+        file_cell = f"🚫 {_n(hard_count, 'hard block')}" if hard_count else "✅ ok"
+        if signals:
+            file_cell += f", {_n(signals, 'signal')}"
+        cov = payload.get("coverage")
+        coverage_cell = "✅ complete" if isinstance(cov, Mapping) and cov.get("complete") is True else "🚫 incomplete"
+    by_pass = {p.name: p for p in result.passes}
+    unvalidated = payload is None and bool(result.codes & {verdict.R_ARTIFACT, verdict.R_PASS_RECORDS})
+    cells = []
+    for name in verdict.PASS_NAMES:
+        info = by_pass.get(name)
+        count = len([f for f in result.findings if f.pass_name == name])
+        if info is None:
+            cells.append("❌ missing")
+        elif info.status == "ok" and unvalidated:
+            cells.append("⚠️ not validated")
+        elif info.status == "ok":
+            cells.append(f"✅ ran, {_n(count, 'finding')}")
+        elif info.status == "skipped-size":
+            cells.append("⚠️ skipped, too large")
+        else:
+            cells.append(f"❌ {_esc('label', info.status)}")
+    dep_failed = any(
+        r.code == verdict.R_DEPENDENCY_REVIEW or (r.code == verdict.R_JOB_RESULT and verdict.DEPENDENCY_REVIEW_JOB in r.detail)
+        for r in result.reasons
+    )
+    dep_cell = "❌ failed" if dep_failed else "✅ ok"
+    return _Block(
+        "\n".join(
+            (
+                "\n| File checks | Review | Security | Supply chain | Dependency review | Coverage |",
+                "|:---:|:---:|:---:|:---:|:---:|:---:|",
+                _row(file_cell, *cells, dep_cell, coverage_cell),
+            )
+        )
+    )
+
+
+def _provenance(ctx: PublishContext, result: verdict.GateResult, truncated: bool) -> _Block:
+    snap = result.snapshot
+    run = f"Run [{ctx.run_id}, attempt {ctx.run_attempt}]({ctx.run_url})"
+    if snap is not None:
+        where = f"for head `{snap.head_sha[:7]}` into {_esc('ref', snap.base_ref)}."
+    else:
+        where = f"for event head `{ctx.head_sha[:7]}`, merge base unknown."
+    text = f"{run} {where} The required workflow in the merge box is the result that counts. This bot never approves a PR."
+    if truncated:
+        text += " Some details were truncated, see the run log."
+    return _Block(f"\n<sub>{text}</sub>")
+
+
+# ---------------------------------------------------------------------------
+# Collapsed sections
+# ---------------------------------------------------------------------------
+
+
+def _details(summary: str, inner: Sequence[_Block]) -> list[_Block]:
+    """`<details>` with never-cut open and close blocks, so a cut can never
+    unbalance the tags."""
+    return [_Block(f"\n<details>\n<summary>{summary}</summary>"), *inner, _Block("\n</details>")]
+
+
+def _waiver_blocks(result: verdict.GateResult) -> list[_Block]:
+    if result.override_command is None:
+        return []
+    text = (
+        "\nThis PR fails for waivable reasons only. A person with write or admin access, who is not the PR "
+        "author, posts this exact line as a new comment and replaces `<reason>` with the reason. Then they "
+        "re-run the newest run of the required workflow through the GitHub REST API "
+        "(`POST .../actions/runs/{run_id}/rerun`). Do not edit the comment afterwards. Do not close and "
+        "reopen the PR to apply the waiver.\n\n```\n" + result.override_command + "\n```\n\n"
+        "A waiver covers the code at this exact head and merge base. Any new push needs a new waiver."
+    )
+    return _details("🔑 Waiver: how a maintainer clears this", [_Block(text)])
+
+
+def _title(text: str) -> _Block:
+    return _Block(f"\n**{text}**\n")
+
+
+def _snapshot_blocks(ctx: PublishContext, result: verdict.GateResult) -> list[_Block]:
+    snap = result.snapshot
+    run = f"{ctx.run_id}, attempt {ctx.run_attempt}"
+    if snap is None:
+        return [_title("Reviewed snapshot"),
+                _Block(f"No valid bundle. Event head SHA `{ctx.head_sha}`, merge base unknown. Run {run}.")]
+    return [
+        _title("Reviewed snapshot"),
+        _Block("| Head SHA | Merge base SHA | Base branch | Run |"),
+        _Block("|---|---|---|---|"),
+        _Block(_row(f"`{snap.head_sha}`", f"`{snap.merge_base_sha}`", _esc("ref", snap.base_ref), run)),
+    ]
+
+
+def _reason_blocks(result: verdict.GateResult) -> list[_Block]:
+    out = [_title("Reasons the gate failed")]
+    if not result.reasons:
+        return out + [_Block("None. No reason applies.")]
+    out += [_Block("| Reason | Waivable? | Detail |"), _Block("|---|---|---|")]
+    for r in result.reasons:
+        flag = ("✅ yes, waived" if result.override_applied else "✅ yes") if r.waivable else "🚫 no"
+        out.append(_Block(_row(_reason_label(r.code), flag, _esc("reason", r.detail))))
+    if result.status == verdict.FAIL and result.override_command is None:
+        out.append(
+            _Block(
+                "\nNo waiver line is shown. At least one reason cannot be waived, so a waiver would not "
+                "change the result."
+            )
+        )
+    return out
+
+
+def _override_blocks(ctx: PublishContext, result: verdict.GateResult) -> list[_Block]:
+    valid = result.valid_overrides
+    if not valid:
+        return []
+    waived = ", ".join(_reason_label(r.code) for r in result.waived) or "none"
+    out = [
+        _title("Maintainer waivers"),
+        _Block("| Author | Time | Reason | Comment | Applied | Waived reasons |"),
+        _Block("|---|---|---|---|---|---|"),
+    ]
+    for c in valid:
+        out.append(
+            _Block(
+                _row(
+                    _esc("login", c.author_login),
+                    c.created_at.isoformat(),
+                    _esc("reason", c.reason),
+                    f"[comment]({ctx.comment_url(c.comment_id)})",
+                    "yes" if result.override_applied else "no",
+                    waived,
+                )
+            )
+        )
+    return out
+
+
+def _check_block(item: Any, rank: int | None, group: str, mark: str = "") -> _Block | None:
+    if not isinstance(item, Mapping):
+        return None
+    return _Block(f"- {mark}{_check_evidence(item)}", rank, group)
 
 
 def _delta_blocks(delta: Any) -> list[_Block]:
@@ -1055,28 +1611,233 @@ def _delta_blocks(delta: Any) -> list[_Block]:
     return out
 
 
-def _coverage_blocks(cov: Any) -> list[_Block]:
+def _check_table_blocks(result: verdict.GateResult, payload: Mapping[str, Any] | None) -> list[_Block]:
+    """The "Checks (code, no model)" table: hard blocks, coverage, dependency changes
+    and the dependency-review job. Hard block evidence and unavailable files are never cut."""
+    out = [_title("Checks (code, no model)"), _Block("| Check | Result | Detail |"), _Block("|---|---|---|")]
+    if payload is None:
+        return out + [_Block(_row("File checks", "❌ no result", "No bundle payload was available."))]
+    items = _hard_block_items(payload)
+    if items:
+        out += [_Block(_row("Hard block", "🚫 blocks", _check_evidence(i))) for i in items]
+    else:
+        out.append(_Block(_row("Hard blocks", "✅ none", "")))
+    cov = payload.get("coverage")
     if not isinstance(cov, Mapping):
-        return [_Block("Coverage: no coverage record.")]
-    complete = "complete" if cov.get("complete") is True else "NOT complete"
-    nums = []
-    for k, label in (("files_in_comparison", "files in comparison"), ("files_collected", "files collected")):
-        v = cov.get(k)
-        if isinstance(v, int) and not isinstance(v, bool):
-            nums.append(f"{label} {v}")
-    trees = cov.get("trees_complete")
-    if isinstance(trees, bool):
-        nums.append("trees complete" if trees else "trees NOT complete")
-    out = [_Block(f"Coverage: {complete}" + (f" ({', '.join(nums)})." if nums else "."))]
-    files = cov.get("files")
-    for f in files if isinstance(files, list) else ():
-        if isinstance(f, Mapping) and f.get("coverage") == "unavailable":
+        out.append(_Block(_row("Coverage", "❌ no record", "")))
+    else:
+        nums = []
+        for k, label in (("files_in_comparison", "files in comparison"), ("files_collected", "files collected")):
+            v = cov.get(k)
+            if isinstance(v, int) and not isinstance(v, bool):
+                nums.append(f"{label} {v}")
+        trees = cov.get("trees_complete")
+        if isinstance(trees, bool):
+            nums.append("trees complete" if trees else "trees NOT complete")
+        out.append(
+            _Block(_row("Coverage", "✅ complete" if cov.get("complete") is True else "🚫 NOT complete", ", ".join(nums)))
+        )
+        files = cov.get("files")
+        for f in files if isinstance(files, list) else ():
+            if isinstance(f, Mapping) and f.get("coverage") == "unavailable":
+                out.append(
+                    _Block(_row("Unavailable file", "⚠️ unavailable", f"{_esc('path', f.get('path'))}: {_esc('reason', f.get('reason'))}"))
+                )
+    has_delta = bool(_delta_blocks(payload.get("dependency_delta")))
+    out.append(_Block(_row("Dependency changes", "ℹ️ listed below" if has_delta else "✅ none", "")))
+    dep_failed = any(
+        r.code == verdict.R_DEPENDENCY_REVIEW or (r.code == verdict.R_JOB_RESULT and verdict.DEPENDENCY_REVIEW_JOB in r.detail)
+        for r in result.reasons
+    )
+    out.append(_Block(_row("Dependency review job", "❌ failed" if dep_failed else "✅ success", "")))
+    return out
+
+
+def _signal_blocks(payload: Mapping[str, Any] | None) -> list[_Block]:
+    out = [_title("Signals (context only, never block)")]
+    pre = payload.get("prefilter") if isinstance(payload, Mapping) and isinstance(payload.get("prefilter"), Mapping) else {}
+    items = []
+    for i in pre.get("signals") or ():
+        mark = "⚠️ " if isinstance(i, Mapping) and i.get("id") in _WARN_SIGNALS else "ℹ️ "
+        blk = _check_block(i, CUT_SIGNALS, "signals", mark)
+        if blk:
+            items.append(blk)
+    return out + (items or [_Block("None.")])
+
+
+def _finding_block(f: verdict.CitedFinding, inline: InlineOutcome) -> _Block | None:
+    """The record bullet of a finding that has no inline comment, with its
+    explanation and quote. None for a finding that has one (its row says so)."""
+    state = _posting_state(f, inline)
+    if state in _INLINE_STATES:
+        return None
+    where = f"{_esc('file', f.file)} line {f.line} ({f.side})"
+    head = f"- {_finding_line(f)}, at {where}: {_esc('title', f.title)}"
+    # A high or critical finding is never cut, also when it is unverified.
+    protected = not _cuttable(f)
+    if state == "unverified":
+        return _Block(
+            "\\\n  ".join(
+                (
+                    head,
+                    f"Not verified: {_esc('reason', f.unverified_reason or 'unknown')}",
+                    _esc("explanation", f.explanation),
+                    f"Quote: {_esc('quote', f.quote)}",
+                )
+            ),
+            None if protected else CUT_UNVERIFIED,
+            "unverified",
+        )
+    note = {
+        "changed": "Differs from the inline comment of an earlier run, shown here.",
+        "not-posted": "Inline comment not posted, shown here.",
+        "meta": "PR title or body, summary only.",
+        "outside": "Outside the diff, summary only.",
+    }[state]
+    return _Block(
+        "\\\n  ".join((head, note, _esc("explanation", f.explanation), f"Quote: {_esc('quote', f.quote)}")),
+        None if protected else CUT_LOW_MEDIUM,
+        f"findings-{f.pass_name}",
+    )
+
+
+def _finding_detail_blocks(result: verdict.GateResult, inline: InlineOutcome) -> list[_Block]:
+    out = [_title("Finding details"), _Block(f"> **{UNTRUSTED_NOTE}** {VERIFIED_NOTE}\n")]
+    out.append(
+        _Block(
+            "Blocking is decided by code from category and severity, never by the model. "
+            "A finding in a blocking category blocks only at high or critical severity."
+        )
+    )
+    if inline.note:
+        out.append(_Block("\n" + _esc("reason", inline.note)))
+    by_pass = {p.name: p for p in result.passes}
+    ran = [n for n in verdict.PASS_NAMES if by_pass.get(n) is not None and by_pass[n].status == "ok"]
+    not_ran = [PASS_LABELS[n] for n in verdict.PASS_NAMES if n not in ran]
+    findings = _by_pass_then_severity(result.findings)
+    if findings:
+        if any(len(r.members) > 1 for r in _merge_findings(result, inline)):
+            out.append(
+                _Block("\nEach row above merges findings of several passes at the same file, line and gate effect.")
+            )
+        out += [
+            _Block("\n| Pass | Severity | Category | Confidence | Citation | Posted | Model title |"),
+            _Block("|---|---|---|---|---|---|---|"),
+        ]
+        for f in findings:
+            rank = None if not _cuttable(f) else (CUT_UNVERIFIED if not f.verified else CUT_LOW_MEDIUM)
             out.append(
                 _Block(
-                    f"- unavailable: {_esc('path', f.get('path'))}: {_esc('reason', f.get('reason'))}",
+                    _row(
+                        PASS_LABELS.get(f.pass_name, f.pass_name),
+                        f.severity,
+                        f.category.replace("-", " "),
+                        f.confidence,
+                        "✅ checked" if f.verified else "❌ not checked",
+                        _POSTING_TEXT[_posting_state(f, inline)],
+                        _esc("title", f.title),
+                    ),
+                    rank,
+                    "detail-rows",
+                    7,
                 )
             )
+        bullets = [x for x in (_finding_block(f, inline) for f in findings) if x is not None]
+        if bullets:
+            out.append(_Block("\nFindings with no inline comment, in full:\n"))
+            out += bullets
+        quiet = [PASS_LABELS[n] for n in ran if not any(f.pass_name == n for f in findings)]
+        for label in quiet:
+            out.append(_Block(f"\nThe {label} pass completed and reported no findings."))
+    elif not not_ran:
+        out.append(_Block("\nNo findings. All three passes completed."))
+    else:
+        out.append(
+            _Block(
+                f"\nNo findings from the passes that ran. The {', '.join(not_ran)} pass did not run, "
+                "so this is not a clean result."
+            )
+        )
+    if findings and not_ran:
+        out.append(_Block(f"\nThe {', '.join(not_ran)} pass did not run, so this is not a clean result."))
     return out
+
+
+def _summary_table_blocks(result: verdict.GateResult) -> list[_Block]:
+    out = [
+        _title("Model summaries"),
+        _Block(f"> **{UNTRUSTED_NOTE}** {VERIFIED_NOTE}\n"),
+        _Block("| Pass | Status | Model | Summary |"),
+        _Block("|---|---|---|---|"),
+    ]
+    by_pass = {p.name: p for p in result.passes}
+    for name in verdict.PASS_NAMES:
+        info = by_pass.get(name)
+        label = PASS_LABELS[name]
+        if info is None:
+            out.append(_Block(_row(label, "❌ missing", "", "No valid pass record.")))
+            continue
+        model = info.meta.get("model")
+        status = "✅ ok" if info.status == "ok" else f"❌ {_esc('label', info.status)}"
+        if info.summary:
+            # One line: a multi-line summary would end the table row.
+            text = escape_text(info.summary, LIMITS["summary"])
+        else:
+            reason = info.meta.get("reason")
+            text = "No summary." + (f" Reason: {_esc('reason', reason)}" if isinstance(reason, str) and reason else "")
+        out.append(_Block(_row(label, status, _esc("model", model) if isinstance(model, str) else "", text)))
+    return out
+
+
+def _token_blocks(result: verdict.GateResult) -> list[_Block]:
+    out = [
+        _title("Token usage"),
+        _Block("| Pass | Input | Output | Cache write | Cache read | Attempts |"),
+        _Block("|---|---:|---:|---:|---:|---:|"),
+    ]
+    by_pass = {p.name: p for p in result.passes}
+    totals: dict[str, int] = {}
+    missing = False
+    for name in verdict.PASS_NAMES:
+        info = by_pass.get(name)
+        nums = _usage_numbers(info.meta) if info is not None else {}
+        cells = []
+        for k, _label in USAGE_FIELDS:
+            if k in nums:
+                totals[k] = totals.get(k, 0) + nums[k]
+                cells.append(str(nums[k]))
+            else:
+                missing = True
+                cells.append("not recorded")
+        out.append(_Block(_row(PASS_LABELS[name], *cells)))
+    out.append(
+        _Block(
+            _row(
+                "**Recorded total**" if missing else "**Total**",
+                *(str(totals[k]) if k in totals else "not recorded" for k, _label in USAGE_FIELDS),
+            )
+        )
+    )
+    return out
+
+
+def _record_blocks(ctx: PublishContext, result: verdict.GateResult, payload: Mapping[str, Any] | None,
+                   inline: InlineOutcome) -> list[_Block]:
+    inner: list[_Block] = []
+    inner += _snapshot_blocks(ctx, result)
+    inner += _reason_blocks(result)
+    inner += _override_blocks(ctx, result)
+    inner += _check_table_blocks(result, payload)
+    inner += _signal_blocks(payload)
+    inner.append(_title("Dependency changes"))
+    delta = _delta_blocks(payload.get("dependency_delta")) if payload is not None else []
+    inner += delta or [_Block("None.")]
+    inner += _finding_detail_blocks(result, inline)
+    inner += _summary_table_blocks(result)
+    inner += _token_blocks(result)
+    return _details(
+        "📋 Full review record: reasons, checks, signals, finding details, model summaries, token usage", inner
+    )
 
 
 @dataclass(frozen=True)
@@ -1090,24 +1851,6 @@ class RenderedSummary:
     overflow: bool = False
 
 
-def _header_lines(ctx: PublishContext, result: verdict.GateResult, status: str) -> list[str]:
-    snap = result.snapshot
-    if snap is not None:
-        computed = (
-            f"Computed for head SHA `{snap.head_sha}`, merge base `{snap.merge_base_sha}`, "
-            f"base ref {_esc('ref', snap.base_ref)}."
-        )
-    else:
-        computed = f"No valid bundle. Event head SHA `{ctx.head_sha}`, merge base unknown."
-    return [
-        verdict.STICKY_MARKER,
-        f"## OC Claude review: {status}",
-        f"Result for run [{ctx.run_id}]({ctx.run_url}), attempt {ctx.run_attempt}.",
-        computed,
-        "The result that counts is the required workflow in the merge box.",
-    ]
-
-
 def _overflow_body(ctx: PublishContext, result: verdict.GateResult) -> str:
     """The fail-closed notice when the never-cut data does not fit (D8). It
     has a fixed size: the result, the SHAs, a count per reason code and the
@@ -1115,21 +1858,56 @@ def _overflow_body(ctx: PublishContext, result: verdict.GateResult) -> str:
     counts: dict[str, int] = {}
     for r in result.reasons:
         counts[r.code] = counts.get(r.code, 0) + 1
-    lines = _header_lines(ctx, result, verdict.FAIL)
-    lines += ["\n### Summary too large", OVERFLOW_NOTE]
-    lines.append(
+    lines = [
+        verdict.STICKY_MARKER,
+        "## 🔴 FAIL: OC Claude review could not publish",
+        "",
+        "> [!CAUTION]",
+        f"> **The full review does not fit in one comment.** {OVERFLOW_NOTE}",
+        "> **Next step:** see the run log.",
+        "",
         f"The computed gate result was {result.status}. The full record (every reason, override, "
-        "finding and prefilter result) is in the run log."
-    )
-    lines.append("\n### Reasons")
+        "finding and prefilter result) is in the run log.",
+    ]
+    lines += [b.text for b in _snapshot_blocks(ctx, result)]
+    lines += ["", "**Reasons**", ""]
     if not counts:
         lines.append("No reason applies.")
-    for code in sorted(counts):
-        waivable = "waivable by override" if verdict.WAIVABLE[code] else "not waivable"
-        lines.append(f"- {code} ({waivable}): {counts[code]} reason(s)")
-    lines.append(f"\n### Override\n{len(result.valid_overrides)} valid override(s).")
-    lines.append(f"\n[Workflow run]({ctx.run_url}). The result that counts is the required workflow in the merge box.")
+    else:
+        lines += ["| Reason | Waivable? | Count |", "|---|---|---|"]
+        for code in sorted(counts):
+            flag = "✅ yes" if verdict.WAIVABLE[code] else "🚫 no"
+            lines.append(_row(_reason_label(code), flag, f"{counts[code]} reason(s)"))
+    lines.append(f"\n{len(result.valid_overrides)} valid override(s).")
+    lines.append(f"\n<sub>Run [{ctx.run_id}, attempt {ctx.run_attempt}]({ctx.run_url}). "
+                 "The required workflow in the merge box is the result that counts. This bot never approves a PR.</sub>")
     return "\n".join(lines)
+
+
+def _summary_blocks(
+    ctx: PublishContext,
+    result: verdict.GateResult,
+    payload: Mapping[str, Any] | None,
+    inline: InlineOutcome,
+    truncated: bool,
+) -> list[_Block]:
+    hard = _hard_rows(result, payload)
+    rows = sorted(
+        [*hard, *_not_run_rows(result), *_merge_findings(result, inline)],
+        key=lambda r: r.sort,
+    )
+    model = _model_rows(rows)
+    b = [
+        _Block(verdict.STICKY_MARKER),
+        _Block(_status_heading(result, model)),
+        _Block("\n" + _callout(result, rows, hard, payload is not None)),
+    ]
+    b += _findings_table(rows)
+    b.append(_checks_strip(result, payload, len(hard)))
+    b.append(_provenance(ctx, result, truncated))
+    b += _waiver_blocks(result)
+    b += _record_blocks(ctx, result, payload, inline)
+    return b
 
 
 def render_summary(
@@ -1141,98 +1919,14 @@ def render_summary(
     limit: int = SUMMARY_LIMIT,
 ) -> RenderedSummary:
     """The sticky summary body (D8). Every untrusted string goes through
-    `escape_field`."""
-    b: list[_Block] = [_Block(line) for line in _header_lines(ctx, result, result.status)]
-    add = b.append
-
-    add(_Block("\n### Reasons"))
-    if not result.reasons:
-        add(_Block("No reason applies."))
-    for r in result.reasons:
-        add(_Block(f"- {r.code} ({_waivable(r)}): {_esc('reason', r.detail)}"))
-
-    if result.override_command is not None:
-        add(_Block("\n### Override"))
-        add(
-            _Block(
-                "The gate fails for waivable reasons only. A person with write access who is not "
-                "the PR author can post this comment, with a reason, then re-run the newest run "
-                "of the required workflow:\n\n```\n" + result.override_command + "\n```"
-            )
-        )
-    valid = result.valid_overrides
-    if valid:
-        if result.override_command is None:
-            add(_Block("\n### Override"))
-        waived = ", ".join(r.code for r in result.waived) or "none"
-        add(_Block(f"Override applied: {'yes' if result.override_applied else 'no'}. Waived reasons: {waived}."))
-        for c in valid:
-            add(
-                _Block(
-                    f"- by {_esc('login', c.author_login)} at {c.created_at.isoformat()}: "
-                    f"{_esc('reason', c.reason)} ([comment]({ctx.comment_url(c.comment_id)}))"
-                )
-            )
-
-    payload = None
-    if bundle is not None and bundle.get("status") in verdict.BUNDLE_PAYLOAD_STATUSES:
-        payload = bundle.get("payload")
-    if isinstance(payload, Mapping):
-        pre = payload.get("prefilter") if isinstance(payload.get("prefilter"), Mapping) else {}
-        add(_Block("\n### Prefilter (code, no LLM)"))
-        hard = [x for x in (_check_block(i, None, "hard-blocks") for i in pre.get("hard_blocks") or ()) if x]
-        sig = [x for x in (_check_block(i, CUT_SIGNALS, "signals") for i in pre.get("signals") or ()) if x]
-        add(_Block(f"Hard blocks: {len(hard)}."))
-        b.extend(hard)
-        add(_Block(f"Signals: {len(sig)}."))
-        b.extend(sig)
-        b.extend(_coverage_blocks(payload.get("coverage")))
-        add(_Block("\n### Dependency delta"))
-        delta = _delta_blocks(payload.get("dependency_delta"))
-        b.extend(delta or [_Block("No dependency changes.")])
-
-    add(_Block("\n### Findings per pass"))
-    add(_Block(f"_{UNTRUSTED_NOTE} {VERIFIED_NOTE}_"))
-    if inline.note:
-        add(_Block(_esc("reason", inline.note)))
-    by_pass = {p.name: p for p in result.passes}
-    for name in verdict.PASS_NAMES:
-        info = by_pass.get(name)
-        if info is None:
-            add(_Block(f"\n#### {name}: no valid pass record"))
-            continue
-        line = f"\n#### {name}: {info.status}"
-        model = info.meta.get("model")
-        if isinstance(model, str) and model:
-            line += f", model {_esc('model', model)}"
-        reason = info.meta.get("reason")
-        if isinstance(reason, str) and reason:
-            line += f", {_esc('reason', reason)}"
-        add(_Block(line))
-        if info.summary:
-            add(_Block(f"Model summary: {_esc('summary', info.summary)}"))
-        verified = [f for f in result.findings if f.pass_name == name and f.verified]
-        if not verified:
-            add(_Block("No verified findings."))
-        for f in sorted(verified, key=lambda f: f.severity not in verdict.BLOCKING_SEVERITIES):
-            b.append(_finding_block(f, inline))
-
-    unverified = [f for f in result.findings if not f.verified]
-    if unverified:
-        add(_Block("\n### Unverified findings"))
-        add(_Block(f"_The citation of these findings did not check out. {UNTRUSTED_NOTE}_"))
-        b.extend(_finding_block(f, inline) for f in unverified)
-
-    add(_Block("\n### Token usage"))
-    totals: dict[str, int] = {}
-    for info in result.passes:
-        nums = _usage_numbers(info.meta)
-        for k, v in nums.items():
-            totals[k] = totals.get(k, 0) + v
-        add(_Block(f"- {info.name}: {_usage_text(nums)}"))
-    add(_Block(f"- total: {_usage_text(totals)}"))
-    add(_Block(f"\n[Workflow run]({ctx.run_url}). The result that counts is the required workflow in the merge box."))
-    body, cut = _fit(b, limit)
+    `escape_field` (or `_code_span`). Layout: result heading, callout, findings
+    table, checks strip, provenance, then the collapsed waiver and record."""
+    payload = _payload_of(bundle)
+    body, cut = _fit(_summary_blocks(ctx, result, payload, inline, False), limit)
+    if body is not None and cut:
+        # The provenance line says so when a cut was made. Its longer text is
+        # in the fit, so the body still fits.
+        body, cut = _fit(_summary_blocks(ctx, result, payload, inline, True), limit)
     if body is None:
         return RenderedSummary(_overflow_body(ctx, result), True, overflow=True)
     return RenderedSummary(body, cut)
