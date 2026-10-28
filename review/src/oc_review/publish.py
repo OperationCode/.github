@@ -1049,7 +1049,11 @@ def _code_span(kind: str, text: str, suffix: str = "") -> str:
     """A code span that is safe in a table cell. `escape_field` backslash-escapes
     punctuation, which would show inside a code span, so a span is cleaned
     and cut here instead: redacted, cut to the field limit, no backticks."""
-    joined, cut = _clean_text(text, LIMITS[kind], False)
+    return _span_of(*_clean_text(text, LIMITS[kind], False), suffix)
+
+
+def _span_of(joined: str, cut: bool, suffix: str = "") -> str:
+    """The code span of text that `_clean_text` already cut: one marker only."""
     joined = _defang(joined).replace("`", "'").replace("<", "‹").replace("|", "\\|") + ("…" if cut else "")
     return f"`{joined or 'unknown'}{suffix}`"
 
@@ -1143,19 +1147,19 @@ def _merge_findings(result: verdict.GateResult, inline: InlineOutcome) -> list[_
     """Model findings, merged into one row per (shown file, side, line, gate
     effect), worst first. Different effects stay on separate rows (ruling 3).
     A merged row can be cut only when every member can be cut."""
-    groups: dict[tuple[str, str, int, str], list[verdict.CitedFinding]] = {}
+    groups: dict[tuple[str, bool, str, int, str], list[verdict.CitedFinding]] = {}
     for f in result.findings:
-        key = (shown_field("file", f.file), f.side, f.line, _finding_effect(f, result))
-        groups.setdefault(key, []).append(f)
+        file, cut = _clean_text(f.file, LIMITS["file"], False)
+        groups.setdefault((file, cut, f.side, f.line, _finding_effect(f, result)), []).append(f)
     rows: list[_Row] = []
-    for (file, side, line, effect), members in groups.items():
+    for (file, cut, side, line, effect), members in groups.items():
         members = _by_pass_then_severity(members)
         top = min(members, key=lambda f: _SEVERITY_ORDER.get(f.severity, 9))  # first of the best: pass order breaks ties
         unverified = [f for f in members if not f.verified]
         severity = SEVERITY_CELLS.get(top.severity, _esc("label", top.severity))
         if unverified:
             severity += " ❌ not checked"
-        where = _code_span("file", file, f":{line}") + (" (base side)" if side == "base" else "")
+        where = _span_of(file, cut, f":{line}") + (" (base side)" if side == "base" else "")
         states = [_posting_state(f, inline) for f in members]
         if all(s in _INLINE_STATES for s in states):
             pointer = (
@@ -1339,7 +1343,7 @@ def _blocking_phrase(model_rows: list[_Row]) -> str:
     return f"{len(blocking)} findings"
 
 
-def _callout(result: verdict.GateResult, rows: list[_Row], hard: list[_Row]) -> str:
+def _callout(result: verdict.GateResult, rows: list[_Row], hard: list[_Row], has_payload: bool) -> str:
     """The colored callout. Kind: TIP for a pass with no findings, NOTE for a
     pass with findings, CAUTION for every fail, waivable or not (ruling 1).
     The text says whether a waiver can clear it."""
@@ -1369,7 +1373,7 @@ def _callout(result: verdict.GateResult, rows: list[_Row], hard: list[_Row]) -> 
         if not any(p.name == name and p.status == "ok" for p in result.passes)
         and not (any(p.name == name and p.status == "skipped-size" for p in result.passes) and verdict.R_SIZE_GATE in codes)
     ]
-    if hard:
+    if hard and has_payload:  # with no bundle the hard rows are synthetic: the author cannot fix a missing artifact
         label = hard[0].label
         if len(hard) == 1:
             first = f"**{label} blocks this PR. No waiver can clear it.**{also}"
@@ -1382,8 +1386,12 @@ def _callout(result: verdict.GateResult, rows: list[_Row], hard: list[_Row]) -> 
             first = f"**The {who} {'review' if len(failed) == 1 else 'reviews'} did not run, so this PR could not be judged. No waiver can clear this.**{also}"
         else:
             first = f"**A required check did not complete, so this PR could not be judged. No waiver can clear this.**{also}"
-        nxt = ("**Next step:** a maintainer re-runs the newest run of the required workflow once the cause is fixed. "
-               "The author does not need to change anything.")
+        nxt = "**Next step:** a maintainer re-runs the newest run of the required workflow once the cause is fixed. "
+        nxt += (
+            f"The author also fixes or waives the finding{'' if len(blocking) == 1 else 's'}."
+            if blocking
+            else "The author does not need to change anything."
+        )
     elif verdict.R_BASE_NOT_DEFAULT in codes:
         ref = _esc("ref", result.snapshot.base_ref) if result.snapshot else "another branch"
         first = f"**This PR targets {ref}, not the default branch. No waiver can clear this.**{also}"
@@ -1419,12 +1427,15 @@ def _checks_strip(result: verdict.GateResult, payload: Mapping[str, Any] | None,
         cov = payload.get("coverage")
         coverage_cell = "✅ complete" if isinstance(cov, Mapping) and cov.get("complete") is True else "🚫 incomplete"
     by_pass = {p.name: p for p in result.passes}
+    unvalidated = payload is None and bool(result.codes & {verdict.R_ARTIFACT, verdict.R_PASS_RECORDS})
     cells = []
     for name in verdict.PASS_NAMES:
         info = by_pass.get(name)
         count = len([f for f in result.findings if f.pass_name == name])
         if info is None:
             cells.append("❌ missing")
+        elif info.status == "ok" and unvalidated:
+            cells.append("⚠️ not validated")
         elif info.status == "ok":
             cells.append(f"✅ ran, {_n(count, 'finding')}")
         elif info.status == "skipped-size":
@@ -1889,7 +1900,7 @@ def _summary_blocks(
     b = [
         _Block(verdict.STICKY_MARKER),
         _Block(_status_heading(result, model)),
-        _Block("\n" + _callout(result, rows, hard)),
+        _Block("\n" + _callout(result, rows, hard, payload is not None)),
     ]
     b += _findings_table(rows)
     b.append(_checks_strip(result, payload, len(hard)))

@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,7 @@ from .test_publish import (
     HEAD,
     MB,
     FakeGitHub,
+    needs_ok,
     bundle_doc,
     clean_passes,
     finding,
@@ -385,3 +387,63 @@ def test_a_cut_keeps_tables_and_tags_whole(tmp_path, monkeypatch):
             assert len(re.split(r"(?<!\\)\|", line)) - 2 in (5, 7)
     # Cuts start at the end: the record loses whole bullets before the visible table loses a row.
     assert len(table_rows(s, "| Severity |")) == 9 and 0 < s.count("Quote: ") < 9
+
+
+# ---------------------------------------------------------------- fix round 1
+
+
+def case_g(tmp_path):
+    return run(tmp_path, bundle=None)
+
+
+def test_g_no_bundle_is_not_an_author_fix(tmp_path):
+    r = case_g(tmp_path)
+    s = r.summary
+    out = os.environ.get("OC_RENDER_OUT")
+    if out:
+        Path(out).mkdir(parents=True, exist_ok=True)
+        (Path(out) / "g-no-bundle.md").write_text(s, encoding="utf-8")
+    assert r.code == 1
+    assert "## 🔴 FAIL: OC Claude review did not complete\n" in s and callout_kind(s) == "CAUTION"
+    callout = "\n".join(line for line in s.split("\n") if line.startswith("> "))
+    assert "A required check did not complete" in callout
+    assert "a maintainer re-runs the newest run" in callout
+    assert "fix the cause named in the row" not in callout and "then push" not in callout
+    assert "blocks this PR" not in callout
+
+
+def test_g_no_bundle_strip_does_not_say_ran(tmp_path):
+    s = case_g(tmp_path).summary
+    strip = next(line for line in s.split("\n") if line.startswith("| ❌ no result"))
+    assert "ran" not in strip
+    assert strip.count("⚠️ not validated") == 3
+
+
+def test_hard_block_with_a_bundle_still_tells_the_author_to_fix(tmp_path):
+    s = case_d(tmp_path).summary
+    assert "fix the cause named in the row, then push" in s
+
+
+def test_dependency_failure_with_blocking_finding_names_the_finding(tmp_path):
+    tls = finding("security", "high", title=TLS, quote="shell=True")
+    r = run(tmp_path, passes=clean_passes(security=[tls]), needs=needs_ok("failure"))
+    callout = "\n".join(line for line in r.summary.split("\n") if line.startswith("> "))
+    assert "also blocks" in callout
+    assert "The author also fixes or waives the finding." in callout
+    assert "does not need to change anything" not in callout
+
+
+def test_dependency_failure_alone_needs_no_author_change(tmp_path):
+    r = run(tmp_path, needs=needs_ok("failure"))
+    assert "The author does not need to change anything." in r.summary
+
+
+def test_long_path_is_cut_once(monkeypatch):
+    """The schema caps `file` at 400, so a longer path reaches the renderer only
+    from a future schema change; the merge key and the span must still cut once."""
+    f = verdict.CitedFinding("review", "bug", "high", "high", "src/" + "d" * 600 + "/app.py", "head", 10,
+                             "q", "Long path finding.", "e", True, True, True, None)
+    result = SimpleNamespace(findings=[f])
+    monkeypatch.setattr(publish, "_finding_effect", lambda *_: publish.EFFECT_NONE)
+    [row] = publish._merge_findings(result, publish.InlineOutcome())
+    assert row.where.count("…") == 1 and "[truncated]" not in row.where
