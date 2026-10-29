@@ -762,13 +762,17 @@ _SafeLoader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
 
 class _UniqueKeyLoader(_SafeLoader):  # type: ignore[misc, valid-type]
-    """Safe loader that refuses a duplicate mapping key (parser differential)."""
+    """Safe loader that refuses a duplicate mapping key (parser differential).
+
+    Merge keys are expanded first, so a merged key that repeats another key
+    is refused too: no parser has to choose which value wins.
+    """
 
     def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
+        if isinstance(node, yaml.MappingNode):
+            self.flatten_mapping(node)
         seen: set[Any] = set()
         for key_node, _value in node.value:
-            if key_node.tag == "tag:yaml.org,2002:merge":
-                continue
             key = self.construct_object(key_node, deep=True)
             if key in seen:
                 raise DepsError(f"duplicate YAML key {str(key)[:60]!r}")
@@ -805,12 +809,18 @@ def _pnpm_source(resolution: dict[str, Any], key: str, name: str, version: str) 
 # dependencies) as a first YAML document before the main lockfile.
 _PNPM_ENV_KEYS = frozenset({"lockfileVersion", "importers", "packages", "snapshots"})
 _PNPM_ENV_IMPORTER_KEYS = frozenset({"configDependencies", "packageManagerDependencies"})
+# The top-level fields of pnpm 12's main lockfile (`Lockfile` in its
+# lockfile crate). The single-document form keeps the old, open check.
+_PNPM_MAIN_KEYS = frozenset({
+    "lockfileVersion", "settings", "catalogs", "overrides", "packageExtensionsChecksum", "pnpmfileChecksum",
+    "ignoredOptionalDependencies", "patchedDependencies", "importers", "packages", "snapshots", "time",
+})
 
 
 def _parse_pnpm_lock(text: str) -> _Result:
     """One document, or two: the env lockfile, then the main lockfile.
 
-    Any other document count, an empty document or an env document of an
+    Any other document count, an empty document or a document of an
     unexpected shape is a parse failure. Packages of both documents are
     returned, so the env document's entries (pnpm itself) get every check.
     """
@@ -824,14 +834,28 @@ def _parse_pnpm_lock(text: str) -> _Result:
     if len(docs) != 2:
         raise DepsError("pnpm-lock.yaml has no YAML document")
     env = _as_dict(docs[0], "pnpm-lock.yaml env document")
-    _check_pnpm_env_doc(env)
+    root = _check_pnpm_env_doc(env)
     _env_version, env_packages, _ = _parse_pnpm_doc(env, "pnpm-lock.yaml env document")
-    version, packages, _ = _parse_pnpm_doc(_as_dict(docs[1], "pnpm-lock.yaml main document"), "pnpm-lock.yaml")
+    main = _as_dict(docs[1], "pnpm-lock.yaml main document")
+    if set(main) - _PNPM_MAIN_KEYS:
+        raise DepsError(f"pnpm-lock.yaml main document has an unexpected shape (keys {sorted(map(str, main))})")
+    version, packages, _ = _parse_pnpm_doc(main, "pnpm-lock.yaml")
+    # Every env dependency must be a package the walker emits, so none
+    # escapes a check under another identity.
+    emitted = {(p.name, p.version) for p in env_packages}
+    for section in _PNPM_ENV_IMPORTER_KEYS:
+        for name, dep in _as_dict({} if root.get(section) is None else root[section], section).items():
+            dep_version = _as_str(_as_dict(dep, f"{section}.{name}").get("version"), f"{section}.{name} version")
+            if (name, dep_version.split("(", 1)[0]) not in emitted:
+                raise DepsError(f"pnpm-lock.yaml env dependency {name}@{dep_version} has no packages entry")
     return version, env_packages + packages, []
 
 
-def _check_pnpm_env_doc(env: dict[str, Any]) -> None:
-    """The env document holds one importer `.` with only env dependencies."""
+def _check_pnpm_env_doc(env: dict[str, Any]) -> dict[str, Any]:
+    """The env document holds one importer `.` with only env dependencies,
+    and its package keys name the identity: an entry's own `name` or
+    `version` must not differ from its key. Returns the importer `.`.
+    """
     extra = set(env) - _PNPM_ENV_KEYS
     if extra or "lockfileVersion" not in env or "importers" not in env:
         raise DepsError(f"pnpm-lock.yaml env document has an unexpected shape (keys {sorted(map(str, env))})")
@@ -842,13 +866,12 @@ def _check_pnpm_env_doc(env: dict[str, Any]) -> None:
     if set(root) - _PNPM_ENV_IMPORTER_KEYS:
         raise DepsError("pnpm-lock.yaml env importer '.' has an unexpected key")
     entries = _as_dict({} if env.get("packages") is None else env["packages"], "env packages")
-    locked = {_pnpm_split_key(_as_str(key, "env package key")) for key in entries}
-    # Every env dependency must have a packages entry, so none escapes a check.
-    for section in _PNPM_ENV_IMPORTER_KEYS:
-        for name, dep in _as_dict({} if root.get(section) is None else root[section], section).items():
-            dep_version = _as_str(_as_dict(dep, f"{section}.{name}").get("version"), f"{section}.{name} version")
-            if (name, dep_version.split("(", 1)[0]) not in locked:
-                raise DepsError(f"pnpm-lock.yaml env dependency {name}@{dep_version} has no packages entry")
+    for key, entry in entries.items():
+        name, version = _pnpm_split_key(_as_str(key, "env package key"))
+        entry = _as_dict(entry, f"env packages[{key!r}]")
+        if entry.get("name", name) != name or str(entry.get("version", version)) != version:
+            raise DepsError(f"pnpm-lock.yaml env package {str(key)[:60]!r} names another package")
+    return root
 
 
 def _parse_pnpm_doc(doc: dict[str, Any], what: str) -> _Result:

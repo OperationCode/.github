@@ -388,6 +388,128 @@ def test_pnpm_multi_document_unknown_version(side):
         parse("pnpm-lock.yaml", pnpm_two(env=env, main=main))
 
 
+# An env package whose own name and version are another package's: the env
+# check saw pnpm@12.15.0, but the walker emitted left-pad@1.3.0.
+PNPM_ENV_RENAMED = PNPM_ENV.replace(
+    "  pnpm@12.15.0:\n    resolution:", "  pnpm@12.15.0:\n    name: left-pad\n    version: 1.3.0\n    resolution:"
+)
+
+
+def test_pnpm_env_package_cannot_take_another_identity():
+    base = parse("pnpm-lock.yaml", PNPM_MAIN)
+    with pytest.raises(DepsError, match="names another package"):
+        parse("pnpm-lock.yaml", pnpm_two(env=PNPM_ENV_RENAMED))
+    # Only the version differs from the key.
+    with pytest.raises(DepsError, match="names another package"):
+        parse("pnpm-lock.yaml", pnpm_two(env=PNPM_ENV.replace("    resolution:", "    version: 1.0.0\n    resolution:", 1)))
+    # Fields that repeat the key are not a conflict; pnpm still reaches the delta.
+    same = PNPM_ENV.replace("    resolution:", "    name: pnpm\n    version: 12.15.0\n    resolution:", 1)
+    assert [c.name for c in deps.compute_delta(base, parse("pnpm-lock.yaml", pnpm_two(env=same)))] == ["pnpm"]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "unrecognizedPackageTable:\n  malware@1.0.0:\n    resolution: {tarball: 'https://evil.example/malware.tgz'}\n",
+        "dependencies:\n  left-pad: 1.3.0\n",
+        "onlyBuiltDependencies: [esbuild]\n",
+    ],
+    ids=["unknown-table", "v6-root-dependencies", "pnpm-10-field"],
+)
+def test_pnpm_main_document_extra_key_fails_closed(extra):
+    with pytest.raises(DepsError, match="main document has an unexpected shape"):
+        parse("pnpm-lock.yaml", pnpm_two(main=PNPM_MAIN + extra))
+    # The single-document form keeps its open check.
+    assert {p.name for p in parse("pnpm-lock.yaml", PNPM_MAIN + extra).packages} >= {"left-pad"}
+
+
+def test_pnpm_main_document_known_keys_parse():
+    main = (
+        PNPM_MAIN
+        + "settings: {autoInstallPeers: true}\ncatalogs: {}\noverrides: {ms: 2.1.3}\n"
+        + "packageExtensionsChecksum: sha256-x\npnpmfileChecksum: sha256-y\nignoredOptionalDependencies: [fsevents]\n"
+        + "patchedDependencies: {}\ntime: {}\n"
+    )
+    assert {p.name for p in parse("pnpm-lock.yaml", pnpm_two(main=main)).packages} == {"pnpm", "left-pad"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Anchors are local to a document: an alias to the env document's anchor.
+        pytest.param(
+            pnpm_two(env=PNPM_ENV.replace("{integrity: sha512-abc}", "&res {integrity: sha512-abc}"),
+                     main=PNPM_MAIN.replace("{integrity: sha512-def}", "*res")),
+            id="cross-document-alias",
+        ),
+        pytest.param(
+            pnpm_two(env=PNPM_ENV.replace("lockfileVersion: '9.0'", "lockfileVersion: !!python/object/apply:os.getcwd []")),
+            id="unsafe-tag-env",
+        ),
+        pytest.param(
+            pnpm_two(main=PNPM_MAIN.replace("lockfileVersion: '9.0'", "lockfileVersion: !!python/object/apply:os.getcwd []")),
+            id="unsafe-tag-main",
+        ),
+        pytest.param(
+            pnpm_two(main=PNPM_MAIN.replace("{integrity: sha512-def}", "!!python/name:os.system ''")),
+            id="unsafe-tag-main-package",
+        ),
+        # A merged key that repeats an explicit key: parsers can differ on the winner.
+        pytest.param(
+            pnpm_two(main=PNPM_MAIN.replace(
+                "  left-pad@1.3.0:\n    resolution: {integrity: sha512-def}\n",
+                "  left-pad@1.3.0:\n    <<: {resolution: {tarball: 'https://evil.example/x.tgz'}}\n"
+                "    resolution: {integrity: sha512-def}\n",
+            )),
+            id="merge-key-collides-with-explicit-key",
+        ),
+        pytest.param(
+            pnpm_two(main=PNPM_MAIN.replace(
+                "  left-pad@1.3.0:\n    resolution: {integrity: sha512-def}\n",
+                "  left-pad@1.3.0:\n    <<: [{resolution: {integrity: sha512-def}}, "
+                "{resolution: {tarball: 'https://evil.example/x.tgz'}}]\n",
+            )),
+            id="merge-keys-collide",
+        ),
+        pytest.param("---\n" + PNPM_ENV + "...\n---\n" + PNPM_MAIN + "...\n---\n" + PNPM_MAIN, id="three-documents-with-end-markers"),
+        # YAML 1.2 allows a bare document after `...`; the YAML 1.1 parser does not.
+        pytest.param(PNPM_ENV + "...\n" + PNPM_MAIN, id="end-marker-without-start-marker"),
+    ],
+)
+def test_pnpm_document_boundaries_fail_closed(text):
+    with pytest.raises(DepsError):
+        parse("pnpm-lock.yaml", text)
+
+
+def test_pnpm_merge_key_without_collision_parses():
+    main = PNPM_MAIN.replace(
+        "  left-pad@1.3.0:\n    resolution: {integrity: sha512-def}\n",
+        "  left-pad@1.3.0:\n    <<: {resolution: {integrity: sha512-def}}\n    deprecated: old\n",
+    )
+    assert one(parse("pnpm-lock.yaml", pnpm_two(main=main)), "left-pad").source.official
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("---\n" + PNPM_ENV + "...\n---\n" + PNPM_MAIN + "...\n", id="explicit-end-markers"),
+        pytest.param("﻿" + pnpm_two(), id="bom"),
+        # A `---` line inside a block scalar is text, not a document start.
+        pytest.param(
+            pnpm_two(main=PNPM_MAIN.replace(
+                "    resolution: {integrity: sha512-def}\n",
+                "    resolution: {integrity: sha512-def}\n    deprecated: |\n      use x\n      ---\n      not a document\n",
+            )),
+            id="marker-in-block-scalar",
+        ),
+    ],
+)
+def test_pnpm_document_boundaries_parse(text):
+    parsed = parse("pnpm-lock.yaml", text)
+    assert {p.name for p in parsed.packages} == {"pnpm", "left-pad"}
+    assert one(parsed, "pnpm").direct is True
+
+
 # --- pyproject.toml ------------------------------------------------------------
 
 

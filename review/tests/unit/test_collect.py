@@ -947,6 +947,36 @@ def test_lockfile_migration_gets_every_check():
     assert _signals(col, prefilter.BASE_DEP_UNPARSED)
 
 
+PNPM_TWO_DOCS = (
+    "---\nlockfileVersion: '9.0'\nimporters:\n  .:\n    configDependencies: {}\n"
+    "    packageManagerDependencies:\n      pnpm: {specifier: 12.15.0, version: 12.15.0}\n"
+    "packages:\n  pnpm@12.15.0:\n    resolution: {integrity: sha512-abc}\nsnapshots:\n  pnpm@12.15.0: {}\n"
+    "---\nlockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n"
+    "      left-pad: {specifier: ^1.3.0, version: 1.3.0}\n"
+    "packages:\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-def}\nsnapshots:\n  left-pad@1.3.0: {}\n"
+)
+
+
+def test_pnpm_two_document_base_that_does_not_parse_is_a_signal():
+    # K-10 holds for the two-document form: a malformed base (an unknown main
+    # document key) counts as empty, and every head entry gets every check.
+    base = PNPM_TWO_DOCS + "unrecognizedPackageTable: {}\n"
+    fx = _snapshot({"pnpm-lock.yaml": ("100644", base)}, {"pnpm-lock.yaml": ("100644", PNPM_TWO_DOCS)})
+    fx["registry"] = {
+        "https://registry.npmjs.org/left-pad": _packument("left-pad", "1.3.0", "2018-04-09T01:51:42.000Z"),
+        "https://registry.npmjs.org/pnpm": _packument("pnpm", "12.15.0", "2026-09-01T00:00:00.000Z"),
+    }
+    col, _, registry = run(fx)
+    payload = col.envelope["payload"]
+    assert payload["prefilter"]["hard_blocks"] == []
+    assert _signals(col, prefilter.BASE_DEP_UNPARSED) == {
+        ("pnpm-lock.yaml", "base side counts as empty: does not parse at the merge base")
+    }
+    changes = {(ch["name"], tuple(ch["old_versions"]), ch["new_version"]) for ch in payload["dependency_delta"]["changes"]}
+    assert changes == {("pnpm", (), "12.15.0"), ("left-pad", (), "1.3.0")}
+    assert sorted(registry.urls) == ["https://registry.npmjs.org/left-pad", "https://registry.npmjs.org/pnpm"]
+
+
 def test_lockfile_migration_over_a_lookup_cap_is_a_hard_block(monkeypatch):
     big = dict(OLD_PACKUMENTS)
     big["https://registry.npmjs.org/is-odd"] = {
