@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import random
 import re
@@ -434,6 +435,88 @@ def test_size_gate_boundary_on_the_final_document():
     assert over.envelope["payload"]["size"]["estimated_tokens"] == tokens
 
 
+# ---------------------------------------------------------------- lockfile churn and the size gate (K-17)
+
+
+def _pnpm_lock(n: int, bumped: frozenset[int] = frozenset()) -> str:
+    """A pnpm 9 lockfile of `n` packages, 9 lines each; `bumped` get a new version."""
+
+    def v(k: int) -> str:
+        return f"2.0.{k}" if k in bumped else f"1.0.{k}"
+
+    def integrity(k: int) -> str:
+        return base64.b64encode(hashlib.sha512(f"pkg-{k}@{v(k)}".encode()).digest()).decode()
+
+    lines = ["lockfileVersion: '9.0'", "", "settings:", "  autoInstallPeers: true", "", "importers:", "", "  .:", "    dependencies:"]
+    for k in range(n):
+        lines += [f"      pkg-{k}:", f"        specifier: ^{v(k)}", f"        version: {v(k)}"]
+    lines += ["", "packages:", ""]
+    for k in range(n):
+        lines += [f"  pkg-{k}@{v(k)}:", f"    resolution: {{integrity: sha512-{integrity(k)}}}", "    engines: {node: '>=18'}", ""]
+    lines += ["snapshots:", ""]
+    for k in range(n):
+        lines += [f"  pkg-{k}@{v(k)}: {{}}", ""]
+    return "".join(f"{line}\n" for line in lines)
+
+
+def test_lockfile_churn_past_the_diff_size_budget_stays_under_the_size_gate(capsys):
+    # PR 2027 shape: version bumps near both ends of a 16,000-line lockfile.
+    n = 1_800
+    bumped = frozenset({0, n - 1, *range(7, n, 9)})
+    base, head = _pnpm_lock(n), _pnpm_lock(n, bumped)
+    assert base.count("\n") * head.count("\n") > linediff.DIFF_BUDGET
+    # One hunk for the whole middle holds every line of both sides: past the gate by itself.
+    assert (len(base) + len(head)) // c.CHARS_PER_TOKEN > c.SIZE_GATE_TOKENS
+    col, _, _ = run(_snapshot({"pnpm-lock.yaml": ("100644", base)}, {"pnpm-lock.yaml": ("100644", head)}))
+    doc = col.envelope
+    assert doc["status"] == "ok"
+    assert doc["payload"]["size"]["estimated_tokens"] < c.SIZE_GATE_TOKENS
+    (f,) = doc["payload"]["files"]
+    # Each bump changes 5 lines (specifier, version, package key, integrity, snapshot key).
+    assert (f["additions"], f["deletions"]) == (5 * len(bumped), 5 * len(bumped))
+    assert apply_patch(base, f["patch"]) == head
+    assert linediff.ANCHORED in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("path", ["src/app.js", "pnpm-lock.yaml"])
+def test_large_rewrite_is_still_too_large(path):
+    # Every line changes, so no line anchors the diff: one hunk, over the gate,
+    # whatever the file is called (a lockfile name with code in it too).
+    n = 16_000
+    base = "".join(f"export const value{i} = compute({i});\n" for i in range(n))
+    head = "".join(f"export const value{i} = compute({i}) + 1;\n" for i in range(n))
+    col, _, _ = run(_snapshot({path: ("100644", base)}, {path: ("100644", head)}))
+    doc = col.envelope
+    assert doc["status"] == "skipped-size"
+    assert doc["payload"]["size"]["reason"].startswith(c.SIZE_GATE_REASON)
+    assert doc["payload"]["size"]["estimated_tokens"] > c.SIZE_GATE_TOKENS
+
+
+INJECTED = "    evilScript: node -e fetchAndRunPayload"
+
+
+def test_lockfile_name_or_path_gets_no_other_treatment():
+    # The anchored diff never reads the path: code placed in a file named like
+    # a lockfile, at the root or in an unexpected directory, gets the same
+    # patch as any other file, and every changed line renders for Claude.
+    n = 700
+    base = _pnpm_lock(n)
+    head_lines = _pnpm_lock(n, frozenset({0, n // 2, n - 1})).split("\n")
+    for at in (40, 3_000, 6_000):
+        head_lines.insert(at, INJECTED)
+    head = "\n".join(head_lines)
+    assert base.count("\n") * head.count("\n") > linediff.DIFF_BUDGET
+    paths = ["pnpm-lock.yaml", "packages/app/node_modules/pnpm-lock.yaml", "src/pnpm-lock.yaml.js"]
+    col, _, _ = run(_snapshot({p: ("100644", base) for p in paths}, {p: ("100644", head) for p in paths}))
+    assert col.envelope["status"] == "ok"
+    files = files_by_path(col)
+    assert len({files[p]["patch"] for p in paths}) == 1
+    patch = files[paths[0]]["patch"]
+    assert apply_patch(base, patch) == head
+    assert patch.count(f"+{INJECTED}\n") == 3
+    assert render.render_bundle(col.envelope).text.count(INJECTED) == 3 * len(paths)
+
+
 # ---------------------------------------------------------------- envelope file
 
 
@@ -696,7 +779,13 @@ def test_unified_diff_budget_fallback_is_still_correct(monkeypatch):
     head = base.replace("5\n", "five\n").replace("25\n", "twenty-five\n")
     patch, adds, dels = c.unified_diff(base, head)
     assert apply_patch(base, patch) == head
-    assert (adds, dels) == (21, 21)
+    # Past the size budget the middle is split at unique lines (K-17).
+    assert (adds, dels) == (3, 3)  # lines 5, 15 and 25
+    # With no line that occurs once on each side, it is one hunk.
+    base, head = "s\n" + "x\n" * 28 + "e\n", "t\n" + "x\n" * 28 + "f\n"
+    patch, adds, dels = c.unified_diff(base, head)
+    assert apply_patch(base, patch) == head
+    assert (adds, dels) == (30, 30)
 
 
 # Low entropy ("a"/"b" lines): about 2.5 million counted diff steps.

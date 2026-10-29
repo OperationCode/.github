@@ -169,3 +169,95 @@ def test_per_file_and_run_reasons():
     assert linediff.diff(a, b, work=linediff.WorkBudget(total=1_000, per_file=10**9)).reason == (
         linediff.PAST_RUN_WORK_BUDGET
     )
+
+
+# ---------------------------------------------------------------- anchored (collect, K-17)
+
+
+def _check_script(a, b, codes) -> int:
+    """`codes` is a correct edit script of `a` to `b`; returns the changed line count."""
+    i = j = changed = 0
+    for tag, i1, i2, j1, j2 in codes:
+        assert (i1, j1) == (i, j)
+        if tag == "equal":
+            assert a[i1:i2] == b[j1:j2]
+        else:
+            changed += (i2 - i1) + (j2 - j1)
+        i, j = i2, j2
+    assert (i, j) == (len(a), len(b))
+    return changed
+
+
+def _lockfile(n: int, bumped: set[int]) -> list[str]:
+    """pnpm-like lines: unique name and integrity lines, repeated filler lines."""
+    out = []
+    for k in range(n):
+        v = f"1.0.{k + (k in bumped)}"
+        out += [f"  pkg-{k}@{v}:", f"    resolution: {{integrity: sha512-{k}-{v}}}", "    engines: {node: '>=18'}", ""]
+    return out
+
+
+def test_anchored_lockfile_churn_is_a_small_diff_within_the_file_budget():
+    n = 4_000  # 16,000 lines per side, changed near both ends
+    bumped = {0, n - 1, *range(1, n, 97)}
+    a, b = _lockfile(n, set()), _lockfile(n, bumped)
+    assert len(a) * len(b) > linediff.DIFF_BUDGET
+    work = linediff.WorkBudget()
+    d = linediff.diff(a, b, work=work, anchored=True)
+    assert d.reason == linediff.ANCHORED and not d.exact
+    assert _check_script(a, b, d.codes) == 4 * len(bumped)  # name and integrity line, each side
+    assert 0 < linediff.RUN_WORK_BUDGET - work.left < linediff.FILE_WORK_BUDGET
+    # Without `anchored` (the publisher) the middle is one replace, as before.
+    plain = linediff.diff(a, b, work=linediff.WorkBudget())
+    assert plain.reason == linediff.PAST_SIZE_BUDGET
+    assert _check_script(a, b, plain.codes) > len(a) + len(b) - 10
+
+
+def test_anchored_diff_is_a_correct_edit_script():
+    rng = random.Random(17)
+    for _ in range(300):
+        pool = [f"u{k}" for k in range(40)] + ["x", "y", ""] * 10
+        a = [rng.choice(pool) for _ in range(rng.randint(0, 50))]
+        b = [rng.choice(pool) for _ in range(rng.randint(0, 50))]
+        work = linediff.WorkBudget()
+        d = linediff.diff(a, b, budget=rng.choice([0, 1, 20, 400]), work=work, anchored=True)
+        _check_script(a, b, d.codes)
+        assert all(x[0] != "equal" or y[0] != "equal" for x, y in zip(d.codes, d.codes[1:]))
+        assert work.left <= linediff.RUN_WORK_BUDGET
+
+
+def test_anchored_with_no_unique_line_is_one_replace():
+    a, b = ["s", *_alt(10)], ["t", *_alt(10, "b", "a")]
+    d = linediff.diff(a, b, budget=1, anchored=True)
+    assert d.codes == _coarse(a, b)
+    assert d.reason == linediff.ANCHORED + "; part past the size budget"
+
+
+def test_anchoring_is_charged_and_skipped_when_the_file_cannot_pay():
+    a, b = ["a", "x", "b"], ["c", "x", "d"]
+    cost = len(a) + len(b) + 3
+    work = linediff.WorkBudget(total=cost - 1)
+    d = linediff.diff(a, b, budget=0, work=work, anchored=True)
+    assert (d.reason, d.codes, work.left) == (linediff.PAST_SIZE_BUDGET, _coarse(a, b), cost - 1)
+    work = linediff.WorkBudget(total=cost)
+    d = linediff.diff(a, b, budget=0, work=work, anchored=True)
+    assert d.codes == [("replace", 0, 1, 0, 1), ("equal", 1, 2, 1, 2), ("replace", 2, 3, 2, 3)]
+    assert d.reason == linediff.ANCHORED + "; part past the size budget"
+    assert work.left == 0
+
+
+def test_anchored_gap_past_the_work_budget_charges_the_whole_allowance():
+    low_a, low_b = LOW_ENTROPY["a-only-vs-alternating"]
+    a, b = ["head", *low_a, "tail"], ["head2", "head", *low_b, "tail"]
+    # Only the gap after the anchor "head" fits the size budget.
+    budget = len(low_a) * len(low_b)
+    work = linediff.WorkBudget()
+    d = linediff.diff(a, b, budget=budget, work=work, anchored=True)
+    assert d.reason == linediff.ANCHORED + "; part past the per-file work budget"
+    assert work.left == linediff.RUN_WORK_BUDGET - linediff.FILE_WORK_BUDGET
+    _check_script(a, b, d.codes)
+    run = linediff.WorkBudget(total=1_000_000)
+    assert linediff.diff(a, b, budget=budget, work=run, anchored=True).reason == (
+        linediff.ANCHORED + "; part past the run work budget"
+    )
+    assert run.left == 0
