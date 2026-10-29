@@ -885,8 +885,25 @@ def test_redirect_status_is_rejected():
 def test_oversized_response_is_rejected_before_parsing():
     body = b"x" * (deps.NPM_MAX_RESPONSE_BYTES + 1)
     resp = deps.FetchResult(status=200, body=body, url="https://registry.npmjs.org/esbuild")
-    with pytest.raises(RegistryError, match="byte cap"):
+    with pytest.raises(deps.ResponseTooLargeError, match="byte cap"):
         deps.lookup_npm("esbuild", "0.19.0", FakeFetch(resp))
+
+
+def test_npm_cap_boundary():
+    # Exactly at the cap parses; one byte over is refused. 39,000,000 bytes
+    # (vite today) fits with 2x headroom.
+    assert deps.NPM_MAX_RESPONSE_BYTES == 80 * 1024 * 1024
+    pad = "x" * 100
+    body = json.dumps({**NPM_DOC, "pad": pad}).encode()
+    ok_resp = deps.FetchResult(200, body, "https://registry.npmjs.org/esbuild")
+    assert deps.lookup_npm("esbuild", "0.19.0", FakeFetch(ok_resp)).name == "esbuild"
+    over = deps.FetchResult(200, b" " * (deps.NPM_MAX_RESPONSE_BYTES + 1), "https://registry.npmjs.org/esbuild")
+    with pytest.raises(deps.ResponseTooLargeError):
+        deps.lookup_npm("esbuild", "0.19.0", FakeFetch(over))
+    at_cap = deps.FetchResult(
+        200, body + b" " * (deps.NPM_MAX_RESPONSE_BYTES - len(body)), "https://registry.npmjs.org/esbuild"
+    )
+    assert deps.lookup_npm("esbuild", "0.19.0", FakeFetch(at_cap)).name == "esbuild"
 
 
 @pytest.mark.parametrize(

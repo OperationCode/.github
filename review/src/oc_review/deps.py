@@ -36,8 +36,9 @@ import yaml
 
 # Byte cap on one manifest or lockfile, applied before parsing.
 MAX_DEP_FILE_BYTES = 16 * 1024 * 1024
-# Byte caps on registry responses, applied before parsing.
-NPM_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+# Byte caps on registry responses, applied before parsing. The npm cap is
+# 2x the largest full packument measured on 2026-10-29 (vite, 37.2 MiB), K-18.
+NPM_MAX_RESPONSE_BYTES = 80 * 1024 * 1024
 PYPI_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 REGISTRY_TIMEOUT_SECONDS = 20.0
 REGISTRY_RETRIES = 2
@@ -125,6 +126,10 @@ class UnsupportedVersionError(DepsError):
 
 class RegistryError(DepsError):
     """A registry lookup failed or its response did not validate."""
+
+
+class ResponseTooLargeError(RegistryError):
+    """A registry response is over its byte cap."""
 
 
 # ---------------------------------------------------------------------------
@@ -1573,7 +1578,7 @@ def _fetch_json(
         if result.status != 200:
             raise RegistryError(f"{url}: HTTP {result.status}")
         if len(result.body) > max_bytes:
-            raise RegistryError(f"{url}: response is over the {max_bytes} byte cap")
+            raise ResponseTooLargeError(f"{url}: response is over the {max_bytes} byte cap")
         try:
             doc = json.loads(result.body)
         except (ValueError, RecursionError) as exc:
