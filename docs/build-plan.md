@@ -185,14 +185,16 @@ Exit criteria:
 
 ## Phase 4: pilot
 
-- [ ] Owner: before a repo joins the pilot, give it its own approval protection on the default branch: a repo ruleset or branch protection with at least 1 approval, code owner review and dismiss stale approvals on push. `back-end` has none today.
-- [ ] Owner: before a repo joins the pilot, check it for people or bots that push to the default branch directly (V25).
+- [x] Owner: record the pilot scope. The plan named only `back-end`; the owner added `front-end` (135777271), `operationcode-pybot` (146210805, default branch `master`) and `operationcode_infra` (107068150), with `back-end` (182584277). Four repos (spec P4-1).
+- [x] Owner: before a repo joins the pilot, give it its own approval protection on the default branch: a repo ruleset or branch protection with at least 1 approval, code owner review and dismiss stale approvals on push. Done 2026-10-28: "Pilot approval protection" on `back-end` (26057791), `operationcode-pybot` (26057793) and `operationcode_infra` (26057794), with the Maintain, Admin and org admin bypass because pybot and infra have one active committer; `front-end`: the existing "Protect main" (25634150), only `require_code_owner_review` changed to true (spec P4-3).
+- [x] Owner: before a repo joins the pilot, check it for people or bots that push to the default branch directly (V25). Done: none in 12 months on `back-end`, `operationcode-pybot` and `operationcode_infra`; `front-end` had a force push on 2026-10-28 that rewrote three merged PRs (cleanup of a malicious dependency payload), not new unreviewed code (spec P4-4).
 - [ ] Owner: accept that during the pilot a maintainer or repo admin can merge past any failed run, also on their own PR (spec "Pilot and enforcement").
-- [ ] Owner: confirm that the federation rule named in the release code has `job_workflow_ref` at the release SHA.
-- [ ] Owner: create the pilot ruleset. Only the rule "Require workflows to pass before merging" with the central workflow `repository_id`, path and release SHA. Targets: the pilot repos by name (first `back-end`), default branch. Bypass in `pull_request` mode: the Maintain and Admin repository roles, and org admins.
-- [ ] Owner: read the pilot ruleset back through the [org rules API](https://docs.github.com/en/rest/orgs/rules#get-an-organization-repository-ruleset). Check `repository_id`, path, `sha`, no `ref`, and the role `actor_id` values from V25. Then enable it.
-- [ ] Owner: require 2FA for all org members.
-- [ ] Owner: CODEOWNERS in each pilot repo for `.github/`, manifests, lockfiles, `pyproject.toml`, `Dockerfile`.
+- [x] Owner: confirm that the federation rule named in the release code has `job_workflow_ref` at the release SHA. Read back by the owner at M4 `9e2795b` (2026-10-29, spec P4-5).
+- [x] Owner: every pilot repo sends the immutable OIDC subject (spec "Immutable subject", P4-6). Found 2026-10-28: repos made before the GitHub default sent `repo:OperationCode/<repo>:...`, the rule rejected them (`match_subject_prefix`), and the first pilot runs failed closed as designed. Fix per repo: `PUT repos/OperationCode/<repo>/actions/oidc/customization/sub` with `use_default` true and `use_immutable_subject` true. Before it, check the other `id-token` users in the repo and their relying-party trust: `back-end` and `operationcode-pybot` push to ECR through a role whose trust policy gained the immutable subjects (owner; old values kept). After it, all four test PRs passed (all four jobs `success`).
+- [x] Owner: create the pilot ruleset. Only the rule "Require workflows to pass before merging" with the central workflow `repository_id`, path and release SHA. Targets: the pilot repos by name (first `back-end`), default branch. Bypass in `pull_request` mode: the Maintain and Admin repository roles, and org admins. Created disabled as `claude-review-pilot` (26132750): four repo ids, `~DEFAULT_BRANCH`, `repository_id` 1432342572, M4 `9e2795b`, bypass `RepositoryRole` 2 and 5 plus `OrganizationAdmin` (spec P4-2).
+- [x] Owner: read the pilot ruleset back through the [org rules API](https://docs.github.com/en/rest/orgs/rules#get-an-organization-repository-ruleset). Check `repository_id`, path, `sha`, no `ref`, and the role `actor_id` values from V25. Then enable it. Read back (`do_not_enforce_on_create` false, no `ref`), then enabled 2026-10-28. Rollback: `PUT` with `enforcement` set to `disabled`.
+- [x] Owner: require 2FA for all org members. Done in the web UI; all 7 members already had 2FA (spec P4-5).
+- [x] Owner: CODEOWNERS in each pilot repo for `.github/`, manifests, lockfiles, `pyproject.toml`, `Dockerfile`. Added on each default branch (`back-end`: @irvingpop @kylemh; `front-end`: @kylemh @irvingpop; `operationcode-pybot` and `operationcode_infra`: @irvingpop; spec P4-3).
 - [ ] Start a run on each open PR in the pilot repos (push, or close and reopen).
 - [ ] Each week, record false positives, overrides, bypasses, failed runs by reason, egress blocks and cost per run. Keep cost numbers (any currency amount) in the owner's private notes and the Anthropic Console, never in this public repo. Public text may give ratios and timing only.
 - [ ] Fix false positives in prompts or code. Each fix goes through phase 2 again, then ships as in "Each release" below.
@@ -216,6 +218,7 @@ Exit criteria:
   - [ ] targets: never `.github`, and none of the repos still in the pilot ruleset
 - [ ] Owner: read the org ruleset back and check the workflow entry (`repository_id`, path, `sha`, no `ref`).
 - [ ] Build the supported repo inventory (spec "Supported repos") as a list in this repo.
+- [ ] Owner: every repo to be added to the org ruleset first sends the immutable OIDC subject (spec "Immutable subject"). Check `GET repos/OperationCode/<repo>/actions/oidc/customization/sub`, check the other `id-token` users in the repo and their relying-party trust, set it per repo, and run a test PR (all jobs `success`) before the repo is a target.
 - [ ] Owner: CODEOWNERS in each supported repo.
 - [ ] Owner: turn "prevent self-review" back on for the `eval` environment (it is off during phase 2), and decide whether admin bypass stays on.
 - [ ] Owner: Dependabot alerts with npm malware detection on active repos.
@@ -232,7 +235,7 @@ Exit criteria:
 
 ## Phase 6: org-wide enforcement
 
-- [ ] Owner: enable the org ruleset with the supported repos that are not in the pilot. Add them in small groups.
+- [ ] Owner: enable the org ruleset with the supported repos that are not in the pilot. Add them in small groups. Each repo in a group already sends the immutable OIDC subject (phase 5); without it the run fails closed.
 - [ ] Owner: move each pilot repo: remove it from the pilot ruleset targets, then add it to the org ruleset targets at once. Never let both rulesets require the workflow on one repo.
 - [ ] After each group or move, start a run on each open PR, and check that each shows the required workflow passing or failing on its own result.
 - [ ] Owner: delete the pilot ruleset when no repo is left in it.
