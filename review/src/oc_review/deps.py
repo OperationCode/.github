@@ -801,11 +801,60 @@ def _pnpm_source(resolution: dict[str, Any], key: str, name: str, version: str) 
     return Source(kind="unknown", normalized="")
 
 
+# pnpm 12 writes the env lockfile (the package manager and config
+# dependencies) as a first YAML document before the main lockfile.
+_PNPM_ENV_KEYS = frozenset({"lockfileVersion", "importers", "packages", "snapshots"})
+_PNPM_ENV_IMPORTER_KEYS = frozenset({"configDependencies", "packageManagerDependencies"})
+
+
 def _parse_pnpm_lock(text: str) -> _Result:
-    doc = _as_dict(yaml.load(text, Loader=_UniqueKeyLoader), "pnpm-lock.yaml")
+    """One document, or two: the env lockfile, then the main lockfile.
+
+    Any other document count, an empty document or an env document of an
+    unexpected shape is a parse failure. Packages of both documents are
+    returned, so the env document's entries (pnpm itself) get every check.
+    """
+    docs: list[Any] = []
+    for doc in yaml.load_all(text, Loader=_UniqueKeyLoader):
+        docs.append(doc)
+        if len(docs) > 2:
+            raise DepsError("pnpm-lock.yaml has more than two YAML documents")
+    if len(docs) == 1:
+        return _parse_pnpm_doc(_as_dict(docs[0], "pnpm-lock.yaml"), "pnpm-lock.yaml")
+    if len(docs) != 2:
+        raise DepsError("pnpm-lock.yaml has no YAML document")
+    env = _as_dict(docs[0], "pnpm-lock.yaml env document")
+    _check_pnpm_env_doc(env)
+    _env_version, env_packages, _ = _parse_pnpm_doc(env, "pnpm-lock.yaml env document")
+    version, packages, _ = _parse_pnpm_doc(_as_dict(docs[1], "pnpm-lock.yaml main document"), "pnpm-lock.yaml")
+    return version, env_packages + packages, []
+
+
+def _check_pnpm_env_doc(env: dict[str, Any]) -> None:
+    """The env document holds one importer `.` with only env dependencies."""
+    extra = set(env) - _PNPM_ENV_KEYS
+    if extra or "lockfileVersion" not in env or "importers" not in env:
+        raise DepsError(f"pnpm-lock.yaml env document has an unexpected shape (keys {sorted(map(str, env))})")
+    importers = _as_dict(env["importers"], "env importers")
+    if list(importers) != ["."]:
+        raise DepsError("pnpm-lock.yaml env document must have exactly the importer '.'")
+    root = _as_dict(importers["."], "env importer '.'")
+    if set(root) - _PNPM_ENV_IMPORTER_KEYS:
+        raise DepsError("pnpm-lock.yaml env importer '.' has an unexpected key")
+    entries = _as_dict({} if env.get("packages") is None else env["packages"], "env packages")
+    locked = {_pnpm_split_key(_as_str(key, "env package key")) for key in entries}
+    # Every env dependency must have a packages entry, so none escapes a check.
+    for section in _PNPM_ENV_IMPORTER_KEYS:
+        for name, dep in _as_dict({} if root.get(section) is None else root[section], section).items():
+            dep_version = _as_str(_as_dict(dep, f"{section}.{name}").get("version"), f"{section}.{name} version")
+            if (name, dep_version.split("(", 1)[0]) not in locked:
+                raise DepsError(f"pnpm-lock.yaml env dependency {name}@{dep_version} has no packages entry")
+
+
+def _parse_pnpm_doc(doc: dict[str, Any], what: str) -> _Result:
     version = str(doc.get("lockfileVersion"))
     if version not in SUPPORTED_PNPM_LOCK_VERSIONS:
-        raise UnsupportedVersionError(f"pnpm-lock.yaml lockfileVersion {version!r} is not supported")
+        raise UnsupportedVersionError(f"{what} lockfileVersion {version!r} is not supported")
     entries = _as_dict({} if doc.get("packages") is None else doc["packages"], "packages")
     snapshots = _as_dict({} if doc.get("snapshots") is None else doc["snapshots"], "snapshots")
     build_names: set[tuple[str, str]] = set()
@@ -846,7 +895,7 @@ def _pnpm_direct_names(doc: dict[str, Any]) -> set[str]:
         sections.extend(_as_dict(v, "importer") for v in _as_dict(importers, "importers").values())
     names: set[str] = set()
     for section in sections:
-        for dep_key in ("dependencies", "devDependencies", "optionalDependencies"):
+        for dep_key in ("dependencies", "devDependencies", "optionalDependencies", *_PNPM_ENV_IMPORTER_KEYS):
             deps = section.get(dep_key)
             if deps is not None:
                 names.update(_as_dict(deps, dep_key))

