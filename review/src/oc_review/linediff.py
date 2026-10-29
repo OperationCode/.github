@@ -15,6 +15,14 @@ The count is deterministic (it depends on the input only, never on the
 clock). Past a limit the middle is one `replace`: every base line there is
 removed and every head line added. The result then is not exact, and its
 `reason` names the limit.
+
+With `anchored=True` (collect's patches only, K-17), a middle past the size
+budget is first split at anchors: lines that occur exactly once in the base
+middle and once in the head middle, in the longest run that keeps their
+order on both sides. Each gap between anchors gets the bounded diff above,
+and a gap past a limit is one `replace`. Anchoring takes its steps from the
+same work budget. The result is a correct edit script, never git's, so it is
+not exact either.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ RUN_WORK_BUDGET = 100_000_000
 PAST_SIZE_BUDGET = "line diff past the size budget"
 PAST_FILE_WORK_BUDGET = "line diff past the per-file work budget"
 PAST_RUN_WORK_BUDGET = "line diff past the run work budget"
+ANCHORED = "line diff past the size budget, anchored on lines that occur once on each side"
 
 
 class WorkBudget:
@@ -97,9 +106,17 @@ class _CountingMatcher(difflib.SequenceMatcher):
         return super().find_longest_match(alo, ahi, blo, bhi)
 
 
-def diff(a: Sequence[Any], b: Sequence[Any], budget: int = DIFF_BUDGET, work: WorkBudget | None = None) -> Diff:
+def diff(
+    a: Sequence[Any],
+    b: Sequence[Any],
+    budget: int = DIFF_BUDGET,
+    work: WorkBudget | None = None,
+    *,
+    anchored: bool = False,
+) -> Diff:
     """difflib-style opcodes of `a` to `b`, bounded by the size budget and by
-    `work` (a fresh `WorkBudget` when None)."""
+    `work` (a fresh `WorkBudget` when None). `anchored` splits a middle past
+    the size budget at unique lines first (`_anchored`)."""
     if work is None:
         work = WorkBudget()
     pre = 0
@@ -114,13 +131,15 @@ def diff(a: Sequence[Any], b: Sequence[Any], budget: int = DIFF_BUDGET, work: Wo
     if pre:
         codes.append(("equal", 0, pre, 0, pre))
     if am or bm:
-        middle: list[Opcode]
+        middle: list[Opcode] | None = None
         if not am:
             middle = [("insert", 0, 0, 0, len(bm))]
         elif not bm:
             middle = [("delete", 0, len(am), 0, 0)]
         elif len(am) * len(bm) > budget:
             reason = PAST_SIZE_BUDGET
+            if anchored:
+                middle, reason = _anchored(am, bm, budget, work)
         else:
             allowance = max(0, min(work.per_file, work.left))
             try:
@@ -132,12 +151,101 @@ def diff(a: Sequence[Any], b: Sequence[Any], budget: int = DIFF_BUDGET, work: Wo
                 reason = PAST_FILE_WORK_BUDGET if allowance == work.per_file else PAST_RUN_WORK_BUDGET
             else:
                 work.left -= allowance - matcher.left
-        if reason is not None:
+        if middle is None:
             middle = [("replace", 0, len(am), 0, len(bm))]
         codes.extend((tag, i1 + pre, i2 + pre, j1 + pre, j2 + pre) for tag, i1, i2, j1, j2 in middle)
     if suf:
         codes.append(("equal", len(a) - suf, len(a), len(b) - suf, len(b)))
     return Diff(codes, reason)
+
+
+def _unique_pairs(a: Sequence[Any], b: Sequence[Any]) -> list[tuple[int, int]]:
+    """(i, j) of each line that occurs once in `a` and once in `b`, by i."""
+    seen_a: dict[Any, int] = {}
+    for i, line in enumerate(a):
+        seen_a[line] = -1 if line in seen_a else i
+    seen_b: dict[Any, int] = {}
+    for j, line in enumerate(b):
+        seen_b[line] = -1 if line in seen_b else j
+    return [
+        (i, j) for i, line in enumerate(a) if seen_a[line] == i and (j := seen_b.get(line, -1)) >= 0
+    ]
+
+
+def _longest_ordered(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """The longest subsequence of `pairs` (sorted by i) whose j also rises."""
+    tails: list[int] = []  # smallest last j of a run of each length
+    tail_at: list[int] = []  # index in `pairs` of that last element
+    prev = [-1] * len(pairs)
+    for k, (_, j) in enumerate(pairs):
+        n = bisect_left(tails, j)
+        if n == len(tails):
+            tails.append(j)
+            tail_at.append(k)
+        else:
+            tails[n] = j
+            tail_at[n] = k
+        prev[k] = tail_at[n - 1] if n else -1
+    out: list[tuple[int, int]] = []
+    k = tail_at[-1] if tail_at else -1
+    while k >= 0:
+        out.append(pairs[k])
+        k = prev[k]
+    out.reverse()
+    return out
+
+
+def _anchored(
+    a: Sequence[Any], b: Sequence[Any], budget: int, work: WorkBudget
+) -> tuple[list[Opcode] | None, str]:
+    """Opcodes of a middle past the size budget, split at anchors, and the
+    reason. None (one `replace`) when the file's allowance cannot pay for
+    the anchoring, which is then not run and costs nothing.
+
+    Anchoring costs one step per line of both sides plus one per line of the
+    shorter side (the pair list and its longest ordered run). Every gap
+    takes its steps from what is left of the file's allowance, so the file
+    and the run limits hold. A file past a limit in a gap is charged its
+    whole allowance, and the reason names that limit.
+    """
+    allowance = max(0, min(work.per_file, work.left))
+    cost = len(a) + len(b) + min(len(a), len(b))
+    if cost > allowance:
+        return None, PAST_SIZE_BUDGET
+    gaps = WorkBudget(total=allowance - cost, per_file=allowance - cost)
+    anchors = _longest_ordered(_unique_pairs(a, b))
+    codes: list[Opcode] = []
+    past: set[str] = set()
+    i0 = j0 = 0
+    for i, j in [*anchors, (len(a), len(b))]:
+        part = diff(a[i0:i], b[j0:j], budget, gaps)
+        if part.reason is not None:
+            past.add(part.reason)
+        codes.extend((tag, i1 + i0, i2 + i0, j1 + j0, j2 + j0) for tag, i1, i2, j1, j2 in part.codes)
+        if i < len(a):
+            codes.append(("equal", i, i + 1, j, j + 1))
+        i0, j0 = i + 1, j + 1
+    work.left -= allowance - gaps.left
+    # A gap's own work reason is relative to `gaps`; name the file's limit.
+    worst = None
+    if past - {PAST_SIZE_BUDGET}:
+        worst = PAST_FILE_WORK_BUDGET if allowance == work.per_file else PAST_RUN_WORK_BUDGET
+    elif past:
+        worst = PAST_SIZE_BUDGET
+    reason = ANCHORED if worst is None else f"{ANCHORED}; part {worst.removeprefix('line diff ')}"
+    return _merge_equal(codes), reason
+
+
+def _merge_equal(codes: list[Opcode]) -> list[Opcode]:
+    """Join adjacent `equal` opcodes, so `hunks` sees each equal run whole."""
+    out: list[Opcode] = []
+    for code in codes:
+        if out and code[0] == "equal" and out[-1][0] == "equal":
+            tag, i1, _, j1, _ = out[-1]
+            out[-1] = (tag, i1, code[2], j1, code[4])
+        else:
+            out.append(code)
+    return out
 
 
 def hunks(codes: list[Opcode], n: int) -> Iterator[list[Opcode]]:
