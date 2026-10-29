@@ -110,7 +110,10 @@ PATCH_CONTEXT = 3
 # Past this product of middle lengths, or past the work budget of the file or
 # of the run (linediff), the patch is one hunk that removes every base line and
 # adds every head line between the common prefix and suffix: a larger patch
-# than git's, never a wrong one.
+# than git's, never a wrong one. Past this product the middle is first split at
+# lines that occur once on each side (linediff `anchored`, K-17), so a long
+# file changed near both ends (a lockfile) keeps a small patch; only the gaps
+# that are still past a limit are one hunk each.
 PATCH_DIFF_BUDGET = linediff.DIFF_BUDGET
 NO_NEWLINE = "\\ No newline at end of file"
 
@@ -413,7 +416,7 @@ def _git_lines(text: str | None) -> tuple[list[str], bool]:
 
 
 def _opcodes(a: Sequence[Any], b: Sequence[Any], work: linediff.WorkBudget | None) -> linediff.Diff:
-    return linediff.diff(a, b, PATCH_DIFF_BUDGET, work)
+    return linediff.diff(a, b, PATCH_DIFF_BUDGET, work, anchored=True)
 
 
 def _range(start: int, stop: int) -> str:
@@ -947,7 +950,8 @@ def _file_entry(
     patch, adds, dels, coarse = _patch(base_text, head_text, work)
     if coarse is not None:
         # The job log says why (repr: a path is one log line).
-        print(f"collect: {change.path!r}: {coarse}; the patch is one hunk for the changed middle", file=sys.stderr)
+        shape = "parts past a limit are one hunk" if coarse.startswith(linediff.ANCHORED) else "the patch is one hunk for the changed middle"
+        print(f"collect: {change.path!r}: {coarse}; {shape}", file=sys.stderr)
     try:
         entry["patch"] = render.redact_patch(patch, base_text, head_text)
     except render.RenderError as exc:
