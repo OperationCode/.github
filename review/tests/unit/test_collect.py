@@ -1248,6 +1248,45 @@ def test_response_over_the_cap_is_not_a_byte_budget_failure():
     assert failed == {("npm", "a", "1.0.0"): c.LOOKUP_RESPONSE_TOO_LARGE}
 
 
+def test_failed_fetches_do_not_spend_the_byte_budget():
+    body = _sized_packument("a", 1000)
+    state = {"fail": True}
+
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        if state["fail"] and not url.endswith("/z"):
+            raise TimeoutError("registry blip")
+        return deps.FetchResult(200, body.replace(b'"a"', b'"%s"' % url.rsplit("/", 1)[1].encode(), 1), url)
+
+    # Many failing attempts (3 per key) would spend 5000 bytes at the cap
+    # each if reservations stayed; the later valid lookup must still fit.
+    registry, failed = c.lookup_registry(
+        _keys("a", "b", "c", "d", "e", "f", "z"),
+        fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=1, byte_budget=5000,
+    )
+    assert list(registry) == _keys("z")
+    assert set(failed.values()) == {c.LOOKUP_FAILED}
+    assert len(failed) == 6
+
+
+def test_oversize_downloads_still_spend_the_byte_budget():
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        raise deps.ResponseTooLargeError(f"{url}: response is over the {max_bytes} byte cap")
+
+    # Budget 2500, grant 1000 per call (cap patched): the real oversize
+    # downloads keep their reservations, so the third key finds the budget
+    # cut and gets the byte-budget reason; near the budget an over-grant
+    # response is a byte-budget failure, not a cap failure (M1).
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(deps, "NPM_MAX_RESPONSE_BYTES", 1000)
+        _, failed = c.lookup_registry(
+            _keys("a", "b", "c", "d"), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=1, byte_budget=2500
+        )
+    assert failed[("npm", "a", "1.0.0")] == c.LOOKUP_RESPONSE_TOO_LARGE
+    assert failed[("npm", "b", "1.0.0")] == c.LOOKUP_RESPONSE_TOO_LARGE
+    assert failed[("npm", "c", "1.0.0")] == c.LOOKUP_BYTES_BUDGET
+    assert failed[("npm", "d", "1.0.0")] == c.LOOKUP_BYTES_BUDGET
+
+
 def test_bad_encoding_has_its_own_reason():
     def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
         raise deps.ResponseEncodingError("x: unsupported Content-Encoding")

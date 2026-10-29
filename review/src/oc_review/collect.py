@@ -716,10 +716,20 @@ def lookup_registry(
                 raise _BytesSpent("download byte budget exceeded")
             grant = min(max_bytes, room)
             reserved += grant
-        got = grant  # a failed fetch keeps its whole reservation
+        # Bytes that count against the budget. A fetch that fails before a
+        # body arrives (timeout, network error, 5xx) downloaded nothing that
+        # counts, so it keeps none of its reservation. A response that was
+        # read past its cap, or a body that did not decode, was a real
+        # download: it keeps the whole reservation.
+        got = 0
         try:
             result = fetch(url, grant, min(timeout, left))
             got = len(result.body)
+        except (deps.ResponseTooLargeError, deps.ResponseEncodingError) as exc:
+            got = grant
+            if grant < max_bytes and isinstance(exc, deps.ResponseTooLargeError):
+                raise _BytesSpent("download byte budget exceeded") from exc
+            raise
         finally:
             with state:
                 reserved -= grant - got
