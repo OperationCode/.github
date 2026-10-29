@@ -1192,8 +1192,10 @@ def _sized_packument(name: str, size: int) -> bytes:
 
 
 def test_npm_cap_fits_the_largest_measured_sized_packument():
-    # vite on 2026-10-29: 38,999,531 bytes; the cap keeps 2x headroom (K-18).
+    # vite on 2026-10-29: 38,999,531 bytes; renovate about 74 MB. The cap keeps
+    # about 1.7x headroom over renovate (K-18, K-19).
     assert deps.NPM_MAX_RESPONSE_BYTES >= 2 * 38_999_531
+    assert deps.NPM_MAX_RESPONSE_BYTES >= int(1.7 * 74_000_000)
 
 
 def test_packument_just_under_and_over_the_cap_through_the_default_fetch_path():
@@ -1219,7 +1221,7 @@ def test_byte_budget_fails_closed_with_its_own_reason():
     def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
         return deps.FetchResult(200, body.replace(b'"a"', b'"%s"' % url.rsplit("/", 1)[1].encode(), 1), url)
 
-    # 2500 bytes: the cap reservation (80 MiB) is cut to what is left, and
+    # 2500 bytes: the cap reservation (the cap) is cut to what is left, and
     # the third response does not fit.
     registry, failed = c.lookup_registry(
         _keys("a", "b", "c"), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=1, byte_budget=2500
@@ -1246,16 +1248,25 @@ def test_response_over_the_cap_is_not_a_byte_budget_failure():
     assert failed == {("npm", "a", "1.0.0"): c.LOOKUP_RESPONSE_TOO_LARGE}
 
 
+def test_bad_encoding_has_its_own_reason():
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        raise deps.ResponseEncodingError("x: unsupported Content-Encoding")
+
+    _, failed = c.lookup_registry(_keys("a"), fetch=fetch, sleep=_no_sleep, clock=FakeClock())
+    assert failed == {("npm", "a", "1.0.0"): c.LOOKUP_BAD_ENCODING}
+
+
 def test_reason_order_puts_run_limits_before_the_size_cap():
     assert c._LOOKUP_REASON_ORDER == (
         c.LOOKUP_BUDGET_EXCEEDED,
         c.LOOKUP_COUNT_CAP,
         c.LOOKUP_BYTES_BUDGET,
         c.LOOKUP_RESPONSE_TOO_LARGE,
+        c.LOOKUP_BAD_ENCODING,
         c.LOOKUP_FAILED,
     )
-    reasons = {c.LOOKUP_BUDGET_EXCEEDED, c.LOOKUP_COUNT_CAP, c.LOOKUP_BYTES_BUDGET, c.LOOKUP_RESPONSE_TOO_LARGE, c.LOOKUP_FAILED}
-    assert len(reasons) == 5 and all(r.startswith(c.LOOKUP_FAILED) for r in reasons)
+    reasons = set(c._LOOKUP_REASON_ORDER)
+    assert len(reasons) == 6 and all(r.startswith(c.LOOKUP_FAILED) for r in reasons)
 
 
 def test_failed_lookup_is_logged_with_class_and_reason_but_no_body(capsys):
@@ -1573,3 +1584,44 @@ def test_hung_lookup_does_not_hold_the_process_open(tmp_path):
     assert json.loads(proc.stdout) == [{"path": "package-lock.json", "reason": c.LOOKUP_BUDGET_EXCEEDED}]
     data = (tmp_path / c.BUNDLE_FILE_NAME).read_bytes()
     envelope.validate_envelope(envelope.parse_json(data))
+
+
+def test_byte_budget_counts_decoded_bytes_of_gzip_responses():
+    import gzip
+
+    body = _sized_packument("a", 4000)
+    assert len(gzip.compress(body)) < 1000  # the encoded size is far below the decoded size
+
+    class Resp:
+        status = 200
+        url = "https://registry.npmjs.org/a"
+        headers = {"Content-Encoding": "gzip"}
+
+        def __init__(self, url):
+            self.url = url
+            named = body.replace(b'"a"', b'"%s"' % url.rsplit("/", 1)[1].encode(), 1)
+            self.chunks = [gzip.compress(named)]
+
+        def read(self, n):
+            return self.chunks.pop(0) if self.chunks else b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class Opener:
+        def open(self, request, timeout):
+            return Resp(request.full_url)
+
+    def fetch(url, max_bytes, timeout):
+        return deps.default_fetch(url, max_bytes, timeout, opener=Opener())
+
+    # Decoded size 4000 each: a 9000 byte budget fits two, not three, even
+    # though three encoded bodies would fit easily.
+    registry, failed = c.lookup_registry(
+        _keys("a", "b", "c"), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=1, byte_budget=9000
+    )
+    assert len(registry) + len(failed) == 3
+    assert list(failed.values()) == [c.LOOKUP_BYTES_BUDGET]

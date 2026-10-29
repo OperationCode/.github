@@ -90,10 +90,10 @@ REGISTRY_LOOKUP_CONCURRENCY = 8
 REGISTRY_LOOKUP_BUDGET_SECONDS = 240.0
 # Unique keys looked up per run; past the cap a key fails without a lookup.
 MAX_REGISTRY_LOOKUPS = 3000
-# Response bytes for all lookups of a run (K-18). Each fetch reserves its cap
+# Decoded response bytes for all lookups of a run (K-18, K-19). Each fetch reserves its cap
 # (or what is left) before it starts, so reserved plus received bytes never
 # pass this. It bounds download volume; memory per worker is bounded by the
-# per-response cap (a parsed packument is about 10x its body).
+# per-response cap (a parsed packument is about 6.4x its body).
 MAX_REGISTRY_BYTES = 1024 * 1024 * 1024
 # Fixed failure reasons ("incomplete dependency data"), in the order a file
 # with several picks its one reason.
@@ -101,12 +101,14 @@ LOOKUP_BUDGET_EXCEEDED = "registry lookup failed: lookup time budget exceeded"
 LOOKUP_COUNT_CAP = "registry lookup failed: over the lookup count cap"
 LOOKUP_BYTES_BUDGET = "registry lookup failed: over the download byte budget"
 LOOKUP_RESPONSE_TOO_LARGE = "registry lookup failed: response over the size cap"
+LOOKUP_BAD_ENCODING = "registry lookup failed: unsupported or corrupt response encoding"
 LOOKUP_FAILED = "registry lookup failed"
 _LOOKUP_REASON_ORDER = (
     LOOKUP_BUDGET_EXCEEDED,
     LOOKUP_COUNT_CAP,
     LOOKUP_BYTES_BUDGET,
     LOOKUP_RESPONSE_TOO_LARGE,
+    LOOKUP_BAD_ENCODING,
     LOOKUP_FAILED,
 )
 
@@ -760,6 +762,9 @@ def lookup_registry(
             except deps.ResponseTooLargeError as exc:
                 _log_lookup_failure(key, exc)
                 result = LOOKUP_RESPONSE_TOO_LARGE
+            except deps.ResponseEncodingError as exc:
+                _log_lookup_failure(key, exc)
+                result = LOOKUP_BAD_ENCODING
             except Exception as exc:  # noqa: BLE001 - any error is a failed lookup, never a lost bundle
                 _log_lookup_failure(key, exc)
                 result = LOOKUP_FAILED
