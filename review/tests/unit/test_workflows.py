@@ -685,6 +685,14 @@ def test_only_eval_yml_uses_the_eval_environment():
     assert users == [(EVAL, "fixture-evals")]
 
 
+def test_eval_upload_step_always_runs_and_keeps_data_out():
+    [step] = [s for j in jobs(load_workflow(WORKFLOWS / EVAL).doc).values() for s in steps(j)
+              if UPLOAD in str(s.get("uses", ""))]
+    assert step["if"] == "always()"
+    assert int(step["with"]["retention-days"]) > 0
+    assert "data/" not in step["with"]["path"]
+
+
 def run_publish_script(script: str, tmp_path: Path, publish_exit: int) -> tuple[int, str]:
     """Run a publish script as the runner does (`bash -e`), with a stub `uv`
     that records its arguments and exits with `publish_exit`. No network."""

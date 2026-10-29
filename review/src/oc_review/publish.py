@@ -1362,7 +1362,7 @@ def _callout(result: verdict.GateResult, rows: list[_Row], hard: list[_Row], has
             return "\n".join(f"> {x}" for x in ("[!NOTE]", *lines))
         else:
             lines = ["**No findings. This review found no reason to block.** Nothing to do for this review."]
-        lines.append("The merge box shows whether the other required checks pass. This bot never approves a PR.")
+        lines.append("The merge box shows whether the other required checks pass.")
         return "\n".join(f"> {x}" for x in ("[!TIP]", *lines))
 
     blocking = [r for r in model if r.effect != EFFECT_NONE]
@@ -1879,6 +1879,8 @@ def _overflow_body(ctx: PublishContext, result: verdict.GateResult) -> str:
             flag = "✅ yes" if verdict.WAIVABLE[code] else "🚫 no"
             lines.append(_row(_reason_label(code), flag, f"{counts[code]} reason(s)"))
     lines.append(f"\n{len(result.valid_overrides)} valid override(s).")
+    # The full record body is a separate surface from the pass comment, so its
+    # "never approves" sentence is intended.
     lines.append(f"\n<sub>Run [{ctx.run_id}, attempt {ctx.run_attempt}]({ctx.run_url}). "
                  "The required workflow in the merge box is the result that counts. This bot never approves a PR.</sub>")
     return "\n".join(lines)
