@@ -179,6 +179,12 @@ def run(repo: str, head: str, base: str) -> int:
         print(f"\n{kind}: {len(checks)}")
         for (cid, detail), n in sorted(counts.items()):
             print(f"  {n:4d}  {cid}: {detail}")
+            subjects = sorted({f"{c.file}: {c.subject}" if c.subject else str(c.file)
+                               for c in checks if (c.id, c.detail) == (cid, detail)})
+            for s in subjects[:20]:
+                print(f"          {s!r}")
+            if len(subjects) > 20:
+                print(f"          ... {len(subjects) - 20} more")
     return 0
 
 
