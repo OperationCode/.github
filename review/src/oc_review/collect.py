@@ -90,11 +90,15 @@ REGISTRY_LOOKUP_CONCURRENCY = 8
 REGISTRY_LOOKUP_BUDGET_SECONDS = 240.0
 # Unique keys looked up per run; past the cap a key fails without a lookup.
 MAX_REGISTRY_LOOKUPS = 3000
-# Decoded response bytes for all lookups of a run (K-18, K-19). Each fetch reserves its cap
-# (or what is left) before it starts, so reserved plus received bytes never
-# pass this. It bounds download volume; memory per worker is bounded by the
-# per-response cap (a parsed packument is about 6.4x its body).
-MAX_REGISTRY_BYTES = 1024 * 1024 * 1024
+# Decoded response bytes for all lookups of a run (K-18, K-19, K-20). Only
+# bytes received count: a fetch starts only while fewer than this have
+# arrived, so a run can pass it by at most the fetches in flight, each at most
+# its response cap (8 x 128 MiB). It is a backstop on download volume: memory
+# is bounded per response by the cap (a parsed packument is about 6.4x its
+# body) and time by the lookup time budget, which binds first at the observed
+# rate (about 64 MB/s decoded, so about 15 GB in 240 s). 8 GiB is about 14x
+# the largest measured legitimate run (front-end PR 2027, 578 MB decoded).
+MAX_REGISTRY_BYTES = 8 * 1024 * 1024 * 1024
 # Fixed failure reasons ("incomplete dependency data"), in the order a file
 # with several picks its one reason.
 LOOKUP_BUDGET_EXCEEDED = "registry lookup failed: lookup time budget exceeded"
@@ -682,7 +686,10 @@ def lookup_registry(
     the deadline fails. Any error in a lookup fails that key only, with a
     reason that tells a response over its size cap, and a run past its
     `byte_budget` download budget, from other failures (K-18); each failure
-    is logged with its exception class.
+    is logged with its exception class. Only bytes received count against
+    `byte_budget`, including the part of a body a failed fetch read (K-21):
+    no fetch starts once they reach it, and the fetches in flight may pass it
+    by at most `concurrency` response caps (K-20).
 
     Collect does not wait for a lookup past the deadline. The workers are
     daemon threads, so a hung lookup also does not hold the process open
@@ -700,41 +707,40 @@ def lookup_registry(
     results: dict[RegistryKey, deps.RegistryInfo | str] = {}
     finished = 0  # groups whose worker is done with them
     closed = False  # set at the deadline or when all groups finish
-    reserved = 0  # response bytes received or reserved by fetches in flight
+    received = 0  # decoded response bytes of finished fetches
 
     def remaining() -> float:
         return deadline - clock()
 
     def bounded_fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
-        nonlocal reserved
+        nonlocal received
         left = remaining()
         if left <= 0:
             raise _BudgetSpent("lookup time budget exceeded")
+        # No reservation (K-20): a fetch starts with its full cap while fewer
+        # than `byte_budget` bytes have arrived, so a refusal means the
+        # budget is really spent, never that fetches in flight hold it.
         with state:
-            room = byte_budget - reserved
-            if room <= 0:
+            if received >= byte_budget:
                 raise _BytesSpent("download byte budget exceeded")
-            grant = min(max_bytes, room)
-            reserved += grant
-        # Bytes that count against the budget. A fetch that fails before a
-        # body arrives (timeout, network error, 5xx) downloaded nothing that
-        # counts, so it keeps none of its reservation. A response that was
-        # read past its cap, or a body that did not decode, was a real
-        # download: it keeps the whole reservation.
+        # Bytes that count against the budget, once per attempt. A fetch that
+        # fails before a body arrives (5xx, refused connection) counts 0; one
+        # that fails after part of a body (reset, timeout) counts what it
+        # read (K-21). A response that was read past its cap, or a body that
+        # did not decode, was a real download: it counts as its cap.
         got = 0
         try:
-            result = fetch(url, grant, min(timeout, left))
+            result = fetch(url, max_bytes, min(timeout, left))
             got = len(result.body)
-        except (deps.ResponseTooLargeError, deps.ResponseEncodingError) as exc:
-            got = grant
-            if grant < max_bytes and isinstance(exc, deps.ResponseTooLargeError):
-                raise _BytesSpent("download byte budget exceeded") from exc
+        except (deps.ResponseTooLargeError, deps.ResponseEncodingError):
+            got = max_bytes
+            raise
+        except Exception as exc:
+            got = deps.received_bytes(exc)
             raise
         finally:
             with state:
-                reserved -= grant - got
-        if grant < max_bytes and got > grant:
-            raise _BytesSpent("download byte budget exceeded")
+                received += got
         return result
 
     def bounded_sleep(seconds: float) -> None:

@@ -57,6 +57,9 @@ PYPI_OFFICIAL_HOSTS = frozenset({"pypi.org", "files.pythonhosted.org"})
 # checks alike: the four install scripts, plus the three npm also runs on
 # install.
 NPM_LIFECYCLE_SCRIPTS = ("preinstall", "install", "postinstall", "prepare", "preprepare", "postprepare", "prepublish")
+# A lookup keeps at most this many characters of each registry lifecycle
+# script, so the results of a run stay small whatever the byte budget (K-21).
+NPM_SCRIPT_TEXT_CHARS = 1000
 
 FAMILIES = (
     "package.json",
@@ -1481,8 +1484,25 @@ class FetchResult:
 
 
 # fetch(url, max_bytes, timeout_seconds) -> FetchResult. It raises OSError,
-# TimeoutError or http.client.HTTPException on a network failure.
+# TimeoutError or http.client.HTTPException on a network failure. A failure
+# after part of the body arrived sets `received_bytes` on the exception to the
+# decoded bytes read (K-21).
 Fetcher = Callable[[str, int, float], FetchResult]
+
+
+def received_bytes(exc: BaseException) -> int:
+    """Decoded body bytes a fetch read before it raised `exc`; 0 when the
+    fetcher did not set them."""
+    value = getattr(exc, "received_bytes", 0)
+    return value if isinstance(value, int) and value > 0 else 0
+
+
+def _with_received(exc: BaseException, size: int) -> BaseException:
+    try:
+        exc.received_bytes = size  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    return exc
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1511,6 +1531,7 @@ def default_fetch(
         headers={"Accept": "application/json", "Accept-Encoding": "gzip", "User-Agent": "oc-claude-review"},
     )
     deadline = clock() + timeout
+    size = 0  # decoded bytes; a failure reports them as `received_bytes`
     try:
         with opener.open(request, timeout=timeout) as resp:
             encoding = (resp.headers.get("Content-Encoding") or "identity").strip().lower()
@@ -1519,7 +1540,6 @@ def default_fetch(
             # 31 = gzip wrapper only (no zlib or raw deflate).
             inflater = zlib.decompressobj(31) if encoding != "identity" else None
             chunks: list[bytes] = []
-            size = 0  # decoded bytes
             wire = 0  # encoded bytes
             while size <= max_bytes:
                 if clock() > deadline:
@@ -1554,7 +1574,9 @@ def default_fetch(
     except urllib.error.HTTPError as exc:
         return FetchResult(status=exc.code, body=b"", url=url)
     except http.client.HTTPException as exc:
-        raise OSError(f"{url}: {type(exc).__name__}: {exc}") from exc
+        raise _with_received(OSError(f"{url}: {type(exc).__name__}: {exc}"), size) from exc
+    except Exception as exc:
+        raise _with_received(exc, size)
 
 
 @dataclass(frozen=True)
@@ -1653,9 +1675,13 @@ def lookup_npm(
     found = {}
     for key in NPM_LIFECYCLE_SCRIPTS:
         if key in scripts:
-            if not isinstance(scripts[key], str):
+            text = scripts[key]
+            if not isinstance(text, str):
                 raise RegistryError(f"{url}: script {key} is not a string")
-            found[key] = scripts[key]
+            if len(text) > NPM_SCRIPT_TEXT_CHARS:
+                cut = len(text) - NPM_SCRIPT_TEXT_CHARS
+                text = f"{text[:NPM_SCRIPT_TEXT_CHARS]} ... [{cut} more characters cut]"
+            found[key] = text
     return RegistryInfo(
         ecosystem="npm",
         name=name,

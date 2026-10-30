@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -1182,6 +1183,14 @@ def test_lookup_limit_constants():
     assert c.REGISTRY_LOOKUP_BUDGET_SECONDS <= 600 * 0.4
 
 
+def test_byte_budget_constant():
+    # K-20: between 4 and 8 GiB decoded, well over the 578 MB of front-end PR
+    # 2027, and more than the bytes 8 workers can have in flight at their cap.
+    assert 4 * 1024**3 <= c.MAX_REGISTRY_BYTES <= 8 * 1024**3
+    assert c.MAX_REGISTRY_BYTES >= 10 * 577_600_000
+    assert c.MAX_REGISTRY_BYTES > c.REGISTRY_LOOKUP_CONCURRENCY * deps.NPM_MAX_RESPONSE_BYTES
+
+
 def _sized_packument(name: str, size: int) -> bytes:
     doc = {"name": name, "time": {"1.0.0": "2026-01-01T00:00:00Z"}, "versions": {"1.0.0": {}}, "pad": ""}
     pad = size - len(json.dumps(doc).encode())
@@ -1221,13 +1230,13 @@ def test_byte_budget_fails_closed_with_its_own_reason():
     def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
         return deps.FetchResult(200, body.replace(b'"a"', b'"%s"' % url.rsplit("/", 1)[1].encode(), 1), url)
 
-    # 2500 bytes: the cap reservation (the cap) is cut to what is left, and
-    # the third response does not fit.
+    # 2500 bytes: the third fetch starts with 2000 received and may pass the
+    # budget (K-20); the fourth starts with 3000 received and is refused.
     registry, failed = c.lookup_registry(
-        _keys("a", "b", "c"), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=1, byte_budget=2500
+        _keys("a", "b", "c", "d"), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=1, byte_budget=2500
     )
-    assert sorted(k[1] for k in registry) == ["a", "b"]
-    assert failed == {("npm", "c", "1.0.0"): c.LOOKUP_BYTES_BUDGET}
+    assert sorted(k[1] for k in registry) == ["a", "b", "c"]
+    assert failed == {("npm", "d", "1.0.0"): c.LOOKUP_BYTES_BUDGET}
 
 
 def test_byte_budget_spent_before_a_fetch_starts():
@@ -1272,10 +1281,9 @@ def test_oversize_downloads_still_spend_the_byte_budget():
     def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
         raise deps.ResponseTooLargeError(f"{url}: response is over the {max_bytes} byte cap")
 
-    # Budget 2500, grant 1000 per call (cap patched): the real oversize
-    # downloads keep their reservations, so the third key finds the budget
-    # cut and gets the byte-budget reason; near the budget an over-grant
-    # response is a byte-budget failure, not a cap failure (M1).
+    # Budget 2500, cap 1000 (patched): each oversize download counts as its
+    # cap, so after three of them the fourth key finds the budget spent and
+    # gets the byte-budget reason, with no fetch.
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(deps, "NPM_MAX_RESPONSE_BYTES", 1000)
         _, failed = c.lookup_registry(
@@ -1283,8 +1291,231 @@ def test_oversize_downloads_still_spend_the_byte_budget():
         )
     assert failed[("npm", "a", "1.0.0")] == c.LOOKUP_RESPONSE_TOO_LARGE
     assert failed[("npm", "b", "1.0.0")] == c.LOOKUP_RESPONSE_TOO_LARGE
-    assert failed[("npm", "c", "1.0.0")] == c.LOOKUP_BYTES_BUDGET
+    assert failed[("npm", "c", "1.0.0")] == c.LOOKUP_RESPONSE_TOO_LARGE
     assert failed[("npm", "d", "1.0.0")] == c.LOOKUP_BYTES_BUDGET
+
+
+class _ResetOpener:
+    """An opener for default_fetch: each response sends `sent` bytes, then
+    the connection resets. With `sent` None, the connection fails before any
+    body arrives. Records each URL opened."""
+
+    def __init__(self, sent: int | None) -> None:
+        self.sent = sent
+        self.opened: list[str] = []
+
+    def open(self, request, timeout):
+        self.opened.append(request.full_url)
+        if self.sent is None:
+            raise ConnectionRefusedError("connection refused")
+        chunks = [b"x" * self.sent]
+
+        class Resp:
+            status = 200
+            url = request.full_url
+            headers: dict = {}
+
+            def read(self, n):
+                if not chunks:
+                    raise ConnectionResetError("connection reset by peer")
+                return chunks.pop()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return Resp()
+
+
+def test_partial_reads_that_fail_spend_the_byte_budget():
+    # K-21: each attempt of "a" reads 100 bytes, then the connection resets.
+    # Its three attempts count 300 bytes, past the 250 byte budget, so "a"
+    # keeps the generic reason and "b" gets the byte-budget reason, with no
+    # fetch. Before K-21 the partial bytes counted 0 and "b" was fetched.
+    opener = _ResetOpener(100)
+
+    def fetch(url, max_bytes, timeout):
+        return deps.default_fetch(url, max_bytes, timeout, opener=opener)
+
+    registry, failed = c.lookup_registry(
+        _keys("a", "b"), fetch=fetch, sleep=lambda s: None, clock=FakeClock(), concurrency=1, byte_budget=250
+    )
+    assert registry == {}
+    assert failed == {("npm", "a", "1.0.0"): c.LOOKUP_FAILED, ("npm", "b", "1.0.0"): c.LOOKUP_BYTES_BUDGET}
+    assert opener.opened == ["https://registry.npmjs.org/a"] * 3
+
+
+def test_a_failure_before_any_body_spends_no_bytes():
+    opener = _ResetOpener(None)
+
+    def fetch(url, max_bytes, timeout):
+        return deps.default_fetch(url, max_bytes, timeout, opener=opener)
+
+    _, failed = c.lookup_registry(
+        _keys("a", "b"), fetch=fetch, sleep=lambda s: None, clock=FakeClock(), concurrency=1, byte_budget=1
+    )
+    assert set(failed.values()) == {c.LOOKUP_FAILED}
+    assert len(opener.opened) == 6
+
+
+def test_registry_results_keep_bounded_script_text():
+    # K-21: lifecycle scripts of 1 MB each, in 20 packages that run in
+    # several successive groups. Each result keeps at most
+    # NPM_SCRIPT_TEXT_CHARS of each script, so the results and the bundle
+    # do not grow with the response sizes; every script name, the signal
+    # and the start of each script stay.
+    big = "node setup.js && " + "x" * 1_000_000
+    names = _names(20)
+    lock = json.dumps({
+        "name": "x", "lockfileVersion": 3, "requires": True,
+        "packages": {
+            "": {"name": "x", "dependencies": {n: "1.0.0" for n in names}},
+            **{
+                f"node_modules/{n}": {"version": "1.0.0", "resolved": f"https://registry.npmjs.org/{n}/-/{n}-1.0.0.tgz"}
+                for n in names
+            },
+        },
+    })
+    fx = _snapshot({}, {"package-lock.json": ("100644", lock)})
+    fx["registry"] = {
+        f"https://registry.npmjs.org/{n}": {"status": 200, "json": {
+            "name": n,
+            "time": {"1.0.0": "2018-01-01T00:00:00.000Z"},
+            "versions": {"1.0.0": {"name": n, "scripts": {"postinstall": big, "prepare": "tsc", "test": big}}},
+        }}
+        for n in names
+    }
+    col, _, _ = run(fx)
+    changes = col.envelope["payload"]["dependency_delta"]["changes"]
+    assert len(changes) == 20
+    limit = deps.NPM_SCRIPT_TEXT_CHARS + 50
+    for ch in changes:
+        scripts = ch["registry"]["install_scripts"]
+        assert set(scripts) == {"postinstall", "prepare"}
+        assert scripts["prepare"] == "tsc"
+        assert scripts["postinstall"].startswith("node setup.js && xxx")
+        assert len(scripts["postinstall"]) <= limit
+    assert len(col.data) < 20 * 2 * limit + 100_000
+    signals = col.envelope["payload"]["prefilter"]["signals"]
+    details = [s["detail"] for s in signals if s["id"] == prefilter.INSTALL_SCRIPT_DEP]
+    assert details == ["registry manifest has install scripts: postinstall, prepare"] * 20
+    assert col.envelope["payload"]["prefilter"]["hard_blocks"] == []
+
+
+def _named_fetch(size: int, gate: Callable[[int], None] = lambda n: None):
+    """A fetch that returns a packument of `size` bytes for every name, after
+    `gate(call number)` returns, and records the most fetches in flight."""
+    body = _sized_packument("a", size)
+    lock = threading.Lock()
+    stats = {"in_flight": 0, "peak": 0, "calls": 0}
+
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        with lock:
+            stats["in_flight"] += 1
+            stats["calls"] += 1
+            stats["peak"] = max(stats["peak"], stats["in_flight"])
+            n = stats["calls"]
+        try:
+            gate(n)
+            return deps.FetchResult(200, body.replace(b'"a"', b'"%s"' % url.rsplit("/", 1)[1].encode(), 1), url)
+        finally:
+            with lock:
+                stats["in_flight"] -= 1
+
+    return fetch, stats
+
+
+def _names(n: int) -> list[str]:
+    return [f"p{i:03d}" for i in range(n)]
+
+
+def _first_8_together(barrier: threading.Barrier) -> Callable[[int], None]:
+    def gate(n: int) -> None:
+        if n <= 8:
+            barrier.wait(timeout=5)
+
+    return gate
+
+
+def test_concurrent_large_fetches_under_the_budget_all_succeed():
+    # 8 fetches near the cap are in flight at once and together need less
+    # than the budget, but less than 8 caps. Reserving the cap up front
+    # refused the 6th and failed it (pilot, front-end PR 2027).
+    fetch, stats = _named_fetch(900, _first_8_together(threading.Barrier(8)))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(deps, "NPM_MAX_RESPONSE_BYTES", 1000)
+        registry, failed = c.lookup_registry(
+            _keys(*_names(8)), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=8, byte_budget=7500
+        )
+    assert failed == {}
+    assert len(registry) == 8 and stats["peak"] == 8
+
+
+def test_a_busy_budget_does_not_cascade_through_the_queue():
+    # 40 small keys need 4,000 of 5,000 bytes. The first 8 fetches are in
+    # flight together, so 8 caps (8,000) would pass the budget: with a
+    # reservation the 6th worker was refused at once and then failed every
+    # queued key in a row (pilot: the last 42 names within 25 ms). Only
+    # bytes received count, so nothing is refused and every key succeeds.
+    fetch, stats = _named_fetch(100, _first_8_together(threading.Barrier(8)))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(deps, "NPM_MAX_RESPONSE_BYTES", 1000)
+        registry, failed = c.lookup_registry(
+            _keys(*_names(40)), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=8, byte_budget=5000
+        )
+    assert failed == {}
+    assert len(registry) == 40 and stats["calls"] == 40 and stats["peak"] == 8
+
+
+def test_budget_exceeded_fails_only_keys_after_the_limit_with_bounded_overshoot():
+    # Budget 1 byte: the first fetch of each worker starts with nothing
+    # received, so 8 fetches run and finish (overshoot at most 8 caps); every
+    # later key fails closed with the budget reason, and none starts a fetch.
+    fetch, stats = _named_fetch(900, _first_8_together(threading.Barrier(8)))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(deps, "NPM_MAX_RESPONSE_BYTES", 1000)
+        registry, failed = c.lookup_registry(
+            _keys(*_names(30)), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=8, byte_budget=1
+        )
+    assert len(registry) == 8 and stats["calls"] == 8
+    assert stats["calls"] * 900 <= 1 + 8 * 1000  # received stays within budget + concurrency x cap
+    assert len(failed) == 22 and set(failed.values()) == {c.LOOKUP_BYTES_BUDGET}
+
+
+def test_gzip_bomb_through_lookup_fails_closed_with_the_cap_reason():
+    import gzip
+
+    bomb = gzip.compress(b"\0" * 5_000_000)
+
+    class Resp:
+        status = 200
+        headers = {"Content-Encoding": "gzip"}
+
+        def __init__(self, url):
+            self.url, self.chunks = url, [bomb]
+
+        def read(self, n):
+            return self.chunks.pop(0) if self.chunks else b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class Opener:
+        def open(self, request, timeout):
+            return Resp(request.full_url)
+
+    def fetch(url, max_bytes, timeout):
+        return deps.default_fetch(url, max_bytes, timeout, opener=Opener())
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(deps, "NPM_MAX_RESPONSE_BYTES", 100_000)
+        registry, failed = c.lookup_registry(_keys("a"), fetch=fetch, sleep=_no_sleep, clock=FakeClock())
+    assert registry == {} and failed == {("npm", "a", "1.0.0"): c.LOOKUP_RESPONSE_TOO_LARGE}
 
 
 def test_bad_encoding_has_its_own_reason():
@@ -1657,10 +1888,11 @@ def test_byte_budget_counts_decoded_bytes_of_gzip_responses():
     def fetch(url, max_bytes, timeout):
         return deps.default_fetch(url, max_bytes, timeout, opener=Opener())
 
-    # Decoded size 4000 each: a 9000 byte budget fits two, not three, even
-    # though three encoded bodies would fit easily.
+    # Decoded size 4000 each: after two, 8000 decoded bytes have arrived, so
+    # an 8000 byte budget refuses the third, even though three encoded bodies
+    # would fit easily.
     registry, failed = c.lookup_registry(
-        _keys("a", "b", "c"), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=1, byte_budget=9000
+        _keys("a", "b", "c"), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=1, byte_budget=8000
     )
     assert len(registry) + len(failed) == 3
     assert list(failed.values()) == [c.LOOKUP_BYTES_BUDGET]
