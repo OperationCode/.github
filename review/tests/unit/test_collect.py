@@ -1074,11 +1074,11 @@ def test_lockfile_migration_over_a_lookup_cap_is_a_hard_block(monkeypatch):
     monkeypatch.setattr(deps, "NPM_MAX_RESPONSE_BYTES", 2048)
     col, _, _ = run(_migration(registry=big))
     assert _dep_blocks(col) == {
-        ("package-lock.json", "dependency data incomplete: registry lookup failed"),
+        ("package-lock.json", "dependency data incomplete: registry lookup failed: response over the size cap"),
         ("package-lock.json", "no registry data for a new version"),
     }
     assert col.envelope["payload"]["dependency_delta"]["failures"] == [
-        {"path": "package-lock.json", "reason": "registry lookup failed"}
+        {"path": "package-lock.json", "reason": c.LOOKUP_RESPONSE_TOO_LARGE}
     ]
 
 
@@ -1180,6 +1180,157 @@ def test_lookup_limit_constants():
     assert c.REGISTRY_LOOKUP_BUDGET_SECONDS == 240.0
     assert c.MAX_REGISTRY_LOOKUPS == 3000
     assert c.REGISTRY_LOOKUP_BUDGET_SECONDS <= 600 * 0.4
+
+
+def _sized_packument(name: str, size: int) -> bytes:
+    doc = {"name": name, "time": {"1.0.0": "2026-01-01T00:00:00Z"}, "versions": {"1.0.0": {}}, "pad": ""}
+    pad = size - len(json.dumps(doc).encode())
+    doc["pad"] = "x" * pad
+    body = json.dumps(doc).encode()
+    assert len(body) == size
+    return body
+
+
+def test_npm_cap_fits_the_largest_measured_sized_packument():
+    # vite on 2026-10-29: 38,999,531 bytes; renovate about 74 MB. The cap keeps
+    # about 1.7x headroom over renovate (K-18, K-19).
+    assert deps.NPM_MAX_RESPONSE_BYTES >= 2 * 38_999_531
+    assert deps.NPM_MAX_RESPONSE_BYTES >= int(1.7 * 74_000_000)
+
+
+def test_packument_just_under_and_over_the_cap_through_the_default_fetch_path():
+    cap = 4096
+
+    def fetch_of(size: int):
+        def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+            # What default_fetch does: read at most max_bytes + 1.
+            return deps.FetchResult(200, _sized_packument("a", size)[: max_bytes + 1] if size > max_bytes else _sized_packument("a", size), url)
+        return fetch
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(deps, "NPM_MAX_RESPONSE_BYTES", cap)
+        registry, failed = c.lookup_registry(_keys("a"), fetch=fetch_of(cap), sleep=_no_sleep, clock=FakeClock())
+        assert failed == {} and list(registry) == _keys("a")
+        registry, failed = c.lookup_registry(_keys("a"), fetch=fetch_of(cap + 1), sleep=_no_sleep, clock=FakeClock())
+        assert registry == {} and failed == {("npm", "a", "1.0.0"): c.LOOKUP_RESPONSE_TOO_LARGE}
+
+
+def test_byte_budget_fails_closed_with_its_own_reason():
+    body = _sized_packument("a", 1000)
+
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        return deps.FetchResult(200, body.replace(b'"a"', b'"%s"' % url.rsplit("/", 1)[1].encode(), 1), url)
+
+    # 2500 bytes: the cap reservation (the cap) is cut to what is left, and
+    # the third response does not fit.
+    registry, failed = c.lookup_registry(
+        _keys("a", "b", "c"), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=1, byte_budget=2500
+    )
+    assert sorted(k[1] for k in registry) == ["a", "b"]
+    assert failed == {("npm", "c", "1.0.0"): c.LOOKUP_BYTES_BUDGET}
+
+
+def test_byte_budget_spent_before_a_fetch_starts():
+    fetch = CountingFetch()
+    registry, failed = c.lookup_registry(
+        _keys("a"), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), byte_budget=0
+    )
+    assert registry == {} and failed == {("npm", "a", "1.0.0"): c.LOOKUP_BYTES_BUDGET}
+    assert fetch.calls == []
+
+
+def test_response_over_the_cap_is_not_a_byte_budget_failure():
+    # Budget left is more than the cap: the cap reason applies.
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        return deps.FetchResult(200, b"x" * (max_bytes + 1), url)
+
+    _, failed = c.lookup_registry(_keys("a"), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), byte_budget=10**9)
+    assert failed == {("npm", "a", "1.0.0"): c.LOOKUP_RESPONSE_TOO_LARGE}
+
+
+def test_failed_fetches_do_not_spend_the_byte_budget():
+    body = _sized_packument("a", 1000)
+    state = {"fail": True}
+
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        if state["fail"] and not url.endswith("/z"):
+            raise TimeoutError("registry blip")
+        return deps.FetchResult(200, body.replace(b'"a"', b'"%s"' % url.rsplit("/", 1)[1].encode(), 1), url)
+
+    # Many failing attempts (3 per key) would spend 5000 bytes at the cap
+    # each if reservations stayed; the later valid lookup must still fit.
+    registry, failed = c.lookup_registry(
+        _keys("a", "b", "c", "d", "e", "f", "z"),
+        fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=1, byte_budget=5000,
+    )
+    assert list(registry) == _keys("z")
+    assert set(failed.values()) == {c.LOOKUP_FAILED}
+    assert len(failed) == 6
+
+
+def test_oversize_downloads_still_spend_the_byte_budget():
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        raise deps.ResponseTooLargeError(f"{url}: response is over the {max_bytes} byte cap")
+
+    # Budget 2500, grant 1000 per call (cap patched): the real oversize
+    # downloads keep their reservations, so the third key finds the budget
+    # cut and gets the byte-budget reason; near the budget an over-grant
+    # response is a byte-budget failure, not a cap failure (M1).
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(deps, "NPM_MAX_RESPONSE_BYTES", 1000)
+        _, failed = c.lookup_registry(
+            _keys("a", "b", "c", "d"), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=1, byte_budget=2500
+        )
+    assert failed[("npm", "a", "1.0.0")] == c.LOOKUP_RESPONSE_TOO_LARGE
+    assert failed[("npm", "b", "1.0.0")] == c.LOOKUP_RESPONSE_TOO_LARGE
+    assert failed[("npm", "c", "1.0.0")] == c.LOOKUP_BYTES_BUDGET
+    assert failed[("npm", "d", "1.0.0")] == c.LOOKUP_BYTES_BUDGET
+
+
+def test_bad_encoding_has_its_own_reason():
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        raise deps.ResponseEncodingError("x: unsupported Content-Encoding")
+
+    _, failed = c.lookup_registry(_keys("a"), fetch=fetch, sleep=_no_sleep, clock=FakeClock())
+    assert failed == {("npm", "a", "1.0.0"): c.LOOKUP_BAD_ENCODING}
+
+
+def test_reason_order_puts_run_limits_before_the_size_cap():
+    assert c._LOOKUP_REASON_ORDER == (
+        c.LOOKUP_BUDGET_EXCEEDED,
+        c.LOOKUP_COUNT_CAP,
+        c.LOOKUP_BYTES_BUDGET,
+        c.LOOKUP_RESPONSE_TOO_LARGE,
+        c.LOOKUP_BAD_ENCODING,
+        c.LOOKUP_FAILED,
+    )
+    reasons = set(c._LOOKUP_REASON_ORDER)
+    assert len(reasons) == 6 and all(r.startswith(c.LOOKUP_FAILED) for r in reasons)
+
+
+def test_failed_lookup_is_logged_with_class_and_reason_but_no_body(capsys):
+    secret = b'{"token": "SECRET-BODY-TEXT"}'
+
+    def fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        if url.endswith("/big"):
+            return deps.FetchResult(200, b"x" * (max_bytes + 1), url)
+        return deps.FetchResult(200, secret, url)  # a JSON object that is for no package
+
+    _, failed = c.lookup_registry(_keys("big", "odd"), fetch=fetch, sleep=_no_sleep, clock=FakeClock())
+    err = capsys.readouterr().err
+    assert "collect: lookup failed for npm 'big' '1.0.0': ResponseTooLargeError:" in err
+    assert "byte cap" in err
+    assert "collect: lookup failed for npm 'odd' '1.0.0': RegistryError:" in err
+    assert "SECRET-BODY-TEXT" not in err and "xxxx" not in err
+    assert failed[("npm", "big", "1.0.0")] == c.LOOKUP_RESPONSE_TOO_LARGE
+    assert failed[("npm", "odd", "1.0.0")] == c.LOOKUP_FAILED
+
+
+def test_failure_log_line_is_escaped_and_short(capsys):
+    c._log_lookup_failure(("npm", "a", "1.0.0"), OSError("line\n::error::boom " + "y" * 500))
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1  # one line, ends the log record
+    assert "::error::boom" in err and len(err) < 300
 
 
 def test_lookup_budget_fails_every_remaining_key():
@@ -1472,3 +1623,44 @@ def test_hung_lookup_does_not_hold_the_process_open(tmp_path):
     assert json.loads(proc.stdout) == [{"path": "package-lock.json", "reason": c.LOOKUP_BUDGET_EXCEEDED}]
     data = (tmp_path / c.BUNDLE_FILE_NAME).read_bytes()
     envelope.validate_envelope(envelope.parse_json(data))
+
+
+def test_byte_budget_counts_decoded_bytes_of_gzip_responses():
+    import gzip
+
+    body = _sized_packument("a", 4000)
+    assert len(gzip.compress(body)) < 1000  # the encoded size is far below the decoded size
+
+    class Resp:
+        status = 200
+        url = "https://registry.npmjs.org/a"
+        headers = {"Content-Encoding": "gzip"}
+
+        def __init__(self, url):
+            self.url = url
+            named = body.replace(b'"a"', b'"%s"' % url.rsplit("/", 1)[1].encode(), 1)
+            self.chunks = [gzip.compress(named)]
+
+        def read(self, n):
+            return self.chunks.pop(0) if self.chunks else b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class Opener:
+        def open(self, request, timeout):
+            return Resp(request.full_url)
+
+    def fetch(url, max_bytes, timeout):
+        return deps.default_fetch(url, max_bytes, timeout, opener=Opener())
+
+    # Decoded size 4000 each: a 9000 byte budget fits two, not three, even
+    # though three encoded bodies would fit easily.
+    registry, failed = c.lookup_registry(
+        _keys("a", "b", "c"), fetch=fetch, sleep=_no_sleep, clock=FakeClock(), concurrency=1, byte_budget=9000
+    )
+    assert len(registry) + len(failed) == 3
+    assert list(failed.values()) == [c.LOOKUP_BYTES_BUDGET]

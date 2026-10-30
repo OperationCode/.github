@@ -27,6 +27,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -36,8 +37,10 @@ import yaml
 
 # Byte cap on one manifest or lockfile, applied before parsing.
 MAX_DEP_FILE_BYTES = 16 * 1024 * 1024
-# Byte caps on registry responses, applied before parsing.
-NPM_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+# Byte caps on registry responses (decoded bytes), applied before parsing. The
+# npm cap is about 1.7x the largest legitimate full packument measured on
+# 2026-10-29 (renovate, about 74 MB), K-18 and K-19.
+NPM_MAX_RESPONSE_BYTES = 128 * 1024 * 1024
 PYPI_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 REGISTRY_TIMEOUT_SECONDS = 20.0
 REGISTRY_RETRIES = 2
@@ -125,6 +128,15 @@ class UnsupportedVersionError(DepsError):
 
 class RegistryError(DepsError):
     """A registry lookup failed or its response did not validate."""
+
+
+class ResponseTooLargeError(RegistryError):
+    """A registry response is over its byte cap."""
+
+
+class ResponseEncodingError(RegistryError):
+    """A registry response has a Content-Encoding the fetcher does not accept,
+    or a gzip body that is corrupt or truncated."""
 
 
 # ---------------------------------------------------------------------------
@@ -1494,20 +1506,50 @@ def default_fetch(
     if parts.scheme != "https" or parts.hostname not in (NPM_REGISTRY_HOST, PYPI_REGISTRY_HOST):
         raise RegistryError("default_fetch refuses a URL outside the fixed registry hosts")
     opener = opener or urllib.request.build_opener(_NoRedirect)
-    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "oc-claude-review"})
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "Accept-Encoding": "gzip", "User-Agent": "oc-claude-review"},
+    )
     deadline = clock() + timeout
     try:
         with opener.open(request, timeout=timeout) as resp:
+            encoding = (resp.headers.get("Content-Encoding") or "identity").strip().lower()
+            if encoding not in ("identity", "gzip", "x-gzip"):
+                raise ResponseEncodingError(f"{url}: unsupported Content-Encoding")
+            # 31 = gzip wrapper only (no zlib or raw deflate).
+            inflater = zlib.decompressobj(31) if encoding != "identity" else None
             chunks: list[bytes] = []
-            size = 0
+            size = 0  # decoded bytes
+            wire = 0  # encoded bytes
             while size <= max_bytes:
                 if clock() > deadline:
                     raise TimeoutError(f"{url}: over the {timeout}s total deadline")
                 chunk = resp.read(min(65536, max_bytes + 1 - size))
                 if not chunk:
                     break
-                chunks.append(chunk)
-                size += len(chunk)
+                if inflater is None:
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    continue
+                wire += len(chunk)
+                if wire > max_bytes:
+                    raise ResponseTooLargeError(f"{url}: encoded response is over the {max_bytes} byte cap")
+                try:
+                    # Inflate in bounded steps: never more than the room left
+                    # under the cap plus one byte, so a bomb stops early.
+                    data = inflater.decompress(chunk, max_bytes + 1 - size)
+                    while True:
+                        chunks.append(data)
+                        size += len(data)
+                        if not inflater.unconsumed_tail or size > max_bytes:
+                            break
+                        data = inflater.decompress(inflater.unconsumed_tail, max_bytes + 1 - size)
+                except zlib.error as exc:
+                    raise ResponseEncodingError(f"{url}: gzip body is corrupt ({exc})") from exc
+                if inflater.eof and inflater.unused_data:
+                    raise ResponseEncodingError(f"{url}: data after the end of the gzip stream")
+            if inflater is not None and size <= max_bytes and not inflater.eof:
+                raise ResponseEncodingError(f"{url}: gzip body is truncated")
             return FetchResult(status=resp.status, body=b"".join(chunks), url=resp.url)
     except urllib.error.HTTPError as exc:
         return FetchResult(status=exc.code, body=b"", url=url)
@@ -1573,7 +1615,7 @@ def _fetch_json(
         if result.status != 200:
             raise RegistryError(f"{url}: HTTP {result.status}")
         if len(result.body) > max_bytes:
-            raise RegistryError(f"{url}: response is over the {max_bytes} byte cap")
+            raise ResponseTooLargeError(f"{url}: response is over the {max_bytes} byte cap")
         try:
             doc = json.loads(result.body)
         except (ValueError, RecursionError) as exc:

@@ -90,12 +90,27 @@ REGISTRY_LOOKUP_CONCURRENCY = 8
 REGISTRY_LOOKUP_BUDGET_SECONDS = 240.0
 # Unique keys looked up per run; past the cap a key fails without a lookup.
 MAX_REGISTRY_LOOKUPS = 3000
+# Decoded response bytes for all lookups of a run (K-18, K-19). Each fetch reserves its cap
+# (or what is left) before it starts, so reserved plus received bytes never
+# pass this. It bounds download volume; memory per worker is bounded by the
+# per-response cap (a parsed packument is about 6.4x its body).
+MAX_REGISTRY_BYTES = 1024 * 1024 * 1024
 # Fixed failure reasons ("incomplete dependency data"), in the order a file
 # with several picks its one reason.
 LOOKUP_BUDGET_EXCEEDED = "registry lookup failed: lookup time budget exceeded"
 LOOKUP_COUNT_CAP = "registry lookup failed: over the lookup count cap"
+LOOKUP_BYTES_BUDGET = "registry lookup failed: over the download byte budget"
+LOOKUP_RESPONSE_TOO_LARGE = "registry lookup failed: response over the size cap"
+LOOKUP_BAD_ENCODING = "registry lookup failed: unsupported or corrupt response encoding"
 LOOKUP_FAILED = "registry lookup failed"
-_LOOKUP_REASON_ORDER = (LOOKUP_BUDGET_EXCEEDED, LOOKUP_COUNT_CAP, LOOKUP_FAILED)
+_LOOKUP_REASON_ORDER = (
+    LOOKUP_BUDGET_EXCEEDED,
+    LOOKUP_COUNT_CAP,
+    LOOKUP_BYTES_BUDGET,
+    LOOKUP_RESPONSE_TOO_LARGE,
+    LOOKUP_BAD_ENCODING,
+    LOOKUP_FAILED,
+)
 
 SIZE_GATE_TOKENS = 150_000
 CHARS_PER_TOKEN = 4
@@ -622,7 +637,25 @@ class _BudgetSpent(deps.RegistryError):
     """No time is left in the run's lookup budget for a fetch or a retry."""
 
 
+class _BytesSpent(deps.RegistryError):
+    """No bytes are left in the run's download budget for a fetch."""
+
+
 _LOOKUP_WAIT_SLICE_SECONDS = 0.05
+_LOG_REASON_CHARS = 160
+
+
+def _log_lookup_failure(key: RegistryKey, exc: BaseException) -> None:
+    """One job-log line per failed lookup: key, exception class and a short
+    reason. Never a response body; the text is escaped and cut, so it cannot
+    start a workflow command."""
+    reason = str(exc).encode("ascii", "backslashreplace").decode("ascii")
+    reason = "".join(ch if ch.isprintable() else "?" for ch in reason)[:_LOG_REASON_CHARS]
+    ecosystem, name, version = key
+    print(
+        f"collect: lookup failed for {ecosystem} {name!r} {version!r}: {type(exc).__name__}: {reason}",
+        file=sys.stderr,
+    )
 
 
 def lookup_registry(
@@ -634,6 +667,7 @@ def lookup_registry(
     budget_seconds: float = REGISTRY_LOOKUP_BUDGET_SECONDS,
     concurrency: int = REGISTRY_LOOKUP_CONCURRENCY,
     max_lookups: int = MAX_REGISTRY_LOOKUPS,
+    byte_budget: int = MAX_REGISTRY_BYTES,
 ) -> tuple[dict[RegistryKey, deps.RegistryInfo], dict[RegistryKey, str]]:
     """Registry data by key, and a fixed failure reason by key for every key
     that has no data (ruling R-LOOKUPS, K-11).
@@ -645,7 +679,10 @@ def lookup_registry(
     `budget_seconds` of the start: a fetch never gets more time than is left,
     no lookup, fetch or retry starts after the deadline, and a result that
     completes at or after the deadline is not taken. A key with no result at
-    the deadline fails. Any error in a lookup fails that key only.
+    the deadline fails. Any error in a lookup fails that key only, with a
+    reason that tells a response over its size cap, and a run past its
+    `byte_budget` download budget, from other failures (K-18); each failure
+    is logged with its exception class.
 
     Collect does not wait for a lookup past the deadline. The workers are
     daemon threads, so a hung lookup also does not hold the process open
@@ -663,15 +700,42 @@ def lookup_registry(
     results: dict[RegistryKey, deps.RegistryInfo | str] = {}
     finished = 0  # groups whose worker is done with them
     closed = False  # set at the deadline or when all groups finish
+    reserved = 0  # response bytes received or reserved by fetches in flight
 
     def remaining() -> float:
         return deadline - clock()
 
     def bounded_fetch(url: str, max_bytes: int, timeout: float) -> deps.FetchResult:
+        nonlocal reserved
         left = remaining()
         if left <= 0:
             raise _BudgetSpent("lookup time budget exceeded")
-        return fetch(url, max_bytes, min(timeout, left))
+        with state:
+            room = byte_budget - reserved
+            if room <= 0:
+                raise _BytesSpent("download byte budget exceeded")
+            grant = min(max_bytes, room)
+            reserved += grant
+        # Bytes that count against the budget. A fetch that fails before a
+        # body arrives (timeout, network error, 5xx) downloaded nothing that
+        # counts, so it keeps none of its reservation. A response that was
+        # read past its cap, or a body that did not decode, was a real
+        # download: it keeps the whole reservation.
+        got = 0
+        try:
+            result = fetch(url, grant, min(timeout, left))
+            got = len(result.body)
+        except (deps.ResponseTooLargeError, deps.ResponseEncodingError) as exc:
+            got = grant
+            if grant < max_bytes and isinstance(exc, deps.ResponseTooLargeError):
+                raise _BytesSpent("download byte budget exceeded") from exc
+            raise
+        finally:
+            with state:
+                reserved -= grant - got
+        if grant < max_bytes and got > grant:
+            raise _BytesSpent("download byte budget exceeded")
+        return result
 
     def bounded_sleep(seconds: float) -> None:
         if seconds >= remaining():
@@ -702,7 +766,17 @@ def lookup_registry(
                 result = lookup(name, version, cached, sleep=bounded_sleep)
             except _BudgetSpent:
                 result = LOOKUP_BUDGET_EXCEEDED
-            except Exception:  # noqa: BLE001 - any error is a failed lookup, never a lost bundle
+            except _BytesSpent as exc:
+                _log_lookup_failure(key, exc)
+                result = LOOKUP_BYTES_BUDGET
+            except deps.ResponseTooLargeError as exc:
+                _log_lookup_failure(key, exc)
+                result = LOOKUP_RESPONSE_TOO_LARGE
+            except deps.ResponseEncodingError as exc:
+                _log_lookup_failure(key, exc)
+                result = LOOKUP_BAD_ENCODING
+            except Exception as exc:  # noqa: BLE001 - any error is a failed lookup, never a lost bundle
+                _log_lookup_failure(key, exc)
                 result = LOOKUP_FAILED
             if not commit(key, result):
                 return
@@ -754,6 +828,7 @@ def dependency_facts(
     budget_seconds: float = REGISTRY_LOOKUP_BUDGET_SECONDS,
     concurrency: int = REGISTRY_LOOKUP_CONCURRENCY,
     max_lookups: int = MAX_REGISTRY_LOOKUPS,
+    byte_budget: int = MAX_REGISTRY_BYTES,
 ) -> prefilter.DependencyFacts:
     """Parse each changed supported file at the merge base and the head, and
     look up every new exact registry version (`prefilter.registry_key`).
@@ -822,6 +897,7 @@ def dependency_facts(
         budget_seconds=budget_seconds,
         concurrency=concurrency,
         max_lookups=max_lookups,
+        byte_budget=byte_budget,
     )
     # One fixed reason per file, the run-limit reason first; the delta shows
     # which entries have no registry data.

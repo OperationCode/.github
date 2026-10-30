@@ -885,8 +885,25 @@ def test_redirect_status_is_rejected():
 def test_oversized_response_is_rejected_before_parsing():
     body = b"x" * (deps.NPM_MAX_RESPONSE_BYTES + 1)
     resp = deps.FetchResult(status=200, body=body, url="https://registry.npmjs.org/esbuild")
-    with pytest.raises(RegistryError, match="byte cap"):
+    with pytest.raises(deps.ResponseTooLargeError, match="byte cap"):
         deps.lookup_npm("esbuild", "0.19.0", FakeFetch(resp))
+
+
+def test_npm_cap_boundary():
+    # Exactly at the cap parses; one byte over is refused. 39,000,000 bytes
+    # (vite today) fits with 2x headroom.
+    assert deps.NPM_MAX_RESPONSE_BYTES == 128 * 1024 * 1024
+    pad = "x" * 100
+    body = json.dumps({**NPM_DOC, "pad": pad}).encode()
+    ok_resp = deps.FetchResult(200, body, "https://registry.npmjs.org/esbuild")
+    assert deps.lookup_npm("esbuild", "0.19.0", FakeFetch(ok_resp)).name == "esbuild"
+    over = deps.FetchResult(200, b" " * (deps.NPM_MAX_RESPONSE_BYTES + 1), "https://registry.npmjs.org/esbuild")
+    with pytest.raises(deps.ResponseTooLargeError):
+        deps.lookup_npm("esbuild", "0.19.0", FakeFetch(over))
+    at_cap = deps.FetchResult(
+        200, body + b" " * (deps.NPM_MAX_RESPONSE_BYTES - len(body)), "https://registry.npmjs.org/esbuild"
+    )
+    assert deps.lookup_npm("esbuild", "0.19.0", FakeFetch(at_cap)).name == "esbuild"
 
 
 @pytest.mark.parametrize(
@@ -1211,8 +1228,9 @@ def test_lookup_pypi_matches_normalized_version():
 
 
 class _Resp:
-    def __init__(self, chunks, status=200, url="https://registry.npmjs.org/a"):
+    def __init__(self, chunks, status=200, url="https://registry.npmjs.org/a", headers=None):
         self.chunks, self.status, self.url = list(chunks), status, url
+        self.headers = headers or {}
 
     def read(self, n):
         return self.chunks.pop(0)[:n] if self.chunks else b""
@@ -1265,3 +1283,97 @@ def test_default_fetch_total_deadline_and_httplib_errors():
         deps.default_fetch(
             "https://registry.npmjs.org/a", 10, 5.0, opener=_Opener(http.client.IncompleteRead(b"x"))
         )
+
+
+def _gz(data: bytes) -> bytes:
+    import gzip
+
+    return gzip.compress(data)
+
+
+def _gz_resp(payload: bytes, step: int = 100, **headers):
+    chunks = [payload[i : i + step] for i in range(0, len(payload), step)]
+    return _Resp(chunks, headers={"Content-Encoding": "gzip", **headers})
+
+
+def _fetch_with(resp, cap=1000):
+    return deps.default_fetch("https://registry.npmjs.org/a", cap, 5.0, opener=_Opener(resp))
+
+
+def test_default_fetch_requests_gzip():
+    seen = {}
+
+    class Op(_Opener):
+        def open(self, request, timeout):
+            seen.update({k.lower(): v for k, v in request.header_items()})
+            return super().open(request, timeout)
+
+    deps.default_fetch("https://registry.npmjs.org/a", 10, 5.0, opener=Op(_Resp([b"ab"])))
+    assert seen["accept-encoding"] == "gzip"
+
+
+def test_default_fetch_inflates_gzip_under_the_cap():
+    body = b'{"a": 1}' * 50
+    got = _fetch_with(_gz_resp(_gz(body)), cap=len(body))
+    assert got.body == body and got.status == 200  # exactly at the cap is fine
+
+
+def test_default_fetch_gzip_over_the_decoded_cap_stops_early():
+    # A small compressed payload that inflates far past the cap.
+    bomb = _gz(b"\0" * 50_000_000)
+    assert len(bomb) < 100_000
+    resp = _gz_resp(bomb, step=1000)
+    got = _fetch_with(resp, cap=1000)
+    assert len(got.body) == 1001  # the cap plus one byte, never the full inflate
+    assert resp.chunks  # stopped before reading the whole stream
+
+
+def test_default_fetch_gzip_one_byte_over_the_cap():
+    body = b"x" * 1001
+    assert len(_fetch_with(_gz_resp(_gz(body)), cap=1000).body) == 1001
+
+
+def test_default_fetch_gzip_large_chunk_inflates_in_bounded_steps():
+    body = b"y" * 5000
+    got = _fetch_with(_gz_resp(_gz(body), step=10_000), cap=10_000)
+    assert got.body == body
+
+
+def test_default_fetch_identity_body_with_and_without_header():
+    assert _fetch_with(_Resp([b"abc"], headers={"Content-Encoding": "identity"})).body == b"abc"
+    assert _fetch_with(_Resp([b"abc"])).body == b"abc"
+
+
+def test_default_fetch_rejects_unknown_encodings():
+    for enc in ("br", "deflate", "zstd", "gzip, br", "compress"):
+        with pytest.raises(deps.ResponseEncodingError, match="Content-Encoding"):
+            _fetch_with(_Resp([b"abc"], headers={"Content-Encoding": enc}))
+
+
+def test_default_fetch_corrupt_and_truncated_gzip_fail_closed():
+    good = _gz(b'{"a": 1}' * 100)
+    with pytest.raises(deps.ResponseEncodingError, match="corrupt"):
+        _fetch_with(_gz_resp(b"not gzip at all, just text" * 4), cap=10_000)
+    with pytest.raises(deps.ResponseEncodingError, match="truncated"):
+        _fetch_with(_gz_resp(good[: len(good) // 2]), cap=10_000)
+    with pytest.raises(deps.ResponseEncodingError, match="corrupt"):
+        _fetch_with(_gz_resp(good[:-8] + b"\x00" * 8), cap=10_000)  # bad CRC and size
+    with pytest.raises(deps.ResponseEncodingError, match="after the end"):
+        _fetch_with(_gz_resp(good + good), cap=10_000)
+
+
+def test_default_fetch_encoded_body_past_the_cap_is_refused():
+    import os
+
+    noise = os.urandom(5000)  # does not compress: encoded size is past the cap
+    with pytest.raises(deps.ResponseTooLargeError):
+        _fetch_with(_gz_resp(_gz(noise), step=500), cap=1000)
+
+
+def test_lookup_npm_accepts_a_gzip_response_through_default_fetch():
+    import json as _json
+
+    doc = _json.dumps(NPM_DOC).encode()
+    resp = _gz_resp(_gz(doc), step=64, url="https://registry.npmjs.org/esbuild")
+    info = deps.lookup_npm("esbuild", "0.19.0", lambda url, mb, t: deps.default_fetch(url, mb, t, opener=_Opener(resp)))
+    assert info.name == "esbuild"
