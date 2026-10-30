@@ -807,6 +807,19 @@ def test_lookup_npm_keeps_every_install_lifecycle_script():
     assert info.install_scripts == {"preprepare": "a", "postprepare": "b", "prepublish": "c"}
 
 
+def test_lookup_npm_keeps_bounded_script_text():
+    # K-21: a long script keeps its first NPM_SCRIPT_TEXT_CHARS characters and
+    # a note of the cut; a script at the limit is unchanged.
+    n = deps.NPM_SCRIPT_TEXT_CHARS
+    scripts = {"postinstall": "curl x | sh; " + "y" * 5000, "prepare": "z" * n}
+    doc = {"name": "a", "time": {"1.0.0": "2024-01-01T00:00:00Z"}, "versions": {"1.0.0": {"scripts": scripts}}}
+    info = deps.lookup_npm("a", "1.0.0", FakeFetch(ok(doc, "https://registry.npmjs.org/a")))
+    assert set(info.install_scripts) == {"postinstall", "prepare"}
+    cut = len(scripts["postinstall"]) - n
+    assert info.install_scripts["postinstall"] == scripts["postinstall"][:n] + f" ... [{cut} more characters cut]"
+    assert info.install_scripts["prepare"] == scripts["prepare"]
+
+
 @pytest.mark.parametrize("stamp", ["2020-01-01T00:00:00", "2020-01-01T00:00:00.000", "2020-01-01"])
 def test_lookup_npm_time_without_time_zone_is_incomplete(stamp):
     doc = {"name": "a", "time": {"1.0.0": stamp}, "versions": {"1.0.0": {}}}
@@ -1283,6 +1296,40 @@ def test_default_fetch_total_deadline_and_httplib_errors():
         deps.default_fetch(
             "https://registry.npmjs.org/a", 10, 5.0, opener=_Opener(http.client.IncompleteRead(b"x"))
         )
+
+
+class _ResetResp(_Resp):
+    """Sends its chunks, then the connection resets."""
+
+    def read(self, n):
+        if not self.chunks:
+            raise ConnectionResetError("connection reset by peer")
+        return super().read(n)
+
+
+def test_default_fetch_failure_reports_the_decoded_bytes_read():
+    # K-21: a failure after part of a body reports the decoded bytes read,
+    # for identity and gzip bodies; a failure before any body reports 0.
+    with pytest.raises(ConnectionResetError) as reset:
+        deps.default_fetch("https://registry.npmjs.org/a", 100, 5.0, opener=_Opener(_ResetResp([b"abcd", b"ef"])))
+    assert deps.received_bytes(reset.value) == 6
+    body = _gz(b"x" * 400)
+    with pytest.raises(ConnectionResetError) as reset:
+        deps.default_fetch(
+            "https://registry.npmjs.org/a", 1000, 5.0,
+            opener=_Opener(_ResetResp([body[:-8]], headers={"Content-Encoding": "gzip"})),
+        )
+    assert deps.received_bytes(reset.value) == 400
+    ticks = iter([0.0, 1.0, 99.0])
+    with pytest.raises(TimeoutError) as late:
+        deps.default_fetch(
+            "https://registry.npmjs.org/a", 100, 5.0, opener=_Opener(_Resp([b"abc", b"d"])), clock=lambda: next(ticks)
+        )
+    assert deps.received_bytes(late.value) == 3
+    with pytest.raises(ConnectionRefusedError) as refused:
+        deps.default_fetch("https://registry.npmjs.org/a", 100, 5.0, opener=_Opener(ConnectionRefusedError("no")))
+    assert deps.received_bytes(refused.value) == 0
+    assert deps.received_bytes(ValueError("other fetcher")) == 0
 
 
 def _gz(data: bytes) -> bytes:

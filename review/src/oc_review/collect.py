@@ -687,8 +687,9 @@ def lookup_registry(
     reason that tells a response over its size cap, and a run past its
     `byte_budget` download budget, from other failures (K-18); each failure
     is logged with its exception class. Only bytes received count against
-    `byte_budget`: no fetch starts once they reach it, and the fetches in
-    flight may pass it by at most `concurrency` response caps (K-20).
+    `byte_budget`, including the part of a body a failed fetch read (K-21):
+    no fetch starts once they reach it, and the fetches in flight may pass it
+    by at most `concurrency` response caps (K-20).
 
     Collect does not wait for a lookup past the deadline. The workers are
     daemon threads, so a hung lookup also does not hold the process open
@@ -722,16 +723,20 @@ def lookup_registry(
         with state:
             if received >= byte_budget:
                 raise _BytesSpent("download byte budget exceeded")
-        # Bytes that count against the budget. A fetch that fails before a
-        # body arrives (timeout, network error, 5xx) downloaded nothing that
-        # counts. A response that was read past its cap, or a body that did
-        # not decode, was a real download: it counts as its cap.
+        # Bytes that count against the budget, once per attempt. A fetch that
+        # fails before a body arrives (5xx, refused connection) counts 0; one
+        # that fails after part of a body (reset, timeout) counts what it
+        # read (K-21). A response that was read past its cap, or a body that
+        # did not decode, was a real download: it counts as its cap.
         got = 0
         try:
             result = fetch(url, max_bytes, min(timeout, left))
             got = len(result.body)
         except (deps.ResponseTooLargeError, deps.ResponseEncodingError):
             got = max_bytes
+            raise
+        except Exception as exc:
+            got = deps.received_bytes(exc)
             raise
         finally:
             with state:

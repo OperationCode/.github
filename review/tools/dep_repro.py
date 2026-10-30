@@ -102,6 +102,7 @@ def _metered_fetch(meter: _Meter) -> deps.Fetcher:
         except Exception as exc:
             with meter.lock:
                 meter.errors[type(exc).__name__] += 1
+                meter.decoded += deps.received_bytes(exc)
             raise
         with meter.lock:
             meter.decoded += len(result.body)
