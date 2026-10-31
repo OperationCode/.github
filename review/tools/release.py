@@ -503,13 +503,19 @@ class Progress:
         self.reported = False
 
     def add(self, key: str, label: str, previous: str, reread: Callable[[], str] | None = None) -> None:
-        self.items[key] = {"label": label, "previous": previous, "state": "pending", "reread": reread}
+        self.items[key] = {"label": label, "previous": previous, "state": "pending", "reread": reread,
+                           "was_sent": False}
 
     def set(self, key: str, state: str) -> None:
         self.items[key]["state"] = state
+        if state == "sent":
+            self.items[key]["was_sent"] = True
 
     def wrote(self) -> bool:
-        return any(i["state"] in ("sent", "written", "done") and i["previous"] != self.sha
+        """True when any write may have reached the server: a write was
+        sent for some object (whatever its previous SHA or later state), or
+        an object read back at a SHA other than its previous one."""
+        return any(i["was_sent"] or (i["state"] == "done" and i["previous"] != self.sha)
                    for i in self.items.values())
 
     def report(self) -> None:

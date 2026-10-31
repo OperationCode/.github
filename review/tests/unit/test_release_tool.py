@@ -341,6 +341,9 @@ def _no_real_subprocess(monkeypatch):
     monkeypatch.setattr(release.subprocess, "Popen", refuse)
 
 
+PLANTED_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_PROFILE")
+
+
 def _repo_records():
     real = ROOT / "release-records"
     return sorted(str(p) for p in real.rglob("*")) if real.exists() else []
@@ -354,10 +357,11 @@ def _records(tmp_path, monkeypatch):
     monkeypatch.setattr(release, "RECORDS", tmp_path / "records")
     monkeypatch.setattr(release.tempfile, "tempdir", str(tmp_path / "tmp"))
     (tmp_path / "tmp").mkdir()
+    # Planted before the test runs: ant must never see them (Fake.ant checks).
+    for k in PLANTED_ENV:
+        monkeypatch.setenv(k, "must-not-reach-ant")
     yield
     assert _repo_records() == before, "a test wrote to the repo's release-records/"
-    for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
-        monkeypatch.setenv(k, "must-not-reach-ant")
 
 
 def confirm_with(text):
@@ -818,3 +822,79 @@ def test_failure_before_any_write_prints_no_state_report(capsys):
 
     assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=ask) == 2
     assert "RELEASE INCOMPLETE" not in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- fix round 3
+
+
+def test_the_planted_credentials_are_in_the_environment_during_each_test():
+    assert all(os.environ.get(k) == "must-not-reach-ant" for k in PLANTED_ENV)
+
+
+def test_ant_env_drops_every_anthropic_variable_and_sets_only_the_config_dir():
+    env = release.ant_env("/private/dir")
+    assert env["ANTHROPIC_CONFIG_DIR"] == "/private/dir"
+    assert [k for k in env if k.startswith("ANTHROPIC_")] == ["ANTHROPIC_CONFIG_DIR"]
+    assert "must-not-reach-ant" not in env.values()
+
+
+def test_every_ant_call_of_a_release_gets_no_planted_credential():
+    fake = Fake()
+    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with(f"release {SHA_NEW[:12]}")) == 0
+    ant_calls = [kw for c, kw in fake.calls if c[0] == "ant"]
+    assert len(ant_calls) >= 5
+    assert all("must-not-reach-ant" not in kw["env"].values() for kw in ant_calls)
+
+
+def test_a_sent_write_counts_even_when_its_previous_sha_is_the_target(capsys):
+    progress = release.Progress(SHA_NEW, release.Records("t"), lambda s: f"make release SHA={s}")
+    progress.add("rule-x", "rule x", SHA_NEW)
+    progress.set("rule-x", "sent")
+    assert progress.wrote()
+    progress.report()
+    assert "RELEASE INCOMPLETE:" in capsys.readouterr().err
+
+
+def test_a_sent_write_still_counts_after_its_step_is_done():
+    progress = release.Progress(SHA_NEW, release.Records("t"), lambda s: f"make release SHA={s}")
+    progress.add("rule-x", "rule x", SHA_NEW)
+    for state in ("failed", "sent", "written", "done"):
+        progress.set("rule-x", state)
+    assert progress.wrote()
+
+
+def test_interrupt_after_a_sent_write_at_the_same_sha_does_not_say_nothing_changed(capsys, monkeypatch):
+    """R1's ref is already at the SHA but another match field differs, so a
+    POST is sent; an interrupt during it must print the report."""
+    fake = Fake()
+    fake.rules[R1] = rule(sha=SHA_NEW)
+    fake.rules[R1]["match"]["claims"]["job_workflow_ref"] = REF + SHA_NEW
+    fake.rules[R1]["match"]["audience"] = None
+    real = fake.ant
+
+    def ant(args, kw):
+        if len(args) > 1 and args[1] == "update":
+            raise KeyboardInterrupt()
+        return real(args, kw)
+
+    fake.ant = ant
+    real_patch = release.patch_match
+
+    def patched(match, sha, *, prefix=None):
+        out = real_patch(match, sha, prefix=prefix)
+        out["claims"]["extra"] = "forces a POST"
+        return out
+
+    monkeypatch.setattr(release, "patch_match", patched)
+    assert _release(fake) == 130
+    err = capsys.readouterr().err
+    assert "RELEASE INCOMPLETE:" in err and "Nothing was changed" not in err
+    assert "Interrupted after a write was sent" in err
+
+
+def test_an_unchanged_object_read_back_is_not_a_write():
+    progress = release.Progress(SHA_NEW, release.Records("t"), lambda s: f"make release SHA={s}")
+    progress.add("rule-x", "rule x", SHA_NEW)
+    progress.set("rule-x", "unchanged")
+    progress.set("rule-x", "done")
+    assert not progress.wrote()
