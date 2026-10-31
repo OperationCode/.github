@@ -80,6 +80,8 @@ VOLATILE_KEYS = frozenset({"updated_at", "updated_by_actor_id"})
 _REDACT_RE = re.compile(r"(?i)(bearer\s+|sk-ant-)[^\s\"']+")
 
 Runner = Callable[..., subprocess.CompletedProcess]
+# `ant auth logout` runs while termination signals are held, so it must end.
+LOGOUT_TIMEOUT_S = 30
 
 
 class ReleaseError(Exception):
@@ -266,8 +268,11 @@ class Console:
     def __init__(self, run: Runner, config_dir: str):
         self.run = run
         self.env = ant_env(config_dir)
+        self.closed = False
 
     def _ant(self, args: Sequence[str], what: str) -> str:
+        if self.closed:
+            raise ReleaseError("the Console session is closed (logged out)")
         cp = self.run(["ant", *args], env=self.env, capture_output=True, text=True)
         return _check(cp, what)
 
@@ -279,8 +284,15 @@ class Console:
             raise ReleaseError(f"ant auth login failed (exit {cp.returncode}); not logged in to the Console")
 
     def logout(self) -> bool:
+        """Log out with a bounded wait. False when it failed or timed out."""
+        self.closed = True
         try:
-            cp = self.run(["ant", "auth", "logout", "--all"], env=self.env, capture_output=True, text=True)
+            cp = self.run(["ant", "auth", "logout", "--all"], env=self.env, capture_output=True, text=True,
+                          timeout=LOGOUT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            print(f"WARNING: `ant auth logout --all` did not end within {LOGOUT_TIMEOUT_S} s and was stopped.",
+                  file=sys.stderr)
+            return False
         except OSError:
             return False
         return cp.returncode == 0
@@ -469,6 +481,9 @@ def github_preconditions(gh: GitHub, sha: str, rule_id: str) -> list[str]:
 
 # ---------------------------------------------------------------- progress
 
+# Records dirs of the state reports printed in this run (main reads it).
+REPORTS_PRINTED: list[Path] = []
+
 
 class Progress:
     """The state of each object a release writes, for the failure report.
@@ -485,6 +500,7 @@ class Progress:
     def __init__(self, sha: str, rec: Records, rollback: Callable[[str], str]):
         self.sha, self.rec, self.rollback = sha, rec, rollback
         self.items: dict[str, dict[str, Any]] = {}
+        self.reported = False
 
     def add(self, key: str, label: str, previous: str, reread: Callable[[], str] | None = None) -> None:
         self.items[key] = {"label": label, "previous": previous, "state": "pending", "reread": reread}
@@ -497,9 +513,12 @@ class Progress:
                    for i in self.items.values())
 
     def report(self) -> None:
-        """Print which object is at which SHA, the records and the recovery."""
-        if not self.wrote():
+        """Print which object is at which SHA, the records and the recovery.
+        Prints once, and only when a write was sent."""
+        if self.reported or not self.wrote():
             return
+        self.reported = True
+        REPORTS_PRINTED.append(self.rec.dir)
         err = sys.stderr
         print(f"\nRELEASE INCOMPLETE: some objects may be at {self.sha[:12]}, others at their previous SHA.", file=err)
         print("While the rule and the pins name different SHAs, required runs fail closed.", file=err)
@@ -513,6 +532,8 @@ class Progress:
                     now = i["reread"]()
                 except BaseException as e:  # noqa: BLE001 - the report must finish
                     now = f"re-read failed ({redact(str(e))[:200]})"
+                    if i["state"] == "done":
+                        now = f"{self.sha} (read back by its step; {now})"
             elif i["state"] == "done":
                 now = f"{self.sha} (read back)"
             print(f"  {i['label']:<28} {i['state']:<9} now {now}  (previous {i['previous']})", file=err)
@@ -647,36 +668,46 @@ def cmd_plan(args, run: Runner, ask, *, apply: bool) -> int:
         print("\nConsole (rule R1):")
         check_ant(run)
         progress = Progress(sha, rec, lambda s: f"make release SHA={s}")
-        with ephemeral_console(run) as console:
-            before, match = plan_rule(console, PROD_RULE_ID, sha, rec, JOB_WORKFLOW_REF_PREFIX)
-            if apply:
-                progress.add(f"rule-{PROD_RULE_ID}", f"rule {PROD_RULE_ID}", rule_sha(before),
-                             lambda: rule_sha(console.retrieve(PROD_RULE_ID)))
-                for rid, _, before_rs in rulesets:
-                    rec.save(f"ruleset-{rid}-rollback-body", {"rules": before_rs["rules"]})
-                    progress.add(f"ruleset-{rid}", f"ruleset {rid}", ruleset_pin(before_rs),
-                                 lambda rid=rid: ruleset_pin(gh.get(f"orgs/{ORG}/rulesets/{rid}")))
-                confirm(sha, ask, f"set rule {PROD_RULE_ID} to {sha[:12]}, then move {len(rulesets)} ruleset pin(s). "
-                        "From the rule change until the last pin moves, required runs fail closed (auth denied)")
-                print("\nApply: Console rule first, then the ruleset pins.")
-                try:
-                    apply_rule(console, PROD_RULE_ID, before, match, rec, progress)
-                except BaseException:
-                    progress.report()  # still logged in: the rule is read again
-                    raise
-        if apply:
-            # Logged out now: the report cannot read the rule again, but its
-            # step read it back before the logout.
-            progress.items[f"rule-{PROD_RULE_ID}"]["reread"] = None
-            try:
-                for rid, _, before_rs in rulesets:
-                    apply_ruleset(gh, rid, before_rs, sha, rec, progress)
-            except BaseException:
-                progress.report()
-                raise
-            print(f"\nReleased {sha}. Records: {rec.dir}")
-            print("Next: start a new run on each open PR (push, or close and reopen). Do not re-run old runs.")
-            return 0
+        try:
+            return _console_and_pins(run, ask, gh, sha, rec, rulesets, progress, apply=apply, fails=fails)
+        except BaseException:
+            # Every exit after a sent write prints the state, also a signal
+            # raised when the Console context closes (held during logout).
+            progress.report()
+            raise
+    return _plan_result(rec, fails)
+
+
+def _console_and_pins(run: Runner, ask, gh: GitHub, sha: str, rec: Records, rulesets, progress: Progress,
+                      *, apply: bool, fails: list[str]) -> int:
+    """Read R1 (plan), or edit R1 and then move the pins (release)."""
+    with ephemeral_console(run) as console:
+        before, match = plan_rule(console, PROD_RULE_ID, sha, rec, JOB_WORKFLOW_REF_PREFIX)
+        if not apply:
+            return _plan_result(rec, fails)
+        progress.add(f"rule-{PROD_RULE_ID}", f"rule {PROD_RULE_ID}", rule_sha(before),
+                     lambda: rule_sha(console.retrieve(PROD_RULE_ID)))
+        for rid, _, before_rs in rulesets:
+            rec.save(f"ruleset-{rid}-rollback-body", {"rules": before_rs["rules"]})
+            progress.add(f"ruleset-{rid}", f"ruleset {rid}", ruleset_pin(before_rs),
+                         lambda rid=rid: ruleset_pin(gh.get(f"orgs/{ORG}/rulesets/{rid}")))
+        confirm(sha, ask, f"set rule {PROD_RULE_ID} to {sha[:12]}, then move {len(rulesets)} ruleset pin(s). "
+                "From the rule change until the last pin moves, required runs fail closed (auth denied)")
+        print("\nApply: Console rule first, then the ruleset pins.")
+        try:
+            apply_rule(console, PROD_RULE_ID, before, match, rec, progress)
+        except BaseException:
+            progress.report()  # still logged in: the rule is read again
+            raise
+    # Logged out now: a report shows R1 from its own read-back.
+    for rid, _, before_rs in rulesets:
+        apply_ruleset(gh, rid, before_rs, sha, rec, progress)
+    print(f"\nReleased {sha}. Records: {rec.dir}")
+    print("Next: start a new run on each open PR (push, or close and reopen). Do not re-run old runs.")
+    return 0
+
+
+def _plan_result(rec: Records, fails: list[str]) -> int:
     print(f"\nRecords: {rec.dir}")
     if fails:
         print(f"PLAN FAILED: {len(fails)} precondition(s) failed:", file=sys.stderr)
@@ -696,15 +727,20 @@ def cmd_rule_test(args, run: Runner, ask) -> int:
     print(f"Rule test: {rule_id} -> {sha}\n\nConsole:")
     check_ant(run)
     progress = Progress(sha, rec, lambda s: f"make release-rule-test RULE={rule_id} SHA={s}")
-    with ephemeral_console(run) as console:
-        before, match = plan_rule(console, rule_id, sha, rec, None)
-        progress.add(f"rule-{rule_id}", f"rule {rule_id}", rule_sha(before), lambda: rule_sha(console.retrieve(rule_id)))
-        confirm(sha, ask, f"set scratch rule {rule_id} to {sha[:12]}")
-        try:
-            apply_rule(console, rule_id, before, match, rec, progress)
-        except BaseException:
-            progress.report()
-            raise
+    try:
+        with ephemeral_console(run) as console:
+            before, match = plan_rule(console, rule_id, sha, rec, None)
+            progress.add(f"rule-{rule_id}", f"rule {rule_id}", rule_sha(before),
+                         lambda: rule_sha(console.retrieve(rule_id)))
+            confirm(sha, ask, f"set scratch rule {rule_id} to {sha[:12]}")
+            try:
+                apply_rule(console, rule_id, before, match, rec, progress)
+            except BaseException:
+                progress.report()  # still logged in: the rule is read again
+                raise
+    except BaseException:
+        progress.report()  # e.g. a signal held during logout, raised at the context exit
+        raise
     print(f"\nRule test passed. Records: {rec.dir}")
     return 0
 
@@ -731,6 +767,7 @@ def main(argv: Sequence[str] | None = None, run: Runner | None = None, ask: Call
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _raise_on_signal)
     CLEANUP_FAILURES.clear()
+    REPORTS_PRINTED.clear()
     try:
         if args.cmd == "rule-test":
             rc = cmd_rule_test(args, run, ask)
@@ -740,8 +777,11 @@ def main(argv: Sequence[str] | None = None, run: Runner | None = None, ask: Call
         print(f"\nREFUSED: {e}", file=sys.stderr)
         rc = 2
     except KeyboardInterrupt:
-        print("\nInterrupted. If a write had started, the state report above says where each object is.",
-              file=sys.stderr)
+        if REPORTS_PRINTED:
+            print("\nInterrupted after a write was sent. Follow the RELEASE INCOMPLETE report above.",
+                  file=sys.stderr)
+        else:
+            print("\nInterrupted before any write was sent. Nothing was changed.", file=sys.stderr)
         rc = 130
     if CLEANUP_FAILURES:
         print(f"\nCLEANUP FAILED ({len(CLEANUP_FAILURES)}): see the ERROR lines above.", file=sys.stderr)

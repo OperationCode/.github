@@ -341,9 +341,21 @@ def _no_real_subprocess(monkeypatch):
     monkeypatch.setattr(release.subprocess, "Popen", refuse)
 
 
+def _repo_records():
+    real = ROOT / "release-records"
+    return sorted(str(p) for p in real.rglob("*")) if real.exists() else []
+
+
 @pytest.fixture(autouse=True)
 def _records(tmp_path, monkeypatch):
+    """Hermetic: records and every temp dir go under this test's tmp_path,
+    and the repo's release-records/ must not change."""
+    before = _repo_records()
     monkeypatch.setattr(release, "RECORDS", tmp_path / "records")
+    monkeypatch.setattr(release.tempfile, "tempdir", str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+    yield
+    assert _repo_records() == before, "a test wrote to the repo's release-records/"
     for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
         monkeypatch.setenv(k, "must-not-reach-ant")
 
@@ -624,6 +636,89 @@ def test_a_failed_delete_is_loud_and_makes_the_run_fail(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------- fix round 1: partial failure report
+
+
+# ---------------------------------------------------------------- fix round 2: signal at logout, logout timeout
+
+
+def _interrupt_at_logout(how):
+    def logout(env):
+        if how == "signal":
+            signal.raise_signal(signal.SIGINT)  # held during cleanup, raised at the context exit
+            return Fake.ok()
+        raise KeyboardInterrupt()
+    return logout
+
+
+@pytest.mark.parametrize("how", ["signal", "raise"])
+def test_interrupt_during_logout_after_r1_moved_prints_the_state_report(how, capsys):
+    fake = Fake(logout=_interrupt_at_logout(how))
+    assert _release(fake) == 130
+    err = capsys.readouterr().err
+    assert "RELEASE INCOMPLETE" in err
+    lines = _state_lines(err)
+    assert "done" in lines[R1] and SHA_NEW in lines[R1]
+    assert all("pending" in lines[str(r)] and f"now {SHA_OLD}" in lines[str(r)] for r in (FIRST, SECOND))
+    assert f"make release SHA={SHA_OLD}" in err and f"make release SHA={SHA_NEW}" in err
+    assert "Interrupted after a write was sent" in err and "Nothing was changed" not in err
+    assert not any("-X" in c for c in fake.writes())  # no pin moved after the interrupt
+    assert all(not os.path.exists(d) for d in fake.config_dirs)
+    assert err.count("RELEASE INCOMPLETE:") == 1  # the report prints once
+
+
+def test_rule_test_interrupt_during_logout_prints_the_state_report(capsys):
+    fake = Fake(logout=_interrupt_at_logout("signal"))
+    rc = release.main(["rule-test", "--rule", R2, "--sha", SHA_NEW], run=fake, ask=confirm_with(f"release {SHA_NEW[:12]}"))
+    assert rc == 130
+    err = capsys.readouterr().err
+    assert "RELEASE INCOMPLETE" in err and f"make release-rule-test RULE={R2} SHA={SHA_OLD}" in err
+    assert "Interrupted after a write was sent" in err
+
+
+def test_interrupt_before_any_write_says_nothing_changed(capsys):
+    def ask(_prompt):
+        raise KeyboardInterrupt()
+
+    fake = Fake()
+    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=ask) == 130
+    err = capsys.readouterr().err
+    assert "RELEASE INCOMPLETE" not in err and "Interrupted before any write was sent. Nothing was changed." in err
+    assert fake.writes() == []
+
+
+def test_interrupt_during_logout_of_a_plan_says_nothing_changed(capsys):
+    fake = Fake(logout=_interrupt_at_logout("signal"))
+    assert release.main(["plan", "--sha", SHA_NEW], run=fake) == 130
+    err = capsys.readouterr().err
+    assert "RELEASE INCOMPLETE" not in err and "Nothing was changed" in err
+
+
+def test_logout_has_a_timeout_and_the_dir_is_still_deleted(capsys):
+    seen = {}
+
+    def logout(env):
+        raise subprocess.TimeoutExpired(["ant", "auth", "logout", "--all"], release.LOGOUT_TIMEOUT_S)
+
+    fake = Fake(logout=logout)
+    real = fake.ant
+
+    def ant(args, kw):
+        if args[:2] == ["auth", "logout"]:
+            seen["timeout"] = kw.get("timeout")
+        return real(args, kw)
+
+    fake.ant = ant
+    assert release.main(["plan", "--sha", SHA_NEW], run=fake) == 0
+    err = capsys.readouterr().err
+    assert seen["timeout"] == release.LOGOUT_TIMEOUT_S and 0 < release.LOGOUT_TIMEOUT_S <= 60
+    assert "did not end within" in err and "local token files are deleted" in err
+    assert fake.config_dirs and all(not os.path.exists(d) for d in fake.config_dirs)
+
+
+def test_temp_dirs_stay_under_the_test_tmp_path(tmp_path):
+    fake = Fake()
+    release.main(["plan", "--sha", SHA_NEW], run=fake)
+    assert fake.config_dirs and all(Path(d).is_relative_to(tmp_path) for d in fake.config_dirs)
 
 
 def _fail_put_on(target, *, apply_first=False):
