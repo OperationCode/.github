@@ -18,7 +18,7 @@ One-time setup: install the [`ant` CLI](https://platform.claude.com/docs/en/cli-
 
 ```sh
 make release-plan SHA=<sha>                 # read-only; NO_CONSOLE=1 skips the Console reads
-make release SHA=<sha>                      # plan, typed confirmation, apply, read back
+make release SHA=<sha>                      # plan, "Apply? [y/N]" prompt, apply, read back
 make release SHA=<previous sha>             # rollback
 make release-rule-test RULE=<id> SHA=<sha>  # Console-only edit of a scratch rule (refuses the production rule)
 ```
