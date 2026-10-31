@@ -66,7 +66,12 @@ ANALYZE_PATH = "review/src/oc_review/analyze.py"
 # Every ruleset that requires the workflow: the pilot ruleset and the scratch
 # test ruleset. Add the org ruleset here when it gets the pin (phase 6).
 RULESETS: tuple[tuple[int, str], ...] = ((26132750, "claude-review-pilot"), (25835887, "p0-required-workflow"))
-RELEASE_WORKFLOWS = ("test.yml", "eval.yml")
+# The run each release needs at the SHA: (file, event, branch). test.yml runs
+# on the push to main; the release eval is an owner-approved dispatch on main
+# (as for cc710fb, cf19216 and 96f4966). A pull_request run at the same head
+# SHA tested a merge ref, so it does not count.
+RELEASE_WORKFLOWS: tuple[tuple[str, str, str], ...] = (("test.yml", "push", "main"),
+                                                       ("eval.yml", "workflow_dispatch", "main"))
 RULE_ID_RE = re.compile(r"^fdrl_[A-Za-z0-9]{24}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RECORDS = Path(__file__).resolve().parents[2] / "release-records"
@@ -306,12 +311,69 @@ def check_ant(run: Runner) -> None:
                            "`brew install anthropics/tap/ant`, or run the plan with NO_CONSOLE=1 "
                            "to skip the Console part") from None
     finally:
-        shutil.rmtree(empty, ignore_errors=True)
+        remove_dir(empty)
     text = (cp.stdout or "") + (cp.stderr or "")
     missing = [c for c in ("retrieve", "update") if not re.search(rf"\b{c}\b", text)]
     if cp.returncode != 0 or missing:
         raise ReleaseError(f"`ant {Console.RULES} --help` does not list {missing or 'its commands'}; "
                            "this ant build does not match the tool; read the help and fix the Console class")
+
+
+# Cleanup problems that must make the run exit non-zero, even after success.
+CLEANUP_FAILURES: list[str] = []
+_CLEANUP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def remove_dir(path: str) -> bool:
+    """Delete `path`. On any failure, say so loudly and record it."""
+    errors: list[str] = []
+    try:
+        shutil.rmtree(path, onexc=lambda _fn, p, exc: errors.append(f"{p}: {exc}"))
+    except BaseException as e:  # noqa: BLE001 - report every failure
+        errors.append(repr(e))
+    if errors or os.path.exists(path):
+        msg = (f"could not delete {path} ({'; '.join(errors) or 'still exists'}). It may hold an "
+               f"org:admin token: delete it now with: rm -rf '{path}'")
+        print(f"\nERROR: {msg}", file=sys.stderr)
+        CLEANUP_FAILURES.append(msg)
+        return False
+    return True
+
+
+@contextmanager
+def signals_deferred() -> Iterator[list[int]]:
+    """Hold SIGINT, SIGTERM and SIGHUP while cleanup runs. Yields the list of
+    signals that arrived; the caller decides whether to raise after."""
+    pending: list[int] = []
+    old = {}
+    try:
+        for sig in _CLEANUP_SIGNALS:
+            old[sig] = signal.signal(sig, lambda signum, _f: pending.append(signum))
+    except ValueError:  # not the main thread: signals cannot arrive here anyway
+        pass
+    try:
+        yield pending
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+
+
+def _cleanup_console(console: Console, config_dir: str) -> list[int]:
+    """Log out, then delete the dir in an inner finally, with termination
+    signals held. Returns the signals that arrived meanwhile."""
+    with signals_deferred() as pending:
+        ok = False
+        try:
+            ok = console.logout()
+        finally:
+            removed = remove_dir(config_dir)
+            if not ok:
+                print("WARNING: `ant auth logout --all` did not complete. "
+                      + ("The local token files are deleted, but " if removed else "")
+                      + "the session may stay valid until it expires.", file=sys.stderr)
+            elif removed:
+                print("Console: logged out, temp config dir removed.")
+    return pending
 
 
 @contextmanager
@@ -324,13 +386,12 @@ def ephemeral_console(run: Runner) -> Iterator[Console]:
     try:
         console.login()
         yield console
-    finally:
-        ok = console.logout()
-        shutil.rmtree(config_dir, ignore_errors=True)
-        if not ok:
-            print("WARNING: `ant auth logout --all` failed. The local token files are deleted, "
-                  "but the session may stay valid until it expires.", file=sys.stderr)
-        print("Console: logged out, temp config dir removed.")
+    except BaseException:
+        _cleanup_console(console, config_dir)  # the first exception wins
+        raise
+    pending = _cleanup_console(console, config_dir)
+    if pending:
+        raise KeyboardInterrupt(f"signal {pending[0]} during cleanup")
 
 
 # ---------------------------------------------------------------- records
@@ -347,6 +408,14 @@ class Records:
 
 
 # ---------------------------------------------------------------- preconditions
+
+
+def release_run_ok(run: dict, wf: str, event: str, branch: str, sha: str) -> bool:
+    """A completed, successful run of that workflow file, for that event and
+    branch, whose head is exactly `sha`."""
+    return (run.get("path") == f".github/workflows/{wf}" and run.get("event") == event
+            and run.get("head_branch") == branch and run.get("head_sha") == sha
+            and run.get("status") == "completed" and run.get("conclusion") == "success")
 
 
 def github_preconditions(gh: GitHub, sha: str, rule_id: str) -> list[str]:
@@ -368,16 +437,15 @@ def github_preconditions(gh: GitHub, sha: str, rule_id: str) -> list[str]:
     except ReleaseError as e:
         check(False, "", f"cannot compare {sha} with main: {e}")
 
-    for wf in RELEASE_WORKFLOWS:
+    for wf, event, branch in RELEASE_WORKFLOWS:
         try:
             runs = gh.get(f"repos/{REPO}/actions/workflows/{wf}/runs?head_sha={sha}&per_page=100").get("workflow_runs") or []
         except ReleaseError as e:
             check(False, "", f"cannot read {wf} runs: {e}")
             continue
-        runs = [r for r in runs if r.get("path") == f".github/workflows/{wf}"]
-        good = [r for r in runs if r.get("status") == "completed" and r.get("conclusion") == "success"]
-        check(bool(good), f"{wf} succeeded at {sha[:12]} (run {good[0]['id'] if good else ''})",
-              f"no successful {wf} run at {sha} ({len(runs)} run(s) found)")
+        good = [r for r in runs if release_run_ok(r, wf, event, branch, sha)]
+        check(bool(good), f"{wf} {event} run on {branch} succeeded at {sha[:12]} (run {good[0]['id'] if good else ''})",
+              f"no successful {wf} {event} run on {branch} at {sha} ({len(runs)} run(s) of any kind found)")
 
     try:
         meta = gh.get(f"repos/{REPO}/contents/{ANALYZE_PATH}?ref={sha}")
@@ -397,6 +465,72 @@ def github_preconditions(gh: GitHub, sha: str, rule_id: str) -> list[str]:
     except ReleaseError as e:
         check(False, "", f"cannot read the gh user or org role: {e}")
     return fails
+
+
+# ---------------------------------------------------------------- progress
+
+
+class Progress:
+    """The state of each object a release writes, for the failure report.
+
+    pending   not touched yet (still at its previous value)
+    unchanged already at the SHA, no write sent
+    sent      a write was sent and its outcome is not known: it may have
+              reached the server (error, timeout or interrupt during the call)
+    written   the write returned, the read-back has not passed yet
+    done      written (or unchanged) and read back as planned
+    failed    the step stopped before its write; the object was not written
+    """
+
+    def __init__(self, sha: str, rec: Records, rollback: Callable[[str], str]):
+        self.sha, self.rec, self.rollback = sha, rec, rollback
+        self.items: dict[str, dict[str, Any]] = {}
+
+    def add(self, key: str, label: str, previous: str, reread: Callable[[], str] | None = None) -> None:
+        self.items[key] = {"label": label, "previous": previous, "state": "pending", "reread": reread}
+
+    def set(self, key: str, state: str) -> None:
+        self.items[key]["state"] = state
+
+    def wrote(self) -> bool:
+        return any(i["state"] in ("sent", "written", "done") and i["previous"] != self.sha
+                   for i in self.items.values())
+
+    def report(self) -> None:
+        """Print which object is at which SHA, the records and the recovery."""
+        if not self.wrote():
+            return
+        err = sys.stderr
+        print(f"\nRELEASE INCOMPLETE: some objects may be at {self.sha[:12]}, others at their previous SHA.", file=err)
+        print("While the rule and the pins name different SHAs, required runs fail closed.", file=err)
+        print("State of each object. 'now' is read again just now. 'sent' means a write was sent and its",
+              file=err)
+        print("outcome is unknown: it may have reached the server, so trust 'now', not the state.", file=err)
+        for key, i in self.items.items():
+            now = "not read"
+            if i["reread"] is not None:
+                try:
+                    now = i["reread"]()
+                except BaseException as e:  # noqa: BLE001 - the report must finish
+                    now = f"re-read failed ({redact(str(e))[:200]})"
+            elif i["state"] == "done":
+                now = f"{self.sha} (read back)"
+            print(f"  {i['label']:<28} {i['state']:<9} now {now}  (previous {i['previous']})", file=err)
+        print(f"Records: {self.rec.dir}", file=err)
+        prevs = {i["previous"] for i in self.items.values()}
+        print("Recovery:", file=err)
+        print(f"  - retry: fix the cause, then run `{self.rollback(self.sha)}` again (objects already at the SHA get no write)", file=err)
+        if len(prevs) == 1:
+            print(f"  - roll back: `{self.rollback(prevs.pop())}`", file=err)
+            return
+        print("  - roll back: the previous values differ, so there is no single rollback SHA. Per object:", file=err)
+        for key, i in self.items.items():
+            if key.startswith("ruleset-"):
+                rid = key.removeprefix("ruleset-")
+                print(f"      {i['label']}: gh api -X PUT orgs/{ORG}/rulesets/{rid} "
+                      f"--input '{self.rec.dir / f'ruleset-{rid}-rollback-body.json'}'  (pin {i['previous']}), then read it back", file=err)
+            else:
+                print(f"      {i['label']}: set job_workflow_ref back to ...@{i['previous']} in the Console, then read it back", file=err)
 
 
 # ---------------------------------------------------------------- flows
@@ -432,39 +566,56 @@ def plan_rule(console: Console, rule_id: str, sha: str, rec: Records, prefix: st
     return before, match
 
 
-def apply_rule(console: Console, rule_id: str, before: dict, match: dict, rec: Records) -> None:
+def rule_sha(rule: dict) -> str:
+    return str(((rule.get("match") or {}).get("claims") or {}).get("job_workflow_ref", "")).rpartition("@")[2]
+
+
+def apply_rule(console: Console, rule_id: str, before: dict, match: dict, rec: Records, progress: Progress) -> None:
+    key = f"rule-{rule_id}"
+    progress.set(key, "failed")
     now = console.retrieve(rule_id)
     changed = diff_paths(_without_volatile(before), _without_volatile(now))
     if changed:
         raise ReleaseError(f"rule {rule_id} changed since the plan read ({', '.join(changed)}); run again")
     if before["match"] == match or _strip_nulls(before["match"]) == match:
         print(f"  rule {rule_id}: already at the SHA, no POST")
+        progress.set(key, "unchanged")
     else:
-        rec.save(f"rule-{rule_id}-response", console.update(rule_id, match))
+        progress.set(key, "sent")
+        response = console.update(rule_id, match)
+        progress.set(key, "written")
+        rec.save(f"rule-{rule_id}-response", response)
     after = console.retrieve(rule_id)
     rec.save(f"rule-{rule_id}-after", after)
     problems = compare_rule(before, after, match)
     if problems:
         raise ReleaseError(f"rule {rule_id} read-back mismatch: {', '.join(problems)}")
+    progress.set(key, "done")
     print(f"  [ok] rule {rule_id} read back: only job_workflow_ref changed")
 
 
-def apply_ruleset(gh: GitHub, rid: int, before: dict, sha: str, rec: Records) -> None:
+def apply_ruleset(gh: GitHub, rid: int, before: dict, sha: str, rec: Records, progress: Progress) -> None:
+    key = f"ruleset-{rid}"
+    progress.set(key, "failed")
     now = gh.get(f"orgs/{ORG}/rulesets/{rid}")
     changed = diff_paths(_without_volatile(before), _without_volatile(now))
     if changed:
         raise ReleaseError(f"ruleset {rid} changed since the plan read ({', '.join(changed)}); run again")
     if ruleset_pin(before) == sha:
         print(f"  ruleset {rid}: already at the SHA, no PUT")
+        progress.set(key, "unchanged")
     else:
         body = patch_ruleset(before, sha)
         rec.save(f"ruleset-{rid}-body", body)
+        progress.set(key, "sent")
         gh.put(f"orgs/{ORG}/rulesets/{rid}", body)
+        progress.set(key, "written")
     after = gh.get(f"orgs/{ORG}/rulesets/{rid}")
     rec.save(f"ruleset-{rid}-after", after)
     problems = compare_ruleset(before, after, sha)
     if problems:
         raise ReleaseError(f"ruleset {rid} read-back mismatch: {', '.join(problems)}")
+    progress.set(key, "done")
     print(f"  [ok] ruleset {rid} read back: only the pin changed (repository_id, path, sha, no ref)")
 
 
@@ -495,16 +646,34 @@ def cmd_plan(args, run: Runner, ask, *, apply: bool) -> int:
     else:
         print("\nConsole (rule R1):")
         check_ant(run)
+        progress = Progress(sha, rec, lambda s: f"make release SHA={s}")
         with ephemeral_console(run) as console:
             before, match = plan_rule(console, PROD_RULE_ID, sha, rec, JOB_WORKFLOW_REF_PREFIX)
             if apply:
+                progress.add(f"rule-{PROD_RULE_ID}", f"rule {PROD_RULE_ID}", rule_sha(before),
+                             lambda: rule_sha(console.retrieve(PROD_RULE_ID)))
+                for rid, _, before_rs in rulesets:
+                    rec.save(f"ruleset-{rid}-rollback-body", {"rules": before_rs["rules"]})
+                    progress.add(f"ruleset-{rid}", f"ruleset {rid}", ruleset_pin(before_rs),
+                                 lambda rid=rid: ruleset_pin(gh.get(f"orgs/{ORG}/rulesets/{rid}")))
                 confirm(sha, ask, f"set rule {PROD_RULE_ID} to {sha[:12]}, then move {len(rulesets)} ruleset pin(s). "
                         "From the rule change until the last pin moves, required runs fail closed (auth denied)")
                 print("\nApply: Console rule first, then the ruleset pins.")
-                apply_rule(console, PROD_RULE_ID, before, match, rec)
+                try:
+                    apply_rule(console, PROD_RULE_ID, before, match, rec, progress)
+                except BaseException:
+                    progress.report()  # still logged in: the rule is read again
+                    raise
         if apply:
-            for rid, _, before_rs in rulesets:
-                apply_ruleset(gh, rid, before_rs, sha, rec)
+            # Logged out now: the report cannot read the rule again, but its
+            # step read it back before the logout.
+            progress.items[f"rule-{PROD_RULE_ID}"]["reread"] = None
+            try:
+                for rid, _, before_rs in rulesets:
+                    apply_ruleset(gh, rid, before_rs, sha, rec, progress)
+            except BaseException:
+                progress.report()
+                raise
             print(f"\nReleased {sha}. Records: {rec.dir}")
             print("Next: start a new run on each open PR (push, or close and reopen). Do not re-run old runs.")
             return 0
@@ -526,10 +695,16 @@ def cmd_rule_test(args, run: Runner, ask) -> int:
     rec = Records(f"rule-test-{rule_id}-{sha[:12]}")
     print(f"Rule test: {rule_id} -> {sha}\n\nConsole:")
     check_ant(run)
+    progress = Progress(sha, rec, lambda s: f"make release-rule-test RULE={rule_id} SHA={s}")
     with ephemeral_console(run) as console:
         before, match = plan_rule(console, rule_id, sha, rec, None)
+        progress.add(f"rule-{rule_id}", f"rule {rule_id}", rule_sha(before), lambda: rule_sha(console.retrieve(rule_id)))
         confirm(sha, ask, f"set scratch rule {rule_id} to {sha[:12]}")
-        apply_rule(console, rule_id, before, match, rec)
+        try:
+            apply_rule(console, rule_id, before, match, rec, progress)
+        except BaseException:
+            progress.report()
+            raise
     print(f"\nRule test passed. Records: {rec.dir}")
     return 0
 
@@ -555,16 +730,23 @@ def main(argv: Sequence[str] | None = None, run: Runner | None = None, ask: Call
         sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with ant's output
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, _raise_on_signal)
+    CLEANUP_FAILURES.clear()
     try:
         if args.cmd == "rule-test":
-            return cmd_rule_test(args, run, ask)
-        return cmd_plan(args, run, ask, apply=args.cmd == "release")
+            rc = cmd_rule_test(args, run, ask)
+        else:
+            rc = cmd_plan(args, run, ask, apply=args.cmd == "release")
     except ReleaseError as e:
         print(f"\nREFUSED: {e}", file=sys.stderr)
-        return 2
+        rc = 2
     except KeyboardInterrupt:
-        print("\nInterrupted. Check the read-backs: a step may be half done.", file=sys.stderr)
-        return 130
+        print("\nInterrupted. If a write had started, the state report above says where each object is.",
+              file=sys.stderr)
+        rc = 130
+    if CLEANUP_FAILURES:
+        print(f"\nCLEANUP FAILED ({len(CLEANUP_FAILURES)}): see the ERROR lines above.", file=sys.stderr)
+        rc = rc or 3
+    return rc
 
 
 if __name__ == "__main__":

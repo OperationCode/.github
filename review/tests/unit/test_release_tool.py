@@ -6,6 +6,7 @@ import copy
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -230,18 +231,27 @@ def test_redact_hides_bearer_and_keys():
 ANALYZE = f'ANTHROPIC_FEDERATION_RULE_ID = "{R1}"\n'
 
 
+def good_run(wf, sha, **over):
+    event = "push" if wf == "test.yml" else "workflow_dispatch"
+    run = {"id": 1, "path": f".github/workflows/{wf}", "event": event, "head_branch": "main",
+           "head_sha": sha, "status": "completed", "conclusion": "success"}
+    run.update(over)
+    return run
+
+
 class Fake:
     """gh and ant stand-in. Records each call; keeps rule and ruleset state."""
 
     def __init__(self, *, sha=SHA_NEW, ant_installed=True, help_text="retrieve  update  list",
                  analyze=ANALYZE, test_ok=True, compare_status="identical", role="admin",
-                 rule_after=None, login_raises=None):
+                 rule_after=None, login_raises=None, runs=None, logout=None, put=None):
         self.calls: list[tuple[list[str], dict]] = []
         self.rules = {R1: rule(R1), R2: rule(R2, prefix="OperationCode/claude-review-test/.github/workflows/v.yml@")}
         self.rulesets = {rid: ruleset(rid) for rid, _ in release.RULESETS}
         self.ant_installed, self.help_text, self.analyze = ant_installed, help_text, analyze
         self.test_ok, self.compare_status, self.role = test_ok, compare_status, role
         self.rule_after, self.login_raises = rule_after, login_raises
+        self.sha, self.runs, self.logout, self.put = sha, runs, logout, put
         self.config_dirs: set[str] = set()
 
     def __call__(self, cmd, **kw):
@@ -265,10 +275,15 @@ class Fake:
             return subprocess.CompletedProcess([], 0, self.help_text, "")
         if args[:2] == ["auth", "login"]:
             assert "capture_output" not in kw  # interactive: owner sees the URL
+            cred = Path(env["ANTHROPIC_CONFIG_DIR"]) / "credentials" / "admin.json"
+            cred.parent.mkdir(parents=True, exist_ok=True)
+            cred.write_text('{"access_token": "synthetic", "refresh_token": "synthetic"}')
             if self.login_raises:
                 raise self.login_raises
             return self.ok()
         if args[:2] == ["auth", "logout"]:
+            if self.logout:
+                return self.logout(env)
             return self.ok()
         rid = args[args.index("--federation-rule-id") + 1]
         if args[1] == "retrieve":
@@ -291,15 +306,18 @@ class Fake:
             new = copy.deepcopy(self.rulesets[rid])
             new.update(json.loads(kw["input"]))
             new["updated_at"] = "t1"
+            if self.put:
+                return self.put(rid, new, self)
             self.rulesets[rid] = new
             return self.ok(new)
         if "/compare/" in path:
             return self.ok({"status": self.compare_status, "ahead_by": 0})
         if "/actions/workflows/" in path:
             wf = path.split("/actions/workflows/")[1].split("/")[0]
+            if self.runs is not None:
+                return self.ok({"workflow_runs": self.runs.get(wf, [])})
             concl = "success" if self.test_ok or wf != "test.yml" else "failure"
-            return self.ok({"workflow_runs": [{"id": 1, "path": f".github/workflows/{wf}",
-                                               "status": "completed", "conclusion": concl}]})
+            return self.ok({"workflow_runs": [good_run(wf, self.sha, conclusion=concl)]})
         if "/contents/" in path:
             return self.ok({"content": base64.b64encode(self.analyze.encode()).decode()})
         if path == "user":
@@ -372,7 +390,7 @@ def test_release_without_confirmation_changes_nothing_and_logs_out(capsys):
 
 
 @pytest.mark.parametrize("kw,msg", [
-    (dict(test_ok=False), "no successful test.yml run"),
+    (dict(test_ok=False), "no successful test.yml push run on main"),
     (dict(compare_status="diverged"), "is not on main"),
     (dict(analyze='ANTHROPIC_FEDERATION_RULE_ID = "fdrl_000000000000000000000000"\n'), "names rule"),
     (dict(role="member"), "needs an org owner"),
@@ -502,3 +520,206 @@ def test_no_workflow_runs_the_release_tool():
 def test_default_runner_is_guarded_in_tests():
     with pytest.raises(AssertionError, match="real subprocess"):
         release.main(["plan", "--sha", SHA_NEW, "--no-console"])
+
+
+# ---------------------------------------------------------------- fix round 1: release run checks
+
+
+def _gh_only(fake):
+    return release.github_preconditions(release.GitHub(fake), SHA_NEW, R1)
+
+
+def test_preconditions_accept_push_and_dispatch_runs_on_main():
+    assert _gh_only(Fake(runs={"test.yml": [good_run("test.yml", SHA_NEW)],
+                               "eval.yml": [good_run("eval.yml", SHA_NEW)]})) == []
+
+
+@pytest.mark.parametrize("wf,over", [
+    ("test.yml", {"event": "pull_request", "head_branch": "candidate"}),
+    ("test.yml", {"event": "pull_request"}),
+    ("test.yml", {"event": "pull_request_target"}),
+    ("test.yml", {"head_branch": "candidate"}),
+    ("test.yml", {"head_sha": SHA_OLD}),
+    ("test.yml", {"path": ".github/workflows/other.yml"}),
+    ("test.yml", {"status": "in_progress", "conclusion": None}),
+    ("eval.yml", {"event": "pull_request", "head_branch": "candidate"}),
+    ("eval.yml", {"event": "push"}),
+    ("eval.yml", {"head_branch": "candidate"}),
+    ("eval.yml", {"head_sha": SHA_OLD}),
+])
+def test_preconditions_refuse_a_run_of_the_wrong_kind(wf, over, capsys):
+    runs = {w: [good_run(w, SHA_NEW)] for w in ("test.yml", "eval.yml")}
+    runs[wf] = [good_run(wf, SHA_NEW, **over)]
+    fails = _gh_only(Fake(runs=runs))
+    assert len(fails) == 1 and wf in fails[0]
+
+
+def test_release_refuses_when_only_pull_request_runs_passed_at_the_sha(capsys):
+    pr = {w: [good_run(w, SHA_NEW, event="pull_request", head_branch="candidate")] for w in ("test.yml", "eval.yml")}
+    fake = Fake(runs=pr)
+    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with(f"release {SHA_NEW[:12]}")) == 2
+    assert fake.writes() == [] and not any(c[0] == "ant" for c, _ in fake.calls)
+
+
+# ---------------------------------------------------------------- fix round 1: credential cleanup
+
+
+def _cred_files(fake):
+    return [p for d in fake.config_dirs for p in Path(d).rglob("*") if p.is_file()]
+
+
+def test_logout_raising_keyboardinterrupt_leaves_no_credential_file():
+    def logout(env):
+        assert (Path(env["ANTHROPIC_CONFIG_DIR"]) / "credentials" / "admin.json").exists()
+        raise KeyboardInterrupt()
+
+    fake = Fake(logout=logout)
+    assert release.main(["plan", "--sha", SHA_NEW], run=fake) == 130
+    assert fake.config_dirs and _cred_files(fake) == []
+    assert all(not os.path.exists(d) for d in fake.config_dirs)
+
+
+def test_logout_raising_any_exception_leaves_no_credential_file():
+    def logout(env):
+        raise RuntimeError("synthetic")
+
+    fake = Fake(logout=logout)
+    with pytest.raises(RuntimeError):
+        release.main(["plan", "--sha", SHA_NEW], run=fake)
+    assert all(not os.path.exists(d) for d in fake.config_dirs)
+
+
+def test_a_signal_during_cleanup_is_held_until_cleanup_ends():
+    seen = []
+
+    def logout(env):
+        signal.raise_signal(signal.SIGINT)
+        seen.append("logout finished")  # the signal must not cut logout short
+        return Fake.ok()
+
+    fake = Fake(logout=logout)
+    assert release.main(["plan", "--sha", SHA_NEW], run=fake) == 130
+    assert seen == ["logout finished"]
+    assert all(not os.path.exists(d) for d in fake.config_dirs)
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+def test_a_failed_delete_is_loud_and_makes_the_run_fail(monkeypatch, capsys):
+    real_rmtree = release.shutil.rmtree
+    dirs = []
+
+    def no_delete(path, onexc=None):
+        dirs.append(path)
+        onexc(os.rmdir, path, PermissionError("synthetic"))
+
+    monkeypatch.setattr(release.shutil, "rmtree", no_delete)
+    fake = Fake()
+    rc = release.main(["plan", "--sha", SHA_NEW], run=fake)
+    err = capsys.readouterr().err
+    monkeypatch.setattr(release.shutil, "rmtree", real_rmtree)
+    for d in dirs:
+        real_rmtree(d, ignore_errors=True)
+    assert rc == 3
+    assert "could not delete" in err and "rm -rf" in err and "CLEANUP FAILED" in err
+
+
+# ---------------------------------------------------------------- fix round 1: partial failure report
+
+
+def _fail_put_on(target, *, apply_first=False):
+    def put(rid, new, fake):
+        if rid == target:
+            if apply_first:
+                fake.rulesets[rid] = new  # the write reached GitHub, the reply was lost
+            return Fake.ok(rc=1, stderr="synthetic ruleset failure")
+        fake.rulesets[rid] = new
+        return Fake.ok(new)
+    return put
+
+
+FIRST, SECOND = (rid for rid, _ in release.RULESETS)
+
+
+def _release(fake):
+    return release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with(f"release {SHA_NEW[:12]}"))
+
+
+def _state_lines(err):
+    return {ln.split()[1]: ln for ln in err.splitlines() if ln.startswith("  rule ") or ln.startswith("  ruleset ")}
+
+
+def test_first_ruleset_failure_reports_state_and_rollback(capsys):
+    fake = Fake(put=_fail_put_on(FIRST))
+    assert _release(fake) == 2
+    err = capsys.readouterr().err
+    assert "RELEASE INCOMPLETE" in err
+    lines = _state_lines(err)
+    assert "done" in lines[R1] and SHA_NEW in lines[R1]
+    assert "failed" not in lines[str(FIRST)] and "sent" in lines[str(FIRST)] and f"now {SHA_OLD}" in lines[str(FIRST)]
+    assert "pending" in lines[str(SECOND)] and f"now {SHA_OLD}" in lines[str(SECOND)]
+    assert f"make release SHA={SHA_OLD}" in err and f"make release SHA={SHA_NEW}" in err
+    assert "Records: " in err
+
+
+def test_second_ruleset_failure_reports_state_and_rollback(capsys):
+    fake = Fake(put=_fail_put_on(SECOND))
+    assert _release(fake) == 2
+    err = capsys.readouterr().err
+    lines = _state_lines(err)
+    assert "done" in lines[str(FIRST)] and f"now {SHA_NEW}" in lines[str(FIRST)]
+    assert "sent" in lines[str(SECOND)] and f"now {SHA_OLD}" in lines[str(SECOND)]
+    assert f"make release SHA={SHA_OLD}" in err
+
+
+def test_ambiguous_write_is_reported_as_sent_with_the_real_state(capsys):
+    fake = Fake(put=_fail_put_on(FIRST, apply_first=True))
+    assert _release(fake) == 2
+    err = capsys.readouterr().err
+    lines = _state_lines(err)
+    assert "sent" in lines[str(FIRST)] and f"now {SHA_NEW}" in lines[str(FIRST)]  # re-read shows it landed
+    assert "may have reached the server" in err
+    assert f"make release SHA={SHA_OLD}" in err
+
+
+def test_ambiguous_rule_write_rereads_the_rule_before_logout(capsys):
+    fake = Fake()
+    real = fake.ant
+
+    def ant(args, kw):
+        if len(args) > 1 and args[1] == "update":
+            real(args, kw)  # lands on the server
+            return Fake.ok(rc=1, stderr="synthetic timeout")
+        return real(args, kw)
+
+    fake.ant = ant
+    assert _release(fake) == 2
+    err = capsys.readouterr().err
+    lines = _state_lines(err)
+    assert "sent" in lines[R1] and f"now {SHA_NEW}" in lines[R1]
+    assert all("pending" in lines[str(r)] for r in (FIRST, SECOND))
+    assert not any("-X" in c for c in fake.writes())
+    assert f"make release SHA={SHA_OLD}" in err
+
+
+def test_differing_previous_pins_give_per_object_recovery_not_one_sha(capsys):
+    fake = Fake(put=_fail_put_on(SECOND))
+    other = "1" * 40
+    fake.rulesets[SECOND] = ruleset(SECOND, other)
+    assert _release(fake) == 2
+    err = capsys.readouterr().err
+    assert "no single rollback SHA" in err
+    assert f"make release SHA={SHA_OLD}" not in err and f"make release SHA={other}" not in err
+    assert f"rulesets/{SECOND} --input" in err and f"ruleset-{SECOND}-rollback-body.json" in err
+    body = json.loads(next(release.RECORDS.rglob(f"ruleset-{SECOND}-rollback-body.json")).read_text())
+    assert release.ruleset_pin({"id": SECOND, "rules": body["rules"]}) == other
+
+
+def test_failure_before_any_write_prints_no_state_report(capsys):
+    fake = Fake()
+
+    def ask(_prompt):
+        fake.rules[R1]["name"] = "changed meanwhile"
+        return f"release {SHA_NEW[:12]}"
+
+    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=ask) == 2
+    assert "RELEASE INCOMPLETE" not in capsys.readouterr().err
