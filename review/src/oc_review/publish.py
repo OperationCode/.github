@@ -848,7 +848,7 @@ def build_review(
     if not comments:
         return None, outcome
     body = (
-        f"OC Claude review, run {result.run_id}: {len(comments)} inline finding(s). "
+        f"Claude of Duty review, run {result.run_id}: {len(comments)} inline finding(s). "
         f"{UNTRUSTED_NOTE} The gate result is in the summary comment."
     )
     request = {"commit_id": head_sha, "event": REVIEW_EVENT, "body": body, "comments": comments}
@@ -1411,7 +1411,7 @@ def _callout(result: verdict.GateResult, rows: list[_Row], hard: list[_Row], has
         first = f"**This review is out of date. No waiver can clear this.**{also}"
         nxt = "**Next step:** read the newest run in the merge box."
     elif verdict.R_SIZE_GATE in codes:
-        first = "**Out of range.** This change is too large for the model review. File checks ran, model checks did not. A maintainer can waive this."
+        first = "**Out of range.** This change is too large for the model review. File checks ran, but model checks did not. A maintainer can waive this."
         nxt = '**Next step for the author:** split the change, or ask a maintainer for a waiver (under "Waiver" below).'
     else:
         phrase = _blocking_phrase(model)

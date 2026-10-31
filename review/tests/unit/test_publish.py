@@ -1267,7 +1267,7 @@ def test_grant_deleted_before_final_check(tmp_path):
     r = run(tmp_path, gh, passes=clean_passes(supply_chain=[BLOCKING]))
     assert r.code == 1
     assert len(r.gh.summary_bodies()) == 2  # pass summary, then the update to fail
-    assert "## 🔴 Hold deployment: Claude of Duty identified" in r.summary
+    assert "\n## 🔴 Hold deployment: Claude of Duty identified 1 item requiring attention\n" in "\n" + r.summary
 
 
 # ---------------------------------------------------------------- final check
@@ -1359,9 +1359,9 @@ def test_size_gate_records_show_reason(tmp_path):
     assert reason_codes(r.summary) == {"size-gate"}
     assert "too large for automatic review" in plain(r.summary)
     assert ("**Out of range.** This change is too large for the model review. File checks ran, "
-            "model checks did not. A maintainer can waive this.") in r.summary
+            "but model checks did not. A maintainer can waive this.") in r.summary
     # the size gate has one reason row and no finding row, so the count is 1 or absent but never wrong
-    assert "## 🔴 Hold deployment: Claude of Duty identified" in r.summary
+    assert "\n## 🔴 Hold deployment: Claude of Duty identified 1 item requiring attention\n" in "\n" + r.summary
 
 
 def test_missing_needs_and_outcome_fail_with_summary(tmp_path):

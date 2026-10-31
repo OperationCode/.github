@@ -459,24 +459,35 @@ def test_mission_line_sits_directly_under_the_heading(rendered):
     assert publish.APPROVAL_NOTE in r.summary and "This bot never approves" not in r.summary
 
 
-def test_fail_count_equals_findings_table_rows(rendered):
-    _, r = rendered
-    if r.code != 1 or "Comms down" in r.summary:
-        return
-    head = next(line for line in r.summary.split("\n") if line.startswith("## "))
-    rows = []
-    in_table = False
-    for ln in r.summary.split("\n"):
-        if ln.startswith("| Severity |"):
-            in_table = True
-        elif in_table and ln.startswith("|---"):
+def test_fail_count_equals_findings_table_rows(tmp_path_factory):
+    checked = 0
+    for name, case in CASES.items():
+        r = case(tmp_path_factory.mktemp(name))
+        if r.code != 1 or "Comms down" in r.summary:
             continue
-        elif in_table and ln.startswith("| "):
-            rows.append(ln)
-        elif in_table:
-            break
-    m = re.search(r"identified (\d+) items?", head)
-    assert (int(m.group(1)) if m else 0) == len(rows)
+        head = next(line for line in r.summary.split("\n") if line.startswith("## "))
+        rows = []
+        in_table = False
+        for ln in r.summary.split("\n"):
+            if ln.startswith("| Severity |"):
+                in_table = True
+            elif in_table and ln.startswith("|---"):
+                continue
+            elif in_table and ln.startswith("| "):
+                rows.append(ln)
+            elif in_table:
+                break
+        m = re.search(r"identified (\d+) items?", head)
+        assert m and int(m.group(1)) == len(rows) > 0, name
+        checked += 1
+    assert checked >= 3
+
+
+def test_b2_pass_with_two_findings_uses_the_plural(tmp_path):
+    one = finding("bug", "low", title="First.", quote="shell=True")
+    two = finding("bug", "low", line=11, quote="line 11", title="Second.")
+    s = run(tmp_path, passes=clean_passes(review=[one, two])).summary
+    assert "\n## 🟡 Clear to proceed: Claude of Duty logged 2 items to consider\n" in "\n" + s
 
 
 def test_fail_heading_without_rows_has_no_number():
