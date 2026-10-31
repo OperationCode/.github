@@ -132,7 +132,7 @@ def table_rows(s: str, header_start: str) -> list[list[str]]:
 
 def test_a_pass_clean(tmp_path):
     s = case_a(tmp_path).summary
-    assert s.startswith(verdict.STICKY_MARKER + "\n## 🟢 PASS: OC Claude review\n")
+    assert s.startswith(verdict.STICKY_MARKER + "\n## 🟢 All clear: Claude of Duty review passed\n")
     assert callout_kind(s) == "TIP"
     assert "No findings. This review found no reason to block." in s
     assert "| Severity |" not in s  # no findings table
@@ -142,7 +142,7 @@ def test_a_pass_clean(tmp_path):
 
 def test_b_pass_with_a_minor_finding(tmp_path):
     s = case_b(tmp_path).summary
-    assert "## 🟡 PASS: OC Claude review, 1 finding to consider\n" in s
+    assert "## 🟡 Clear to proceed: Claude of Duty logged 1 item to consider\n" in s
     assert callout_kind(s) == "NOTE"
     assert "It does not block this PR." in s
     [row] = table_rows(s, "| Severity |")
@@ -155,7 +155,7 @@ def test_c_waivable_fail_is_red_caution(tmp_path):
     r = case_c(tmp_path)
     s = r.summary
     assert r.code == 1
-    assert "## 🔴 FAIL: OC Claude review\n" in s
+    assert "\n## 🔴 Hold deployment: Claude of Duty identified " in s
     assert callout_kind(s) == "CAUTION" and "[!WARNING]" not in s  # ruling 1
     assert "**One high-severity security finding blocks this PR.** A maintainer can waive it." in s
     assert "ask a maintainer to post the waiver line" in s
@@ -168,7 +168,7 @@ def test_c_waivable_fail_is_red_caution(tmp_path):
 def test_d_hard_block_comes_first_and_has_no_waiver(tmp_path):
     r = case_d(tmp_path)
     s = r.summary
-    assert "## 🔴 FAIL: OC Claude review\n" in s and callout_kind(s) == "CAUTION"
+    assert "\n## 🔴 Hold deployment: Claude of Duty identified " in s and callout_kind(s) == "CAUTION"
     assert "**Hidden text-direction control blocks this PR. No waiver can clear it.**" in s
     assert "One high-severity" in s and "also blocks." in s
     rows = table_rows(s, "| Severity |")
@@ -185,7 +185,7 @@ def test_d_hard_block_comes_first_and_has_no_waiver(tmp_path):
 def test_e_pass_that_did_not_run(tmp_path):
     r = case_e(tmp_path)
     s = r.summary
-    assert "## 🔴 FAIL: OC Claude review did not complete\n" in s and callout_kind(s) == "CAUTION"
+    assert "## 🔴 Comms down: the Claude of Duty review did not complete\n" in s and callout_kind(s) == "CAUTION"
     assert "The Security review did not run, so this PR could not be judged. No waiver can clear this." in s
     [row] = table_rows(s, "| Severity |")
     assert row[:3] == ["⚠️ **Not run**", "Blocks, no waiver", "Security pass"]
@@ -199,7 +199,7 @@ def test_e_pass_that_did_not_run(tmp_path):
 
 def test_f_pr39_waivable_fail_is_red_caution_with_two_rows(tmp_path):
     s = case_f(tmp_path).summary
-    assert "## 🔴 FAIL: OC Claude review\n" in s
+    assert "\n## 🔴 Hold deployment: Claude of Duty identified " in s
     assert callout_kind(s) == "CAUTION" and "[!WARNING]" not in s  # ruling 1: not the yellow signal
     assert "A maintainer can waive it." in s
     # Ruling 3: the high finding blocks, the two medium findings do not. Different effects, different rows.
@@ -220,15 +220,15 @@ def test_a_fail_never_uses_the_warning_callout(rendered):
     s = r.summary
     assert "[!WARNING]" not in s
     if r.code == 1:
-        assert callout_kind(s) == "CAUTION" and "🔴 FAIL" in s
+        assert callout_kind(s) == "CAUTION" and "🔴 " in s
     else:
-        assert callout_kind(s) in ("TIP", "NOTE") and "PASS" in s
+        assert callout_kind(s) in ("TIP", "NOTE") and ("All clear" in s or "Clear to proceed" in s)
 
 
 def test_the_comment_never_implies_approval(rendered):
     _, r = rendered
     s = r.summary.lower()
-    assert "approved" not in s and "this bot never approves a pr" in s
+    assert "approved" not in s and "claude of duty never approves a pr" in s
     assert s.count("never approves") == 1
 
 
@@ -356,7 +356,7 @@ def test_a_waiver_applied_is_a_green_pass_and_the_findings_stay_listed(tmp_path)
     from .test_publish import override
     r = run(tmp_path, FakeGitHub(issue_comments=[override(1)]), passes=clean_passes(supply_chain=[BLOCKING]))
     s = r.summary
-    assert r.code == 0 and "## 🟢 PASS: OC Claude review\n" in s and callout_kind(s) == "TIP"
+    assert r.code == 0 and "## 🟢 All clear: Claude of Duty review passed\n" in s and callout_kind(s) == "TIP"
     assert "A maintainer waiver was applied by maintainer. Findings stay listed." in s
     assert s.lower().count("never approves") == 1
     [row] = table_rows(s, "| Severity |")
@@ -406,7 +406,7 @@ def test_g_no_bundle_is_not_an_author_fix(tmp_path):
         Path(out).mkdir(parents=True, exist_ok=True)
         (Path(out) / "g-no-bundle.md").write_text(s, encoding="utf-8")
     assert r.code == 1
-    assert "## 🔴 FAIL: OC Claude review did not complete\n" in s and callout_kind(s) == "CAUTION"
+    assert "## 🔴 Comms down: the Claude of Duty review did not complete\n" in s and callout_kind(s) == "CAUTION"
     callout = "\n".join(line for line in s.split("\n") if line.startswith("> "))
     assert "A required check did not complete" in callout
     assert "a maintainer re-runs the newest run" in callout
@@ -449,3 +449,48 @@ def test_long_path_is_cut_once(monkeypatch):
     monkeypatch.setattr(publish, "_finding_effect", lambda *_: publish.EFFECT_NONE)
     [row] = publish._merge_findings(result, publish.InlineOutcome())
     assert row.where.count("…") == 1 and "[truncated]" not in row.where
+
+
+def test_mission_line_sits_directly_under_the_heading(rendered):
+    _, r = rendered
+    lines = r.summary.split("\n")
+    i = next(n for n, line in enumerate(lines) if line.startswith("## "))
+    assert lines[i + 1] == publish.MISSION_LINE and r.summary.count(publish.MISSION_LINE) == 1
+    assert publish.APPROVAL_NOTE in r.summary and "This bot never approves" not in r.summary
+
+
+def test_fail_count_equals_findings_table_rows(tmp_path_factory):
+    checked = 0
+    for name, case in CASES.items():
+        r = case(tmp_path_factory.mktemp(name))
+        if r.code != 1 or "Comms down" in r.summary:
+            continue
+        head = next(line for line in r.summary.split("\n") if line.startswith("## "))
+        rows = []
+        in_table = False
+        for ln in r.summary.split("\n"):
+            if ln.startswith("| Severity |"):
+                in_table = True
+            elif in_table and ln.startswith("|---"):
+                continue
+            elif in_table and ln.startswith("| "):
+                rows.append(ln)
+            elif in_table:
+                break
+        m = re.search(r"identified (\d+) items?", head)
+        assert m and int(m.group(1)) == len(rows) > 0, name
+        checked += 1
+    assert checked >= 3
+
+
+def test_b2_pass_with_two_findings_uses_the_plural(tmp_path):
+    one = finding("bug", "low", title="First.", quote="shell=True")
+    two = finding("bug", "low", line=11, quote="line 11", title="Second.")
+    s = run(tmp_path, passes=clean_passes(review=[one, two])).summary
+    assert "\n## 🟡 Clear to proceed: Claude of Duty logged 2 items to consider\n" in "\n" + s
+
+
+def test_fail_heading_without_rows_has_no_number():
+    result = SimpleNamespace(status=verdict.FAIL, codes=set(), override_applied=False)
+    assert publish._status_heading(result, [], []) == (
+        "## 🔴 Hold deployment: Claude of Duty identified items requiring attention")

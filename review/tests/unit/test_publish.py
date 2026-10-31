@@ -384,7 +384,7 @@ def test_clean_run_passes_and_posts_summary(tmp_path):
     assert not r.gh.bodies("POST", "/reviews")
     s = r.summary
     assert s.startswith(verdict.STICKY_MARKER)
-    assert "## 🟢 PASS: OC Claude review" in s
+    assert "## 🟢 All clear: Claude of Duty review passed" in s
     assert r.record["result"] == "pass"
 
 
@@ -419,7 +419,7 @@ def test_summary_has_every_required_field(tmp_path):
         "| Review | 12000 | 900 | 11000 | 0 | 1 |",
         "| **Total** | 36000 | 2700 | 33000 | 0 | 3 |",
         "The required workflow in the merge box is the result that counts.",
-        "This bot never approves a PR.",
+        "Claude of Duty never approves a PR. A human reviewer gives the final approval.",
     ):
         assert text in s, text
 
@@ -971,7 +971,7 @@ def test_summary_under_limit_and_cut_in_order(tmp_path):
     assert len(s) < publish.SUMMARY_MAX_CHARS
     assert publish.TRUNCATED_NOTE in s
     # Never cut: result, reasons, SHAs.
-    assert "## 🔴 FAIL: OC Claude review" in s and f"`{HEAD}`" in s
+    assert "## 🔴 Hold deployment: Claude of Duty identified" in s and f"`{HEAD}`" in s
     assert has_reason(s, "blocking-finding", True)
     # Cut first: unverified findings; high findings stay.
     assert "low bug 0" not in s
@@ -1073,7 +1073,7 @@ def test_critical_findings_with_a_cut_path_are_never_cut_from_the_summary(tmp_pa
     r = run(tmp_path, passes=passes)
     assert r.code == 1 and r.gh.bodies("POST", "/reviews") == []
     s = plain(r.summary)
-    assert publish.OVERFLOW_NOTE in s and "could not publish" in s
+    assert publish.OVERFLOW_NOTE in s and "could not post its full report" in s
     assert not any(c in s for c in claims(passes))  # no partial list
     assert r.record["result"] == "fail" and r.record["publish_error"]
     rec = full_record_from_log(capsys.readouterr().out)
@@ -1112,7 +1112,7 @@ def test_reasons_that_do_not_fit_fail_closed(tmp_path, capsys):
     s = r.summary
     assert r.code == 1
     assert len(s) < publish.SUMMARY_MAX_CHARS
-    assert "## 🔴 FAIL: OC Claude review" in s and publish.OVERFLOW_NOTE in s
+    assert "## 🔴 Comms down: Claude of Duty could not post its full report" in s and publish.OVERFLOW_NOTE in s
     assert f"| `{HEAD}` | `{MB}` | main |" in s
     assert "| Hard block from the file checks | 🚫 no | 400 reason(s) |" in s
     # No partial reason list: either every reason or none.
@@ -1190,7 +1190,7 @@ def test_stale_before_final_summary_update_writes_nothing(tmp_path, trigger):
         kw["passes"] = clean_passes(supply_chain=[BLOCKING])
     r = run(tmp_path, gh, **kw)
     assert r.code == 1
-    assert len(r.gh.summary_bodies()) == 1 and "## 🟢 PASS: OC Claude review" in r.summary
+    assert len(r.gh.summary_bodies()) == 1 and "## 🟢 All clear: Claude of Duty review passed" in r.summary
     assert r.gh.paths("PATCH") == []
     assert "stale" in r.record["reasons"]
 
@@ -1267,7 +1267,7 @@ def test_grant_deleted_before_final_check(tmp_path):
     r = run(tmp_path, gh, passes=clean_passes(supply_chain=[BLOCKING]))
     assert r.code == 1
     assert len(r.gh.summary_bodies()) == 2  # pass summary, then the update to fail
-    assert "## 🔴 FAIL: OC Claude review" in r.summary
+    assert "\n## 🔴 Hold deployment: Claude of Duty identified 1 item requiring attention\n" in "\n" + r.summary
 
 
 # ---------------------------------------------------------------- final check
@@ -1278,8 +1278,8 @@ def test_newer_run_supersedes_and_updates_summary(tmp_path):
     r = run(tmp_path, gh)
     assert r.code == 1
     first, last = r.gh.summary_bodies()
-    assert "## 🟢 PASS: OC Claude review" in first
-    assert "## 🔴 FAIL: OC Claude review" in last and has_reason(last, "superseded", False)
+    assert "## 🟢 All clear: Claude of Duty review passed" in first
+    assert "## 🔴 Hold deployment: Claude of Duty identified" in last and has_reason(last, "superseded", False)
     assert r.gh.paths("PATCH")  # the update edits the comment the run posted
 
 
@@ -1358,6 +1358,10 @@ def test_size_gate_records_show_reason(tmp_path):
             passes={n: pass_doc(n, "skipped-size") for n in verdict.PASS_NAMES})
     assert reason_codes(r.summary) == {"size-gate"}
     assert "too large for automatic review" in plain(r.summary)
+    assert ("**Out of range.** This change is too large for the model review. File checks ran, "
+            "but model checks did not. A maintainer can waive this.") in r.summary
+    # the size gate has one reason row and no finding row, so the count is 1 or absent but never wrong
+    assert "\n## 🔴 Hold deployment: Claude of Duty identified 1 item requiring attention\n" in "\n" + r.summary
 
 
 def test_missing_needs_and_outcome_fail_with_summary(tmp_path):

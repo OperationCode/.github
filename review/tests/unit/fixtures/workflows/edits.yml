@@ -140,8 +140,8 @@
   expect: continue-on-error
 - id: continue-on-error-job
   file: claude-review.yml
-  old: "  analyze:\n    needs: collect\n"
-  new: "  analyze:\n    needs: collect\n    continue-on-error: true\n"
+  old: "  analyze:\n    name: Analysis\n    needs: collect\n"
+  new: "  analyze:\n    name: Analysis\n    needs: collect\n    continue-on-error: true\n"
   expect: continue-on-error
 
 # --- central workflow: trigger, permissions, concurrency, jobs ---
@@ -222,20 +222,20 @@
   expect: needs
 - id: environment-in-central
   file: claude-review.yml
-  old: "  collect:\n    runs-on: ubuntu-24.04\n"
-  new: "  collect:\n    runs-on: ubuntu-24.04\n    environment: production\n"
+  old: "  collect:\n    name: Recon\n    runs-on: ubuntu-24.04\n"
+  new: "  collect:\n    name: Recon\n    runs-on: ubuntu-24.04\n    environment: production\n"
   expect: environment
 - id: eval-environment-in-central
   file: claude-review.yml
-  old: "  oc-claude-review:\n    needs: [collect, analyze, dependency-review]\n"
-  new: "  oc-claude-review:\n    needs: [collect, analyze, dependency-review]\n    environment: eval\n"
+  old: "  oc-claude-review:\n    name: Mission report\n    needs: [collect, analyze, dependency-review]\n"
+  new: "  oc-claude-review:\n    name: Mission report\n    needs: [collect, analyze, dependency-review]\n    environment: eval\n"
   expect: [eval-environment, environment, eval-permissions]
 
 # --- central workflow: if ---
 - id: job-if-on-analyze
   file: claude-review.yml
-  old: "  analyze:\n    needs: collect\n"
-  new: "  analyze:\n    needs: collect\n    if: always()\n"
+  old: "  analyze:\n    name: Analysis\n    needs: collect\n"
+  new: "  analyze:\n    name: Analysis\n    needs: collect\n    if: always()\n"
   expect: job-if
 - id: gate-if-changed
   file: claude-review.yml

@@ -24,7 +24,7 @@
 # (the action accepts that only in block mode). Block mode is revisited
 # before org-wide enforcement (build plan, phase 5).
 
-name: claude-review
+name: Claude of Duty
 
 on: pull_request_target
 
@@ -32,6 +32,7 @@ permissions: {}
 
 jobs:
   collect:
+    name: Recon
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -94,6 +95,7 @@ jobs:
           retention-days: 3
 
   analyze:
+    name: Analysis
     needs: collect
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -198,6 +200,7 @@ jobs:
           retention-days: 3
 
   dependency-review:
+    name: Supply line check
     needs: collect
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -226,6 +229,7 @@ jobs:
           show-openssf-scorecard: false
 
   oc-claude-review:
+    name: Mission report
     needs: [collect, analyze, dependency-review]
     if: always()
     runs-on: ubuntu-24.04
