@@ -251,15 +251,13 @@ Exit criteria:
 
 ## Each release (from phase 4 on)
 
-One federation rule allows one SHA, and every release is validated at its final SHA before a pin moves (spec "Auth and cost", "Each release"):
+Each release edits rule R1 in place, once, at the merge SHA, with the owner-run release tool (spec "Auth and cost", "Each release"; decision P4-9):
 
-- [ ] Owner: create a new federation rule R2 as a copy of the current rule R1, with the placeholder SHA `0000000000000000000000000000000000000000` in `job_workflow_ref`. Read it back (V26).
-- [ ] Put the R2 ID in the central code. That commit is the release candidate S2.
-- [ ] Owner: set `job_workflow_ref` of R2 to S2 and read it back.
-- [ ] Validate S2, for every release: unit tests pass, the owner-approved fixture eval passes, and a run under the scratch test ruleset pinned to S2 gets a token through R2.
-- [ ] Merge. If the merge makes a new SHA, check that its tree equals S2 (`git diff` is empty, so the content and rule ID are the same). If the trees differ, treat the merge SHA as a new candidate and go back to the step that sets R2. That SHA is the release SHA. Phase 3 learned: every squash merge makes a new SHA, so one release takes two Console edits per rule, the candidate SHA and then the merge SHA.
-- [ ] Before the second Console edit, pin the scratch test ruleset to the merge SHA and run once: the exchange must be denied, because the rule still names the candidate SHA (phase 3: run 40583290922). Then the owner sets R2 to the merge SHA and reads it back.
-- [ ] Pin the scratch test ruleset to the release SHA and do one token exchange through R2. Any new candidate, for example a fix commit after a failed validation, repeats from the step that sets R2 to the candidate SHA.
-- [ ] Owner: move the pin of every ruleset that requires the workflow (the pilot ruleset, the org ruleset, or both) to the release SHA, then read each back: `repository_id`, path, `sha`, no `ref`.
-- [ ] Start a new run on each open PR (push, or close and reopen). Do not re-run old runs: after R1 is deleted, a re-run at the old SHA fails auth. Do this after every pin move, also a move back: the box counts only runs at the pinned SHA, so a move back revives older passes at that SHA (spec "Pinned SHA only").
-- [ ] Owner: delete R1 only when each new run has completed at the release SHA (`job.workflow_sha`); a queued run does not count (V22).
+- [ ] Merge the release PR. The merge SHA is the release SHA.
+- [ ] Validate at the release SHA: `test.yml` (push to main) and the owner-approved fixture eval (`eval.yml`) both conclude success.
+- [ ] Owner: `make release-plan SHA=<release SHA>`. Read the plan: every precondition `ok`, the R1 `job_workflow_ref` change, and the pin change of each ruleset.
+- [ ] Owner: `make release SHA=<release SHA>`. Type the confirmation. The tool edits R1 first, then moves the pin of every ruleset that requires the workflow (the pilot ruleset and the scratch test ruleset), and reads all three back. A required run started between the rule edit and the last pin move fails closed. A non-zero exit means a step did not read back as planned: read the message and the files in `release-records/`, then run the same command again or roll back.
+- [ ] Start a new run on each open PR (push, or close and reopen). Do not re-run old runs: a run at the old SHA fails auth. Do this after every pin move, also a move back: the box counts only runs at the pinned SHA (spec "Pinned SHA only").
+- [ ] Check one run under the scratch test ruleset (claude-review-test) gets a token at the release SHA.
+- Rollback: `make release SHA=<previous release SHA>`, then new runs on each open PR.
+- After a change to the release tool or to `ant`: `make release-rule-test RULE=fdrl_01AfACzupW3U4Bx361ZUbsyR SHA=<sha>` on the scratch rule R2 first.
