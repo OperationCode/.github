@@ -4,7 +4,6 @@ ant call goes to a fake runner."""
 import base64
 import copy
 import importlib.util
-import io
 import json
 import os
 import signal
@@ -245,7 +244,7 @@ class Fake:
 
     def __init__(self, *, sha=SHA_NEW, ant_installed=True, help_text="retrieve  update  list",
                  analyze=ANALYZE, test_ok=True, compare_status="identical", role="admin",
-                 rule_after=None, login_raises=None, runs=None, logout=None, put=None):
+                 rule_after=None, login_raises=None, runs=None, logout=None, put=None, on_retrieve=None):
         self.calls: list[tuple[list[str], dict]] = []
         self.rules = {R1: rule(R1), R2: rule(R2, prefix="OperationCode/claude-review-test/.github/workflows/v.yml@")}
         self.rulesets = {rid: ruleset(rid) for rid, _ in release.RULESETS}
@@ -254,6 +253,7 @@ class Fake:
         self.rule_after, self.login_raises = rule_after, login_raises
         self.sha, self.runs, self.logout, self.put = sha, runs, logout, put
         self.config_dirs: set[str] = set()
+        self.on_retrieve, self.retrieves = on_retrieve, {}
 
     def __call__(self, cmd, **kw):
         self.calls.append((list(cmd), kw))
@@ -288,6 +288,9 @@ class Fake:
             return self.ok()
         rid = args[args.index("--federation-rule-id") + 1]
         if args[1] == "retrieve":
+            self.retrieves[rid] = self.retrieves.get(rid, 0) + 1
+            if self.on_retrieve:
+                self.on_retrieve(self, rid, self.retrieves[rid])
             return self.ok(self.rules[rid])
         if args[1] == "update":
             new = copy.deepcopy(self.rules[rid])
@@ -365,13 +368,44 @@ def _records(tmp_path, monkeypatch):
     assert _repo_records() == before, "a test wrote to the repo's release-records/"
 
 
-def confirm_with(text):
-    return lambda _prompt: text
+def change_r1_on_second_read(fake, rid, n):
+    if rid == R1 and n == 2:  # the read just before the apply
+        fake.rules[R1]["name"] = "changed meanwhile"
+
+
+def test_apply_runs_without_reading_stdin(monkeypatch, capsys):
+    class NoStdin:
+        def read(self, *a):
+            raise AssertionError("stdin was read")
+
+        readline = readlines = read
+
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(release.sys, "stdin", NoStdin())
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("input() called")))
+    fake = Fake()
+    assert release.main(["release", "--sha", SHA_NEW], run=fake) == 0
+    out = capsys.readouterr().out
+    assert fake.writes() != [] and "no prompt" in out and "Apply?" not in out
+
+
+def test_rule_test_applies_without_reading_stdin(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("input() called")))
+    fake = Fake()
+    assert release.main(["rule-test", "--rule", R2, "--sha", SHA_NEW], run=fake) == 0
+    assert fake.writes() != []
+
+
+def test_plan_header_says_read_only_dry_run(capsys):
+    assert release.main(["plan", "--sha", SHA_NEW], run=Fake()) == 0
+    assert "read-only dry run" in capsys.readouterr().out
 
 
 def test_release_applies_console_first_then_pins_and_cleans_up(capsys):
     fake = Fake()
-    rc = release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with("y"))
+    rc = release.main(["release", "--sha", SHA_NEW], run=fake)
     assert rc == 0, capsys.readouterr()
     writes = fake.writes()
     assert writes[0][0] == "ant" and writes[0][2] == "update"
@@ -393,17 +427,8 @@ def test_release_rerun_at_the_same_sha_writes_nothing():
     fake = Fake()
     fake.rules[R1] = rule(sha=SHA_NEW)
     fake.rulesets = {rid: ruleset(rid, SHA_NEW) for rid, _ in release.RULESETS}
-    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with("y")) == 0
+    assert release.main(["release", "--sha", SHA_NEW], run=fake) == 0
     assert fake.writes() == []
-
-
-def test_release_without_confirmation_changes_nothing_and_logs_out(capsys):
-    fake = Fake()
-    rc = release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with("no"))
-    assert rc == 2 and fake.writes() == []
-    assert "not confirmed" in capsys.readouterr().err
-    assert any(c[:3] == ["ant", "auth", "logout"] for c, _ in fake.calls)
-    assert all(not os.path.exists(d) for d in fake.config_dirs)
 
 
 @pytest.mark.parametrize("kw,msg", [
@@ -414,7 +439,7 @@ def test_release_without_confirmation_changes_nothing_and_logs_out(capsys):
 ])
 def test_release_refuses_on_a_failed_precondition_before_any_console_call(kw, msg, capsys):
     fake = Fake(**kw)
-    rc = release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with("y"))
+    rc = release.main(["release", "--sha", SHA_NEW], run=fake)
     assert rc == 2 and fake.writes() == []
     assert not any(c[0] == "ant" for c, _ in fake.calls)
     out = capsys.readouterr()
@@ -424,80 +449,34 @@ def test_release_refuses_on_a_failed_precondition_before_any_console_call(kw, ms
 def test_release_refuses_a_ruleset_with_a_ref():
     fake = Fake()
     fake.rulesets[25835887]["rules"][0]["parameters"]["workflows"][0]["ref"] = "refs/heads/main"
-    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with("y")) == 2
+    assert release.main(["release", "--sha", SHA_NEW], run=fake) == 2
     assert fake.writes() == []
 
 
 def test_release_stops_before_the_pins_when_the_rule_reads_back_wrong(capsys):
     fake = Fake(rule_after=lambda r: r.update(token_lifetime_seconds=3600))
-    rc = release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with("y"))
+    rc = release.main(["release", "--sha", SHA_NEW], run=fake)
     assert rc == 2
     assert "token_lifetime_seconds" in capsys.readouterr().err
     assert not any("-X" in c for c in fake.writes())
 
 
-@pytest.mark.parametrize("answer", ["", "n", "N", "yep", "release " + SHA_NEW[:12], "y y"])
-def test_anything_but_y_or_yes_stops_with_no_write(answer, capsys):
-    fake = Fake()
-    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with(answer)) == 2
-    assert fake.writes() == []
-    assert "not confirmed" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("answer", ["y", "Y", "yes", "YES", "  Yes \n"])
-def test_y_or_yes_applies(answer):
-    fake = Fake()
-    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with(answer)) == 0
-    assert fake.writes() != []
-
-
-def test_eof_at_the_prompt_stops_with_no_write():
-    fake = Fake()
-
-    def ask(_prompt):
-        raise EOFError
-
-    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=ask) == 2
-    assert fake.writes() == []
-
-
-def test_non_tty_stdin_stops_with_no_write(monkeypatch):
-    fake = Fake()
-    monkeypatch.setattr(release.sys, "stdin", io.StringIO("y\n"))
-    assert release.main(["release", "--sha", SHA_NEW], run=fake) == 2
-    assert fake.writes() == []
-
-
-def test_rule_test_prompts_the_same_way(capsys):
-    fake = Fake()
-    prompts = []
-    def ask(p):
-        prompts.append(p)
-        return "n"
-    assert release.main(["rule-test", "--rule", R2, "--sha", SHA_NEW], run=fake, ask=ask) == 2
-    assert prompts == ["Apply? [y/N]: "] and fake.writes() == []
-
-
 def test_release_refuses_a_rule_changed_since_the_plan_read():
-    fake = Fake()
+    fake = Fake(on_retrieve=change_r1_on_second_read)
 
-    def ask(_prompt):
-        fake.rules[R1]["name"] = "changed meanwhile"
-        return "y"
-
-    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=ask) == 2
+    assert release.main(["release", "--sha", SHA_NEW], run=fake) == 2
     assert fake.writes() == []
 
 
 def test_release_refuses_no_console():
     fake = Fake()
-    assert release.main(["release", "--sha", SHA_NEW, "--no-console"], run=fake, ask=confirm_with("x")) == 2
+    assert release.main(["release", "--sha", SHA_NEW, "--no-console"], run=fake) == 2
     assert fake.writes() == []
 
 
 def test_plan_is_read_only_and_logs_out(capsys):
     fake = Fake()
-    assert release.main(["plan", "--sha", SHA_NEW], run=fake, ask=confirm_with("never asked")) == 0
+    assert release.main(["plan", "--sha", SHA_NEW], run=fake) == 0
     assert fake.writes() == []
     out = capsys.readouterr().out
     assert f"{SHA_OLD} -> {SHA_NEW}" in out and "Plan OK" in out
@@ -554,7 +533,7 @@ def test_config_dir_is_private_during_the_run():
 
 def test_rule_test_edits_only_the_given_rule():
     fake = Fake()
-    rc = release.main(["rule-test", "--rule", R2, "--sha", SHA_NEW], run=fake, ask=confirm_with("y"))
+    rc = release.main(["rule-test", "--rule", R2, "--sha", SHA_NEW], run=fake)
     assert rc == 0
     assert fake.rules[R2]["match"]["claims"]["job_workflow_ref"].endswith("@" + SHA_NEW)
     assert fake.rules[R1] == rule(R1)
@@ -616,7 +595,7 @@ def test_preconditions_refuse_a_run_of_the_wrong_kind(wf, over, capsys):
 def test_release_refuses_when_only_pull_request_runs_passed_at_the_sha(capsys):
     pr = {w: [good_run(w, SHA_NEW, event="pull_request", head_branch="candidate")] for w in ("test.yml", "eval.yml")}
     fake = Fake(runs=pr)
-    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with("y")) == 2
+    assert release.main(["release", "--sha", SHA_NEW], run=fake) == 2
     assert fake.writes() == [] and not any(c[0] == "ant" for c, _ in fake.calls)
 
 
@@ -715,7 +694,7 @@ def test_interrupt_during_logout_after_r1_moved_prints_the_state_report(how, cap
 
 def test_rule_test_interrupt_during_logout_prints_the_state_report(capsys):
     fake = Fake(logout=_interrupt_at_logout("signal"))
-    rc = release.main(["rule-test", "--rule", R2, "--sha", SHA_NEW], run=fake, ask=confirm_with("y"))
+    rc = release.main(["rule-test", "--rule", R2, "--sha", SHA_NEW], run=fake)
     assert rc == 130
     err = capsys.readouterr().err
     assert "RELEASE INCOMPLETE" in err and f"make release-rule-test RULE={R2} SHA={SHA_OLD}" in err
@@ -723,11 +702,12 @@ def test_rule_test_interrupt_during_logout_prints_the_state_report(capsys):
 
 
 def test_interrupt_before_any_write_says_nothing_changed(capsys):
-    def ask(_prompt):
-        raise KeyboardInterrupt()
+    def interrupt(_fake, rid, n):
+        if rid == R1 and n == 2:
+            raise KeyboardInterrupt()
 
-    fake = Fake()
-    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=ask) == 130
+    fake = Fake(on_retrieve=interrupt)
+    assert release.main(["release", "--sha", SHA_NEW], run=fake) == 130
     err = capsys.readouterr().err
     assert "RELEASE INCOMPLETE" not in err and "Interrupted before any write was sent. Nothing was changed." in err
     assert fake.writes() == []
@@ -783,7 +763,7 @@ FIRST, SECOND = (rid for rid, _ in release.RULESETS)
 
 
 def _release(fake):
-    return release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with("y"))
+    return release.main(["release", "--sha", SHA_NEW], run=fake)
 
 
 def _state_lines(err):
@@ -857,13 +837,9 @@ def test_differing_previous_pins_give_per_object_recovery_not_one_sha(capsys):
 
 
 def test_failure_before_any_write_prints_no_state_report(capsys):
-    fake = Fake()
+    fake = Fake(on_retrieve=change_r1_on_second_read)
 
-    def ask(_prompt):
-        fake.rules[R1]["name"] = "changed meanwhile"
-        return "y"
-
-    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=ask) == 2
+    assert release.main(["release", "--sha", SHA_NEW], run=fake) == 2
     assert "RELEASE INCOMPLETE" not in capsys.readouterr().err
 
 
@@ -883,7 +859,7 @@ def test_ant_env_drops_every_anthropic_variable_and_sets_only_the_config_dir():
 
 def test_every_ant_call_of_a_release_gets_no_planted_credential():
     fake = Fake()
-    assert release.main(["release", "--sha", SHA_NEW], run=fake, ask=confirm_with("y")) == 0
+    assert release.main(["release", "--sha", SHA_NEW], run=fake) == 0
     ant_calls = [kw for c, kw in fake.calls if c[0] == "ant"]
     assert len(ant_calls) >= 5
     assert all("must-not-reach-ant" not in kw["env"].values() for kw in ant_calls)

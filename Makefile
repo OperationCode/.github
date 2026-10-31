@@ -4,7 +4,7 @@
 # "Each release" in "Auth and cost".
 #
 #   make release-plan SHA=<sha> [NO_CONSOLE=1]   read-only plan
-#   make release SHA=<sha>                       plan, typed confirmation, apply, read back
+#   make release SHA=<sha>                       plan, then apply at once (no prompt), read back
 #   make release-rule-test RULE=<id> SHA=<sha>   Console-only edit of a scratch rule
 #   rollback: make release SHA=<previous release sha>
 

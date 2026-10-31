@@ -1,7 +1,7 @@
 """Owner-run release tool: move the production federation rule and the ruleset pins.
 
     make release-plan SHA=<sha>              read-only; NO_CONSOLE=1 skips the Console reads
-    make release SHA=<sha>                   plan, "Apply? [y/N]" prompt, then apply and read back
+    make release SHA=<sha>                   plan, then apply at once (no prompt) and read back
     make release-rule-test RULE=<id> SHA=<sha>   Console-only edit of a scratch rule
 
 Spec: docs/claude-review-design.md, "Each release" in "Auth and cost". The steps
@@ -646,31 +646,11 @@ def apply_ruleset(gh: GitHub, rid: int, before: dict, sha: str, rec: Records, pr
     print(f"  [ok] ruleset {rid} read back: only the pin changed (repository_id, path, sha, no ref)")
 
 
-def tty_ask(prompt: str) -> str:
-    """Read one answer from the terminal. A non-TTY stdin answers nothing (no apply)."""
-    if not sys.stdin.isatty():
-        return ""
-    try:
-        return input(prompt)
-    except EOFError:
-        return ""
-
-
-def confirm(ask: Callable[[str], str], what: str) -> None:
-    print(f"\nThis will {what}.")
-    try:
-        answer = ask("Apply? [y/N]: ")
-    except EOFError:
-        answer = ""
-    if answer.strip().lower() not in ("y", "yes"):
-        raise ReleaseError("not confirmed; nothing changed")
-
-
-def cmd_plan(args, run: Runner, ask, *, apply: bool) -> int:
+def cmd_plan(args, run: Runner, *, apply: bool) -> int:
     sha = validate_sha(args.sha)
     gh = GitHub(run)
     rec = Records(f"{'release' if apply else 'plan'}-{sha[:12]}")
-    print(f"Release {'' if apply else 'plan '}for {sha}\n\nPreconditions (GitHub, read-only):")
+    print(f"{'Release (applies at once, no prompt)' if apply else 'Release plan (read-only dry run; `make release` applies)'} for {sha}\n\nPreconditions (GitHub, read-only):")
     fails = github_preconditions(gh, sha, PROD_RULE_ID)
     print("\nRulesets (GitHub, read-only):")
     rulesets, rs_fails = plan_rulesets(gh, sha, rec)
@@ -687,7 +667,7 @@ def cmd_plan(args, run: Runner, ask, *, apply: bool) -> int:
         check_ant(run)
         progress = Progress(sha, rec, lambda s: f"make release SHA={s}")
         try:
-            return _console_and_pins(run, ask, gh, sha, rec, rulesets, progress, apply=apply, fails=fails)
+            return _console_and_pins(run, gh, sha, rec, rulesets, progress, apply=apply, fails=fails)
         except BaseException:
             # Every exit after a sent write prints the state, also a signal
             # raised when the Console context closes (held during logout).
@@ -696,7 +676,7 @@ def cmd_plan(args, run: Runner, ask, *, apply: bool) -> int:
     return _plan_result(rec, fails)
 
 
-def _console_and_pins(run: Runner, ask, gh: GitHub, sha: str, rec: Records, rulesets, progress: Progress,
+def _console_and_pins(run: Runner, gh: GitHub, sha: str, rec: Records, rulesets, progress: Progress,
                       *, apply: bool, fails: list[str]) -> int:
     """Read R1 (plan), or edit R1 and then move the pins (release)."""
     with ephemeral_console(run) as console:
@@ -709,9 +689,8 @@ def _console_and_pins(run: Runner, ask, gh: GitHub, sha: str, rec: Records, rule
             rec.save(f"ruleset-{rid}-rollback-body", {"rules": before_rs["rules"]})
             progress.add(f"ruleset-{rid}", f"ruleset {rid}", ruleset_pin(before_rs),
                          lambda rid=rid: ruleset_pin(gh.get(f"orgs/{ORG}/rulesets/{rid}")))
-        confirm(ask, f"set rule {PROD_RULE_ID} to {sha[:12]}, then move {len(rulesets)} ruleset pin(s). "
-                "From the rule change until the last pin moves, required runs fail closed (auth denied)")
-        print("\nApply: Console rule first, then the ruleset pins.")
+        print(f"\nApplying now (no confirmation): set rule {PROD_RULE_ID} to {sha[:12]}, then move {len(rulesets)} "
+              "ruleset pin(s). From the rule change until the last pin moves, required runs fail closed (auth denied)")
         try:
             apply_rule(console, PROD_RULE_ID, before, match, rec, progress)
         except BaseException:
@@ -736,7 +715,7 @@ def _plan_result(rec: Records, fails: list[str]) -> int:
     return 0
 
 
-def cmd_rule_test(args, run: Runner, ask) -> int:
+def cmd_rule_test(args, run: Runner) -> int:
     sha = validate_sha(args.sha)
     rule_id = validate_rule_id(args.rule)
     if rule_id == PROD_RULE_ID:
@@ -750,7 +729,7 @@ def cmd_rule_test(args, run: Runner, ask) -> int:
             before, match = plan_rule(console, rule_id, sha, rec, None)
             progress.add(f"rule-{rule_id}", f"rule {rule_id}", rule_sha(before),
                          lambda: rule_sha(console.retrieve(rule_id)))
-            confirm(ask, f"set scratch rule {rule_id} to {sha[:12]}")
+            print(f"\nApplying now (no confirmation): set scratch rule {rule_id} to {sha[:12]}")
             try:
                 apply_rule(console, rule_id, before, match, rec, progress)
             except BaseException:
@@ -767,9 +746,8 @@ def _raise_on_signal(signum, _frame):
     raise KeyboardInterrupt(f"signal {signum}")
 
 
-def main(argv: Sequence[str] | None = None, run: Runner | None = None, ask: Callable[[str], str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, run: Runner | None = None) -> int:
     run = run or subprocess.run
-    ask = ask or tty_ask
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("plan", "release"):
@@ -788,9 +766,9 @@ def main(argv: Sequence[str] | None = None, run: Runner | None = None, ask: Call
     REPORTS_PRINTED.clear()
     try:
         if args.cmd == "rule-test":
-            rc = cmd_rule_test(args, run, ask)
+            rc = cmd_rule_test(args, run)
         else:
-            rc = cmd_plan(args, run, ask, apply=args.cmd == "release")
+            rc = cmd_plan(args, run, apply=args.cmd == "release")
     except ReleaseError as e:
         print(f"\nREFUSED: {e}", file=sys.stderr)
         rc = 2
