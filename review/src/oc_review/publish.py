@@ -1325,14 +1325,22 @@ def _model_rows(rows: list[_Row]) -> list[_Row]:
     return [r for r in rows if r.is_model]
 
 
-def _status_heading(result: verdict.GateResult, model_rows: list[_Row]) -> str:
+MISSION_LINE = "*Mission: Review the code. Protect the branch. Deploy the future.*"
+APPROVAL_NOTE = "*Claude of Duty never approves a PR. A human reviewer gives the final approval.*"
+
+
+def _status_heading(result: verdict.GateResult, model_rows: list[_Row], rows: list[_Row]) -> str:
+    """Display text only (D8). `rows` is the findings table, so a FAIL count
+    equals the rows the body lists; no row means no number."""
     if result.status != verdict.FAIL:
         if model_rows and not result.override_applied:
-            return f"## 🟡 PASS: OC Claude review, {_n(len(model_rows), 'finding')} to consider"
-        return "## 🟢 PASS: OC Claude review"
+            return f"## 🟡 Clear to proceed: Claude of Duty logged {_n(len(model_rows), 'item')} to consider"
+        return "## 🟢 All clear: Claude of Duty review passed"
     if result.codes & _INCOMPLETE_CODES:
-        return "## 🔴 FAIL: OC Claude review did not complete"
-    return "## 🔴 FAIL: OC Claude review"
+        return "## 🔴 Comms down: the Claude of Duty review did not complete"
+    if rows:
+        return f"## 🔴 Hold deployment: Claude of Duty identified {_n(len(rows), 'item')} requiring attention"
+    return "## 🔴 Hold deployment: Claude of Duty identified items requiring attention"
 
 
 def _blocking_phrase(model_rows: list[_Row]) -> str:
@@ -1403,7 +1411,7 @@ def _callout(result: verdict.GateResult, rows: list[_Row], hard: list[_Row], has
         first = f"**This review is out of date. No waiver can clear this.**{also}"
         nxt = "**Next step:** read the newest run in the merge box."
     elif verdict.R_SIZE_GATE in codes:
-        first = "**The change is too large for the model review. A maintainer can waive this.** File checks ran, model checks did not."
+        first = "**Out of range.** This change is too large for the model review. File checks ran, model checks did not. A maintainer can waive this."
         nxt = '**Next step for the author:** split the change, or ask a maintainer for a waiver (under "Waiver" below).'
     else:
         phrase = _blocking_phrase(model)
@@ -1465,10 +1473,10 @@ def _provenance(ctx: PublishContext, result: verdict.GateResult, truncated: bool
         where = f"for head `{snap.head_sha[:7]}` into {_esc('ref', snap.base_ref)}."
     else:
         where = f"for event head `{ctx.head_sha[:7]}`, merge base unknown."
-    text = f"{run} {where} The required workflow in the merge box is the result that counts. This bot never approves a PR."
+    text = f"{run} {where} The required workflow in the merge box is the result that counts."
     if truncated:
         text += " Some details were truncated, see the run log."
-    return _Block(f"\n<sub>{text}</sub>")
+    return _Block(f"\n<sub>{text}</sub>\n\n{APPROVAL_NOTE}")
 
 
 # ---------------------------------------------------------------------------
@@ -1860,7 +1868,8 @@ def _overflow_body(ctx: PublishContext, result: verdict.GateResult) -> str:
         counts[r.code] = counts.get(r.code, 0) + 1
     lines = [
         verdict.STICKY_MARKER,
-        "## 🔴 FAIL: OC Claude review could not publish",
+        "## 🔴 Comms down: Claude of Duty could not post its full report",
+        MISSION_LINE,
         "",
         "> [!CAUTION]",
         f"> **The full review does not fit in one comment.** {OVERFLOW_NOTE}",
@@ -1882,7 +1891,7 @@ def _overflow_body(ctx: PublishContext, result: verdict.GateResult) -> str:
     # The full record body is a separate surface from the pass comment, so its
     # "never approves" sentence is intended.
     lines.append(f"\n<sub>Run [{ctx.run_id}, attempt {ctx.run_attempt}]({ctx.run_url}). "
-                 "The required workflow in the merge box is the result that counts. This bot never approves a PR.</sub>")
+                 "The required workflow in the merge box is the result that counts.</sub>\n\n" + APPROVAL_NOTE)
     return "\n".join(lines)
 
 
@@ -1901,7 +1910,7 @@ def _summary_blocks(
     model = _model_rows(rows)
     b = [
         _Block(verdict.STICKY_MARKER),
-        _Block(_status_heading(result, model)),
+        _Block(_status_heading(result, model, rows) + "\n" + MISSION_LINE),
         _Block("\n" + _callout(result, rows, hard, payload is not None)),
     ]
     b += _findings_table(rows)

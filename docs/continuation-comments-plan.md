@@ -31,7 +31,7 @@ All line numbers are at main `03e1b8d`.
 
 **The caps do not bound the input.** A pass over its cap adds a not-waivable `pass-records` reason and still keeps every finding ([verdict.py:950-957](../review/src/oc_review/verdict.py), [verdict.py:50](../review/src/oc_review/verdict.py)). So 35 is the maximum for passes within their caps, not the maximum input of the publisher. Such a run fails at the gate in any case.
 
-**What the user sees.** The sticky comment becomes the notice `## 🔴 FAIL: OC Claude review could not publish` with a `[!CAUTION]` callout, the computed gate result, the snapshot, a count per reason and the number of valid overrides ([publish.py:1854-1884](../review/src/oc_review/publish.py)). The required run fails, so the merge box blocks, also when the computed result was `pass`. A low or medium bullet that was cut shows only the truncation note; its explanation is in the run log only.
+**What the user sees.** The sticky comment becomes the notice `## 🔴 Comms down: Claude of Duty could not post its full report` with a `[!CAUTION]` callout, the computed gate result, the snapshot, a count per reason and the number of valid overrides ([publish.py:1854-1884](../review/src/oc_review/publish.py)). The required run fails, so the merge box blocks, also when the computed result was `pass`. A low or medium bullet that was cut shows only the truncation note; its explanation is in the run log only.
 
 **Writes today.** The gate job may write only a `COMMENT` review, a new issue comment, and a PATCH of an issue comment ([publish.py:216-220](../review/src/oc_review/publish.py), [publish.py:270-277](../review/src/oc_review/publish.py)). Writes are never retried ([publish.py:229-230](../review/src/oc_review/publish.py)), and a write sends no precondition header, so a PATCH cannot be made conditional on the current body ([publish.py:278-284](../review/src/oc_review/publish.py)). A write can raise after GitHub accepted it, for example a timeout while the response is read ([publish.py:288-304](../review/src/oc_review/publish.py)). The order is inline review, summary, final check, exit code, with a snapshot check before each write ([publish.py:2194-2259](../review/src/oc_review/publish.py)). A snapshot check is three reads with a valid bundle (PR, base tip, compare) and one read without ([publish.py:550-567](../review/src/oc_review/publish.py)). Each read has a 30 second timeout and at most 2 retries on a 429, a 5xx or a network error ([collect.py:76-77](../review/src/oc_review/collect.py), [collect.py:240-268](../review/src/oc_review/collect.py)). The gate job has `contents: read`, `pull-requests: write`, `issues: write` and `actions: read`, no Anthropic credential and a 10-minute timeout ([claude-review.yml:228-237](../.github/workflows/claude-review.yml)). Runs on one PR are not serialized: the workflow has no `concurrency` ([claude-review.yml:8](../.github/workflows/claude-review.yml)).
 
@@ -204,10 +204,11 @@ Each outcome is defined, so no failure reads as an empty PR (review B, Important
 
 ```
  <!-- oc-claude-review-continuation:<run id>:<attempt>:<i> -->   owner marker, first line
- ### OC Claude review: findings in full, part <i> of <K>, run <run id> attempt <n>
+ ### Claude of Duty: findings in full, part <i> of <K>, run <run id> attempt <n>
  <sub>Run [<run id>, attempt <n>](run URL). The current result is in the [summary comment](link).
       A part of another run than the one the summary names is out of date.
-      The required workflow in the merge box is the result that counts. This bot never approves a PR.</sub>
+      The required workflow in the merge box is the result that counts. </sub>
+      *Claude of Duty never approves a PR. A human reviewer gives the final approval.*
  > **Model output from untrusted input. Check it before you act on it.** Verified means ...
  <!-- oc-continued:<d14 key> <full key> -->                       one per bullet
  - <the bullet, exactly as _finding_block renders it today>
