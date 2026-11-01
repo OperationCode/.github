@@ -6,7 +6,7 @@ Items marked "Owner:" need an org owner or the owner of the Anthropic account. "
 
 ## Goal
 
-Every PR to a supported OperationCode repo gets the three-pass Claude review, and an org ruleset requires the central workflow at a pinned SHA before a merge.
+Every PR to a supported OperationCode repo gets the three-pass Claude review, and the review ruleset requires the central workflow at a pinned SHA, and the baseline ruleset requires an approval, before a merge.
 
 Done when:
 
@@ -32,7 +32,7 @@ Done when:
  V2 or V3 fails (no federation)   -> stop, change the auth design.
 ```
 
-There is one build of the central workflow. Its gate job fails for real when the result is `fail`. The pilot and org-wide enforcement differ only in who can merge past a failed run (spec "Pilot and enforcement"). The pilot does not protect merges: a maintainer or repo admin can merge past any failed run, also on their own PR. Each pilot repo needs its own approval protection.
+There is one build of the central workflow. Its gate job fails for real when the result is `fail`. The pilot and org-wide enforcement differ only in who can merge past a failed run (spec "Pilot and enforcement"). The pilot does not protect merges against a failed run: a maintainer or repo admin can merge past any failed run, also on their own PR, but only with the approval that the baseline ruleset 25787833 requires. The baseline gives each repo its approval protection, and its only bypass is org admins through a pull request (spec P5-1; before it, each pilot repo had its own repo ruleset, P4-3).
 
 ## Phase 0: platform tests that block the build
 
@@ -105,7 +105,7 @@ Depends on: V3, V5, V9 (analyze); V6, V16, V24 (publish).
 - [ ] Guard every artifact download in the gate job with an explicit non-empty id check (D10). An empty `artifact-ids` makes `actions/download-artifact` fetch every artifact of the run. When analyze failed, its ids are empty, and `publish.py` must find a missing directory and fail with the `artifact` reason while it still posts the summary.
 - [ ] A unit test parses the workflow: no `continue-on-error`, the dependency-review job exports the step `outcome`, every `uses:` is a full SHA.
 - [ ] `.github/workflows/test.yml`: unit tests on PRs to this repo (`pull_request`, no path filter) and on pushes to `main`. The job is `unit-tests`, with `contents: read`, no `id-token`, no environment and no secrets, so it runs a PR's code with a read-only token (the no-execute rule covers the review workflow). From phase 3 the job has a second step, `pytest tests/unit -m release`, so the check name does not change.
-- [ ] Every workflow job starts with harden-runner and has `timeout-minutes`. Actions are pinned to the newest release at least 7 days old, except `setup-uv` v10.3.2 (spec K-15). Python is the runner image's 3.12, and `setup-uv` has an exact version and checksum, with its cache and the Astral mirror off. Artifact names carry the run attempt.
+- [ ] Every workflow job starts with harden-runner and has `timeout-minutes`. Actions are pinned to the newest release at least 2 days old (spec P5-5; it was 7 days), except `setup-uv` v10.3.2 (spec K-15). Python is the runner image's 3.12, and `setup-uv` has an exact version and checksum, with its cache and the Astral mirror off. Artifact names carry the run attempt.
 - [ ] `.github/workflows/eval.yml`: manual fixture evals. The job uses `environment: eval` and has `contents: read` and `id-token: write` only. A workflow unit test reads every workflow file and fails if a workflow other than `eval.yml` uses `environment: eval`, or if a job that uses `eval` sets no explicit job-level `permissions` or has any `write` permission other than `id-token: write`. Job-level `permissions` is required even if the workflow level sets it. `write-all` at either level fails the test, and so do `read-all` and a missing job-level block, because the job must state `contents: read` and `id-token: write` itself.
 - [ ] `review/src/oc_review/evals.py`: the runner that `eval.yml` calls (`python -m oc_review.evals --fixtures-dir ... --out-dir ...`), with placeholder eval federation IDs and one smoke fixture. The phase 2 fixtures and IDs come later. `analyze` takes an optional federation IDs parameter for it.
 - [ ] Prefilter run budget: the prefilter line diff has a budget of 40,000,000 steps per run next to its 2,000,000 per file (spec "Coverage limits").
@@ -188,20 +188,20 @@ Exit criteria:
 - [x] Owner: record the pilot scope. The plan named only `back-end`; the owner added `front-end` (135777271), `operationcode-pybot` (146210805, default branch `master`) and `operationcode_infra` (107068150), with `back-end` (182584277). Four repos (spec P4-1).
 - [x] Owner: before a repo joins the pilot, give it its own approval protection on the default branch: a repo ruleset or branch protection with at least 1 approval, code owner review and dismiss stale approvals on push. Done 2026-10-28: "Pilot approval protection" on `back-end` (26057791), `operationcode-pybot` (26057793) and `operationcode_infra` (26057794), with the Maintain, Admin and org admin bypass because pybot and infra have one active committer; `front-end`: the existing "Protect main" (25634150), only `require_code_owner_review` changed to true (spec P4-3).
 - [x] Owner: before a repo joins the pilot, check it for people or bots that push to the default branch directly (V25). Done: none in 12 months on `back-end`, `operationcode-pybot` and `operationcode_infra`; `front-end` had a force push on 2026-10-28 that rewrote three merged PRs (cleanup of a malicious dependency payload), not new unreviewed code (spec P4-4).
-- [ ] Owner: accept that during the pilot a maintainer or repo admin can merge past any failed run, also on their own PR (spec "Pilot and enforcement").
+- [ ] Owner: accept that during the pilot a maintainer or repo admin can merge past any failed run, also on their own PR, with the approval that the baseline still requires (spec "Pilot and enforcement").
 - [x] Owner: confirm that the federation rule named in the release code has `job_workflow_ref` at the release SHA. Read back by the owner at M4 `9e2795b` (2026-10-29, spec P4-5).
 - [x] Owner: every pilot repo sends the immutable OIDC subject (spec "Immutable subject", P4-6). Found 2026-10-29: repos made before the GitHub default sent `repo:OperationCode/<repo>:...`, the rule rejected them (`match_subject_prefix`), and the first pilot runs failed closed as designed. Fix per repo: `PUT repos/OperationCode/<repo>/actions/oidc/customization/sub` with `use_default` true and `use_immutable_subject` true. Before it, check the other `id-token` users in the repo and their relying-party trust: `back-end` and `operationcode-pybot` use a cloud OIDC trust policy that gained the immutable subjects (owner; old values kept). After it, all four test PRs passed (all four jobs `success`).
-- [x] Owner: create the pilot ruleset. Only the rule "Require workflows to pass before merging" with the central workflow `repository_id`, path and release SHA. Targets: the pilot repos by name (`back-end`, `front-end`, `operationcode-pybot`, `operationcode_infra`), default branch. Bypass in `pull_request` mode: the Maintain and Admin repository roles, and org admins. Created disabled as `claude-review-pilot` (26132750): four repo ids, `~DEFAULT_BRANCH`, `repository_id` 1432342572, M4 `9e2795b`, bypass `RepositoryRole` 2 and 5 plus `OrganizationAdmin` (spec P4-2).
+- [x] Owner: create the pilot ruleset. Only the rule "Require workflows to pass before merging" with the central workflow `repository_id`, path and release SHA. Targets: the pilot repos by repository id (`back-end`, `front-end`, `operationcode-pybot`, `operationcode_infra`), default branch. Bypass in `pull_request` mode: the Maintain and Admin repository roles, and org admins. Created disabled as `claude-review-pilot` (26132750): four repo ids, `~DEFAULT_BRANCH`, `repository_id` 1432342572, M4 `9e2795b`, bypass `RepositoryRole` 2 and 5 plus `OrganizationAdmin` (spec P4-2).
 - [x] Owner: read the pilot ruleset back through the [org rules API](https://docs.github.com/en/rest/orgs/rules#get-an-organization-repository-ruleset). Check `repository_id`, path, `sha`, no `ref`, and the role `actor_id` values from V25. Then enable it. Read back (`do_not_enforce_on_create` false, no `ref`), then enabled 2026-10-29 (created and enabled the same morning). Rollback: `PUT` with `enforcement` set to `disabled`.
 - [x] Owner: require 2FA for all org members. Done in the web UI; all 7 members already had 2FA (spec P4-5).
 - [x] Owner: CODEOWNERS in each pilot repo for `.github/`, manifests, lockfiles, `pyproject.toml`, `Dockerfile`. Added on each default branch (`back-end`: @irvingpop @kylemh; `front-end`: @kylemh @irvingpop; `operationcode-pybot` and `operationcode_infra`: @irvingpop; spec P4-3).
-- [ ] Right after enabling the pilot ruleset, list the open PRs in the pilot repos again (do not reuse a list from earlier recon) and start a run on each (close and reopen, or a new push). A required workflow starts only on a new PR event, so a PR opened between the recon and the enable gets no review run: front-end PR 2027 (opened 2026-10-29T08:06Z) was missed this way.
+- [x] Right after enabling the pilot ruleset, list the open PRs in the pilot repos again (do not reuse a list from earlier recon) and start a run on each (close and reopen, or a new push). A required workflow starts only on a new PR event, so a PR opened between the recon and the enable gets no review run: front-end PR 2027 (opened 2026-10-29T08:06Z) was missed this way. Done after the PR 2027 miss; the rule is in spec rollout step 5.
 - [ ] Each week, record false positives, overrides, bypasses, failed runs by reason, egress blocks and cost per run. Keep cost numbers (any currency amount) in the owner's private notes and the Anthropic Console, never in this public repo. Public text may give ratios and timing only.
 - [ ] Fix false positives in prompts or code. Each fix goes through phase 2 again, then ships as in "Each release" below.
 - [x] Release cf19216 (PR #21, spec K-18, K-19): npm registry responses capped at 128 MiB decoded, gzip requested with a bounded inflate, and visible failure reasons for a failed lookup. Found by the pilot: a false hard block on front-end PR 2027.
 - [x] Release 96f4966 (PR #22, spec K-20, K-21): the byte budget counts received bytes with no up-front reservation, the budget is 8 GiB, script text is cut to 1000 chars, and the local harness `review/tools/dep_repro.py` reproduces the dependency stage. Rule: a dependency-check change is reproduced and validated locally with the harness before release.
 - [x] Pilot result, 2026-10-31: the first real PR (`OperationCode/front-end` PR 2027, a large dependency update) was falsely blocked three times at earlier releases (the pnpm two-document lockfile parse, the lockfile diff size, then the npm cap and the byte-budget race). At 96f4966 it passes with 0 hard blocks and 0 findings, matching the local harness. `operationcode_infra` PR 191 passed with low, non-blocking findings. The test PRs were closed 2026-10-31. The pilot continues; the exit judgment is pending the owner.
-- [ ] Release item (pending): "Claude of Duty" branding of the PR comment and check names (spec P4-8). Display text only; no change to markers, job ids, file names or the `test / unit-tests` check.
+- [x] Release item: "Claude of Duty" branding of the PR comment and check names (spec P4-8). Display text only; no change to markers, job ids, file names or the `test / unit-tests` check. Shipped in 88e055f (PR #23).
 - [x] Keep the fixture eval results as an artifact: `eval.yml` uploads `results.jsonl` and each case's `summary.md` as `eval-results-a<N>` (14 days, `if: always()`). Before this, a release eval's per-case results existed only in the job log (phase 2 run 40445885087 and phase 3 run 40528717338 were read from logs). Ships as in "Each release".
 - [ ] Plan publication before writing: bounded continuation comments, pointed to from the sticky summary, hold every summary-only finding (changed keys, unverified, outside the diff) when one comment cannot. Then no explanation is cut from the PR comments and summary capacity no longer fails a run whose computed result is `pass` (spec "Publishing (code)", size limit residual; review r-p3-cut-final Important 1). Keep the fail-closed check until this path is complete. Ships as in "Each release". Plan (planned, not built): [docs/continuation-comments-plan.md](continuation-comments-plan.md).
 
@@ -214,19 +214,14 @@ Exit criteria:
 ## Phase 5: before org-wide enforcement
 
 - [ ] Owner: accept in writing the residuals in the spec's "Which run counts": an earlier pass on the same SHA, and run deletion (V6 f confirmed it as a Write user).
-- [ ] Owner: fix the existing disabled org ruleset "All checks must pass" before it is enabled:
-  - [ ] dismiss stale approvals on push: on
-  - [ ] `OrganizationAdmin` bypass mode: `pull_request`, not `always`
-  - [ ] remove the empty required status checks rule
-  - [ ] fill the workflows rule with the `repository_id` of `OperationCode/.github`, the path `.github/workflows/claude-review.yml` and the pinned release SHA
-  - [ ] targets: never `.github`, and none of the repos still in the pilot ruleset
-- [ ] Owner: read the org ruleset back and check the workflow entry (`repository_id`, path, `sha`, no `ref`).
-- [ ] Build the supported repo inventory (spec "Supported repos") as a list in this repo.
-- [ ] Owner: every repo to be added to the org ruleset first sends the immutable OIDC subject (spec "Immutable subject"). Check `GET repos/OperationCode/<repo>/actions/oidc/customization/sub`, check the other `id-token` users in the repo and their relying-party trust, set it per repo, and run a test PR (all jobs `success`) before the repo is a target.
-- [ ] Owner: CODEOWNERS in each supported repo.
+- [x] Owner: baseline ruleset 25787833 (spec P5-1): `deletion`, `non_fast_forward`, `required_signatures`, `pull_request` (1 approval, dismiss stale approvals on push, Code Owners review, squash only); `~ALL`; `OrganizationAdmin` `pull_request` bypass only. Read back after each target change.
+- [x] Supported repo inventory: [docs/supported-repos.md](supported-repos.md).
+- [ ] Owner: every repo to be added to the review ruleset first sends the immutable OIDC subject (spec "Immutable subject"). Check `GET repos/OperationCode/<repo>/actions/oidc/customization/sub`, check the other `id-token` users in the repo and their relying-party trust, set it per repo and read it back before the repo is a target. Right after the repo becomes a target, run a test PR in that repo (all four jobs `success` at the pin); the repo is accepted only when it passes.
+- [x] CODEOWNERS in each supported repo (pilot repos P4-3; `START_HERE` P5-4).
 - [ ] Owner: turn "prevent self-review" back on for the `eval` environment (it is off during phase 2), and decide whether admin bypass stays on.
 - [ ] Owner: Dependabot alerts with npm malware detection on active repos.
-- [ ] Re-run the key acceptance tests on the current release: V6 a, V8 a, V22 b, V23 and the outage process (the invalid federation rule case).
+- [ ] Re-run the key acceptance tests on the current release: V6 a, V8 a, V22 b, V23 and the outage process (the invalid federation rule case), each case on its own terms (V6 a on a same-repo and a fork PR, with the timed-out and slow runs from a scratch-only build; V8 a from an account outside the org). A case not run leaves phase 5 open until the owner accepts the gap in the decision log.
+- [ ] Scratch bypass matrix and switch rehearsal on claude-review-test: under the scratch test ruleset and the live baseline, check who can merge which PR kind with the empty, the pilot-shaped and the org-admin-only bypass lists, then return to the pilot-shaped list (the rollback of the phase 6 bypass switch). The baseline is never changed for this test.
 - [ ] Revisit harden-runner block mode (spec K-14): switch to block when harden-runner [issue 708](https://github.com/step-security/harden-runner/issues/708) is fixed in a harden-runner release. Pin that release, measure the `test.yml` and `eval.yml` lists in audit mode, and re-test block mode. If no job hangs, set `egress-policy: block` and `disable-telemetry: true` in every job, and update the unit tests and the spec.
 
 Depends on: phase 4; V6, V8, V22, V23.
@@ -234,20 +229,19 @@ Depends on: phase 4; V6, V8, V22, V23.
 Exit criteria:
 
 - [ ] The written acceptance exists.
-- [ ] The org ruleset read-back matches this checklist.
+- [ ] The baseline read-back matches the P5-1 checklist, and the bypass matrix passed.
 - [ ] The re-run tests pass.
+- [ ] The owner's open security items are done or deferred, with the decision recorded.
 
 ## Phase 6: org-wide enforcement
 
-- [ ] Owner: enable the org ruleset with the supported repos that are not in the pilot. Add them in small groups. Each repo in a group already sends the immutable OIDC subject (phase 5); without it the run fails closed.
-- [ ] Owner: move each pilot repo: remove it from the pilot ruleset targets, then add it to the org ruleset targets at once. Never let both rulesets require the workflow on one repo.
-- [ ] After each group or move, start a run on each open PR, and check that each shows the required workflow passing or failing on its own result.
-- [ ] Owner: delete the pilot ruleset when no repo is left in it.
+- [ ] Owner: add each supported repo to the review ruleset 26132750 (immutable subject first, test PR right after). After each add, start a run on each open PR. After the last add, set its bypass list to org admins in `pull_request` mode (rehearsed on the scratch test ruleset first) and rename it `claude-review`.
 - [ ] Keep the supported repo inventory current. A repo joins or leaves through a PR to this repo.
+- [ ] Owner: Phase 6 also applies the org security configuration. Details are kept in the owner's records.
 
 Exit criteria:
 
-- [ ] Every supported repo is a target of the org ruleset, and only org admins can bypass, through a pull request.
+- [ ] Every supported repo is a target of the review ruleset and gets the baseline rules, and only org admins can bypass either one, through a pull request. The org security configuration is attached and read back (final acceptance test, checks 1-8).
 
 ## Each release (from phase 4 on)
 
@@ -256,7 +250,7 @@ Each release edits rule R1 in place, once, at the merge SHA, with the owner-run 
 - [ ] Merge the release PR. The merge SHA is the release SHA.
 - [ ] Validate at the release SHA: `test.yml` (the push run on main) and the owner-approved fixture eval (`eval.yml`, a `workflow_dispatch` run on main) both conclude success. A pull_request run at the same head SHA does not count.
 - [ ] Owner: `make release-plan SHA=<release SHA>`. Read the plan: every precondition `ok`, the R1 `job_workflow_ref` change, and the pin change of each ruleset.
-- [ ] Owner: `make release SHA=<release SHA>`. There is no prompt: it prints the plan and applies at once, so read `make release-plan` first. The tool edits R1 first, then moves the pin of every ruleset that requires the workflow (the pilot ruleset and the scratch test ruleset), and reads all three back. A required run started between the rule edit and the last pin move fails closed. A non-zero exit after a write prints which object is at which SHA, the records path and the recovery (the same command again, or the rollback command it prints): follow it before anything else.
+- [ ] Owner: `make release SHA=<release SHA>`. There is no prompt: it prints the plan and applies at once, so read `make release-plan` first. The tool edits R1 first, then moves the pin of every ruleset that requires the workflow (every ruleset in `RULESETS`; the drift check refuses a release if another org ruleset requires the workflow), and reads all three back. A required run started between the rule edit and the last pin move fails closed. A non-zero exit after a write prints which object is at which SHA, the records path and the recovery (the same command again, or the rollback command it prints): follow it before anything else.
 - [ ] Start a new run on each open PR (push, or close and reopen). Do not re-run old runs: a run at the old SHA fails auth. Do this after every pin move, also a move back: the box counts only runs at the pinned SHA (spec "Pinned SHA only").
 - [ ] Check one run under the scratch test ruleset (claude-review-test) gets a token at the release SHA.
 - Rollback: `make release SHA=<previous release SHA>`, then new runs on each open PR.

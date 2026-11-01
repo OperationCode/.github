@@ -10,7 +10,9 @@ of a release, in this order:
     1. preconditions (fail closed): SHA is 40-hex and on main; test.yml and the
        release eval.yml run at SHA concluded success; analyze.py at SHA names
        rule R1; the caller is an org owner; each ruleset has exactly one
-       workflows entry for claude-review.yml, with a sha and no ref
+       workflows entry for claude-review.yml, with a sha and no ref; drift
+       check: no org ruleset outside RULESETS requires the workflow, and
+       every id in RULESETS exists
     2. Console: GET R1, change only the SHA suffix of
        match.claims.job_workflow_ref, POST the whole match, GET back, compare
     3. GitHub: for each ruleset, GET, change only that entry's sha, PUT the
@@ -63,9 +65,18 @@ WORKFLOW_REPO_ID = 1432342572
 JOB_WORKFLOW_REF_PREFIX = f"{REPO}/{WORKFLOW_PATH}@"
 PROD_RULE_ID = "fdrl_01N2ZktTiVKqUvvXwywBFfys"
 ANALYZE_PATH = "review/src/oc_review/analyze.py"
-# Every ruleset that requires the workflow: the pilot ruleset and the scratch
-# test ruleset. Add the org ruleset here when it gets the pin (phase 6).
+# Every ruleset that requires the workflow: the review ruleset (the pilot
+# ruleset until the bypass switch) and the scratch test ruleset. The baseline
+# ruleset 25787833 has no workflows rule, so it is not here (spec P5-7). The
+# drift check refuses a release when any other org ruleset requires the
+# workflow, or when an id here no longer exists.
 RULESETS: tuple[tuple[int, str], ...] = ((26132750, "claude-review-pilot"), (25835887, "p0-required-workflow"))
+# Org ruleset list paging for the drift check. More pages than this fails closed.
+RULESET_PAGE_SIZE = 100
+RULESET_MAX_PAGES = 10
+# A required status check with one of these (lowercase) in its context is a
+# name-bound stand-in for the review, which a same-name job can satisfy.
+REVIEW_CHECK_NAMES = ("oc-claude-review", "claude of duty")
 # The run each release needs at the SHA: (file, event, branch). test.yml runs
 # on the push to main; the release eval is an owner-approved dispatch on main
 # (as for cc710fb, cf19216 and 96f4966). A pull_request run at the same head
@@ -213,6 +224,47 @@ def compare_ruleset(before: dict, after: dict, sha: str) -> list[str]:
     expected = copy.deepcopy(before)
     expected["rules"] = patch_ruleset(before, sha)["rules"]
     problems += diff_paths(_without_volatile(expected), _without_volatile(after))
+    return problems
+
+
+def _is_review_workflow(wf: Any) -> bool:
+    """A workflows entry for the central workflow: the .github repository id,
+    or the workflow path (any repository, any case, with or without ./)."""
+    if not isinstance(wf, dict):
+        return False
+    path = str(wf.get("path") or "").removeprefix("./").lower()
+    return wf.get("repository_id") == WORKFLOW_REPO_ID or path == WORKFLOW_PATH
+
+
+def drift_problems(listed_ids: Sequence[int], bodies: dict[int, Any]) -> list[str]:
+    """The drift check on the org ruleset list and each ruleset as read.
+    Fails when (a) a ruleset not in RULESETS has a workflows entry for the
+    central workflow, (b) an id in RULESETS is not in the list, or (c) any
+    ruleset requires a status check named like the review (a name-bound check
+    that a same-name job can satisfy). A body that cannot be read as a ruleset
+    also fails. Returns the problems, each naming its ruleset id."""
+    known = {rid for rid, _ in RULESETS}
+    problems = [f"ruleset {rid} is in RULESETS but not in the org ruleset list"
+                for rid in sorted(known - set(listed_ids))]
+    for rid in listed_ids:
+        body = bodies.get(rid)
+        rules = body.get("rules") if isinstance(body, dict) else None
+        if not isinstance(rules, list) or body.get("id") != rid:
+            problems.append(f"ruleset {rid}: the read did not return this ruleset with a rules list")
+            continue
+        name = body.get("name")
+        entries = [wf for r in rules if isinstance(r, dict) and r.get("type") == "workflows"
+                   for wf in ((r.get("parameters") or {}).get("workflows") or []) if _is_review_workflow(wf)]
+        if entries and rid not in known:
+            problems.append(f"ruleset {rid} {name!r} ({body.get('enforcement')}) is not in RULESETS but requires "
+                            f"the review workflow ({len(entries)} entr{'y' if len(entries) == 1 else 'ies'}); "
+                            "a release would leave its pin behind")
+        contexts = [str(c.get("context")) for r in rules if isinstance(r, dict) and r.get("type") == "required_status_checks"
+                    for c in ((r.get("parameters") or {}).get("required_status_checks") or []) if isinstance(c, dict)
+                    and any(n in str(c.get("context") or "").lower() for n in REVIEW_CHECK_NAMES)]
+        if contexts:
+            problems.append(f"ruleset {rid} {name!r} requires the status check(s) {contexts}; "
+                            "the review must be required by workflow, never by check name")
     return problems
 
 
@@ -479,6 +531,48 @@ def github_preconditions(gh: GitHub, sha: str, rule_id: str) -> list[str]:
     return fails
 
 
+def list_org_rulesets(gh: GitHub) -> list[int]:
+    """The id of every org ruleset, from all pages of GET /orgs/{org}/rulesets.
+    Fails closed on a page that is not a list, an item with no integer id, or
+    more than RULESET_MAX_PAGES pages."""
+    ids: list[int] = []
+    for page in range(1, RULESET_MAX_PAGES + 1):
+        items = gh.get(f"orgs/{ORG}/rulesets?per_page={RULESET_PAGE_SIZE}&page={page}")
+        if not isinstance(items, list):
+            raise ReleaseError(f"org ruleset list page {page} is not a list")
+        for item in items:
+            rid = item.get("id") if isinstance(item, dict) else None
+            if not isinstance(rid, int) or isinstance(rid, bool):
+                raise ReleaseError(f"org ruleset list page {page} has an item with no integer id")
+            if rid not in ids:
+                ids.append(rid)
+        if len(items) < RULESET_PAGE_SIZE:
+            return ids
+    raise ReleaseError(f"the org ruleset list has more than {RULESET_MAX_PAGES} pages; the drift check stops")
+
+
+def drift_check(gh: GitHub, rec: Records) -> list[str]:
+    """Read-only: list every org ruleset, read each one, and run
+    drift_problems. Repo-level rulesets are out of scope (the spec says target
+    repos hold no repo ruleset for the review). Returns the failures."""
+    try:
+        listed = list_org_rulesets(gh)
+        bodies = {rid: gh.get(f"orgs/{ORG}/rulesets/{rid}") for rid in listed}
+    except ReleaseError as e:
+        msg = f"drift check: cannot read the org rulesets: {e}"
+        print(f"  [FAIL] {msg}")
+        return [msg]
+    rec.save("org-rulesets", {"ids": listed, "rulesets": {str(k): v for k, v in bodies.items()}})
+    problems = [f"drift check: {p}" for p in drift_problems(listed, bodies)]
+    for p in problems:
+        print(f"  [FAIL] {p}")
+    if not problems:
+        others = [rid for rid in listed if rid not in {r for r, _ in RULESETS}]
+        print(f"  [ok] drift check: {len(listed)} org ruleset(s), every RULESETS id present; no other ruleset "
+              f"({', '.join(map(str, others)) or 'none'}) requires the review workflow; no check named like it is required")
+    return problems
+
+
 # ---------------------------------------------------------------- progress
 
 # Records dirs of the state reports printed in this run (main reads it).
@@ -652,6 +746,8 @@ def cmd_plan(args, run: Runner, *, apply: bool) -> int:
     rec = Records(f"{'release' if apply else 'plan'}-{sha[:12]}")
     print(f"{'Release (applies at once, no prompt)' if apply else 'Release plan (read-only dry run; `make release` applies)'} for {sha}\n\nPreconditions (GitHub, read-only):")
     fails = github_preconditions(gh, sha, PROD_RULE_ID)
+    print("\nDrift check (GitHub, read-only):")
+    fails += drift_check(gh, rec)
     print("\nRulesets (GitHub, read-only):")
     rulesets, rs_fails = plan_rulesets(gh, sha, rec)
     fails += rs_fails

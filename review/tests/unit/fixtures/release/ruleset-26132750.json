@@ -1,0 +1,67 @@
+{
+  "id": 26132750,
+  "name": "claude-review-pilot",
+  "target": "branch",
+  "source_type": "Organization",
+  "source": "OperationCode",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "exclude": [],
+      "include": [
+        "~DEFAULT_BRANCH"
+      ]
+    },
+    "repository_id": {
+      "repository_ids": [
+        107068150,
+        135777271,
+        146210805,
+        182584277
+      ]
+    }
+  },
+  "rules": [
+    {
+      "type": "workflows",
+      "parameters": {
+        "do_not_enforce_on_create": false,
+        "workflows": [
+          {
+            "repository_id": 1432342572,
+            "path": ".github/workflows/claude-review.yml",
+            "sha": "88e055f0ebff003a3e07fe0d015fee6856692f2c"
+          }
+        ]
+      }
+    }
+  ],
+  "node_id": "RRS_lACkVXNlcs4An-cEzgGOwQ4",
+  "created_at": "2026-10-29T08:21:30.214-07:00",
+  "updated_at": "2026-10-31T10:54:53.991-07:00",
+  "bypass_actors": [
+    {
+      "actor_id": null,
+      "actor_type": "OrganizationAdmin",
+      "bypass_mode": "pull_request"
+    },
+    {
+      "actor_id": 2,
+      "actor_type": "RepositoryRole",
+      "bypass_mode": "pull_request"
+    },
+    {
+      "actor_id": 5,
+      "actor_type": "RepositoryRole",
+      "bypass_mode": "pull_request"
+    }
+  ],
+  "_links": {
+    "self": {
+      "href": "https://api.github.com/orgs/OperationCode/rulesets/26132750"
+    },
+    "html": {
+      "href": "http://github.com/organizations/OperationCode/settings/rules/26132750"
+    }
+  }
+}
