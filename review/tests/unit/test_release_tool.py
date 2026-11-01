@@ -230,6 +230,15 @@ def test_redact_hides_bearer_and_keys():
 
 ANALYZE = f'ANTHROPIC_FEDERATION_RULE_ID = "{R1}"\n'
 
+# Recorded org ruleset bodies (GET /orgs/OperationCode/rulesets/{id} and the
+# list, 2026-11-01): the review ruleset, the baseline and the scratch test ruleset.
+FIXTURES = Path(__file__).parent / "fixtures" / "release"
+BASELINE_ID = 25787833
+
+
+def recorded(rid: int) -> dict:
+    return json.loads((FIXTURES / f"ruleset-{rid}.json").read_text(encoding="utf-8"))
+
 
 def good_run(wf, sha, **over):
     event = "push" if wf == "test.yml" else "workflow_dispatch"
@@ -254,6 +263,10 @@ class Fake:
         self.sha, self.runs, self.logout, self.put = sha, runs, logout, put
         self.config_dirs: set[str] = set()
         self.on_retrieve, self.retrieves = on_retrieve, {}
+        # Org rulesets that are not in RULESETS (the live baseline by default),
+        # and an optional override of the list pages: {page: [items]}.
+        self.other_rulesets = {BASELINE_ID: recorded(BASELINE_ID)}
+        self.list_pages: dict[int, object] | None = None
 
     def __call__(self, cmd, **kw):
         self.calls.append((list(cmd), kw))
@@ -328,8 +341,15 @@ class Fake:
             return self.ok({"login": "owner"})
         if "/memberships/" in path:
             return self.ok({"role": self.role})
+        if path.startswith("orgs/OperationCode/rulesets?"):
+            page = int(path.rsplit("page=", 1)[1])
+            if self.list_pages is not None:
+                return self.ok(self.list_pages.get(page, []))
+            items = [{"id": rid} for rid in [*self.rulesets, *self.other_rulesets]]
+            return self.ok(items if page == 1 else [])
         if "/rulesets/" in path:
-            return self.ok(self.rulesets[int(path.rsplit("/", 1)[1])])
+            rid = int(path.rsplit("/", 1)[1])
+            return self.ok(self.rulesets[rid] if rid in self.rulesets else self.other_rulesets[rid])
         raise AssertionError(path)
 
     def writes(self):
@@ -917,3 +937,158 @@ def test_an_unchanged_object_read_back_is_not_a_write():
     progress.set("rule-x", "unchanged")
     progress.set("rule-x", "done")
     assert not progress.wrote()
+
+
+# ---------------------------------------------------------------- drift check (spec P5-7)
+
+LIVE_IDS = [26132750, BASELINE_ID, 25835887]  # the recorded list order
+
+
+def live_bodies() -> dict[int, dict]:
+    return {rid: recorded(rid) for rid in LIVE_IDS}
+
+
+def extra_review_ruleset(rid=99, **wf_over) -> dict:
+    """A recorded review ruleset under a new id, as a new org ruleset would be."""
+    body = recorded(26132750)
+    body.update(id=rid, name="another-review")
+    body["rules"][0]["parameters"]["workflows"][0].update(wf_over)
+    return body
+
+
+def test_recorded_list_and_bodies_match_the_live_org():
+    listed = [i["id"] for i in json.loads((FIXTURES / "org-rulesets-list.json").read_text(encoding="utf-8"))]
+    assert listed == LIVE_IDS
+    assert {rid for rid, _ in release.RULESETS} == {26132750, 25835887}
+    for rid, _ in release.RULESETS:
+        assert release.ruleset_pin(recorded(rid))  # one entry, a sha, no ref
+
+
+def test_drift_passes_on_the_recorded_org_baseline_without_workflows():
+    bodies = live_bodies()
+    assert not any(r["type"] == "workflows" for r in bodies[BASELINE_ID]["rules"])
+    assert release.drift_problems(LIVE_IDS, bodies) == []
+
+
+@pytest.mark.parametrize("wf_over", [
+    {},  # same repository id and path
+    {"repository_id": 1, "path": release.WORKFLOW_PATH},  # path only
+    {"path": ".github/workflows/renamed.yml"},  # repository id only
+    {"repository_id": 1, "path": "./.GitHub/Workflows/Claude-Review.yml"},  # path spelled differently
+])
+def test_drift_fails_on_an_extra_review_ruleset(wf_over):
+    bodies = live_bodies() | {99: extra_review_ruleset(**wf_over)}
+    problems = release.drift_problems([*LIVE_IDS, 99], bodies)
+    assert len(problems) == 1 and problems[0].startswith("ruleset 99 'another-review'")
+    assert "not in RULESETS" in problems[0]
+
+
+def test_drift_fails_on_a_disabled_extra_review_ruleset():
+    body = extra_review_ruleset()
+    body["enforcement"] = "disabled"
+    problems = release.drift_problems([*LIVE_IDS, 99], live_bodies() | {99: body})
+    assert len(problems) == 1 and "ruleset 99" in problems[0] and "(disabled)" in problems[0]
+
+
+def test_drift_ignores_a_workflows_rule_for_another_workflow():
+    body = extra_review_ruleset(repository_id=1, path=".github/workflows/other.yml")
+    assert release.drift_problems([*LIVE_IDS, 99], live_bodies() | {99: body}) == []
+
+
+@pytest.mark.parametrize("missing", [26132750, 25835887])
+def test_drift_fails_when_a_listed_id_is_missing(missing):
+    ids = [i for i in LIVE_IDS if i != missing]
+    problems = release.drift_problems(ids, {i: recorded(i) for i in ids})
+    assert problems == [f"ruleset {missing} is in RULESETS but not in the org ruleset list"]
+
+
+@pytest.mark.parametrize("context", ["oc-claude-review", "Claude of Duty / Mission report (pull_request_target)"])
+def test_drift_fails_on_a_required_check_named_like_the_review(context):
+    bodies = live_bodies()
+    bodies[BASELINE_ID]["rules"].append({"type": "required_status_checks", "parameters": {
+        "strict_required_status_checks_policy": False,
+        "required_status_checks": [{"context": "unit-tests"}, {"context": context}]}})
+    problems = release.drift_problems(LIVE_IDS, bodies)
+    assert len(problems) == 1 and problems[0].startswith(f"ruleset {BASELINE_ID} 'org-baseline'")
+    assert context in problems[0] and "unit-tests" not in problems[0]
+
+
+@pytest.mark.parametrize("body", [None, [], {"id": BASELINE_ID}, {"id": 1, "rules": []}])
+def test_drift_fails_closed_on_a_body_it_cannot_read(body):
+    bodies = live_bodies()
+    bodies[BASELINE_ID] = body
+    assert release.drift_problems(LIVE_IDS, bodies) == [
+        f"ruleset {BASELINE_ID}: the read did not return this ruleset with a rules list"]
+
+
+def test_list_reads_every_page_until_a_short_one():
+    fake = Fake()
+    full = [{"id": 1000 + i} for i in range(release.RULESET_PAGE_SIZE)]
+    fake.list_pages = {1: full, 2: [{"id": 26132750}, {"id": 1000}]}
+    ids = release.list_org_rulesets(release.GitHub(fake))
+    assert ids == [i["id"] for i in full] + [26132750]  # a repeat across pages counts once
+    paths = [c[-1] for c, _ in fake.calls]
+    assert paths == [f"orgs/OperationCode/rulesets?per_page={release.RULESET_PAGE_SIZE}&page={p}" for p in (1, 2)]
+
+
+def test_list_with_an_exactly_full_last_page_reads_one_empty_page():
+    fake = Fake()
+    fake.list_pages = {1: [{"id": 1000 + i} for i in range(release.RULESET_PAGE_SIZE)], 2: []}
+    assert len(release.list_org_rulesets(release.GitHub(fake))) == release.RULESET_PAGE_SIZE
+    assert len(fake.calls) == 2
+
+
+@pytest.mark.parametrize("pages,msg", [
+    ({1: {"message": "Not Found"}}, "page 1 is not a list"),
+    ({1: [{"name": "x"}]}, "no integer id"),
+    ({1: [{"id": "26132750"}]}, "no integer id"),
+])
+def test_list_fails_closed_on_a_bad_page(pages, msg):
+    fake = Fake()
+    fake.list_pages = pages
+    with pytest.raises(release.ReleaseError, match=msg):
+        release.list_org_rulesets(release.GitHub(fake))
+
+
+def test_list_fails_closed_past_the_page_limit():
+    fake = Fake()
+    fake.list_pages = {p: [{"id": p * 1000 + i} for i in range(release.RULESET_PAGE_SIZE)]
+                       for p in range(1, release.RULESET_MAX_PAGES + 2)}
+    with pytest.raises(release.ReleaseError, match="more than"):
+        release.list_org_rulesets(release.GitHub(fake))
+    assert len(fake.calls) == release.RULESET_MAX_PAGES
+
+
+def test_plan_runs_the_drift_check_on_the_recorded_bodies(capsys):
+    fake = Fake()
+    fake.other_rulesets = {BASELINE_ID: recorded(BASELINE_ID)}
+    assert release.main(["plan", "--sha", SHA_NEW], run=fake) == 0
+    out = capsys.readouterr().out
+    assert "[ok] drift check: 3 org ruleset(s)" in out and str(BASELINE_ID) in out
+    assert any(p.name == "org-rulesets.json" for p in release.RECORDS.rglob("*.json"))
+
+
+def test_release_refuses_an_extra_review_ruleset_before_any_console_call(capsys):
+    fake = Fake()
+    fake.other_rulesets[99] = extra_review_ruleset()
+    rc = release.main(["release", "--sha", SHA_NEW], run=fake)
+    assert rc == 2 and fake.writes() == []
+    assert not any(c[0] == "ant" for c, _ in fake.calls)
+    out = capsys.readouterr()
+    assert "[FAIL] drift check: ruleset 99" in out.out and "precondition(s) failed" in out.err
+
+
+def test_plan_fails_on_a_missing_listed_ruleset(capsys):
+    fake = Fake()
+    fake.list_pages = {1: [{"id": 26132750}, {"id": BASELINE_ID}]}
+    assert release.main(["plan", "--sha", SHA_NEW, "--no-console"], run=fake) == 1
+    err = capsys.readouterr().err
+    assert "PLAN FAILED" in err and "ruleset 25835887 is in RULESETS but not in the org ruleset list" in err
+
+
+def test_release_refuses_when_the_ruleset_list_cannot_be_read(capsys):
+    fake = Fake()
+    fake.list_pages = {1: {"message": "Resource not accessible"}}
+    assert release.main(["release", "--sha", SHA_NEW], run=fake) == 2
+    assert fake.writes() == [] and not any(c[0] == "ant" for c, _ in fake.calls)
+    assert "drift check: cannot read the org rulesets" in capsys.readouterr().out

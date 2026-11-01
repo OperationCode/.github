@@ -881,8 +881,8 @@ def test_sticky_found_on_a_later_page(tmp_path):
 
 def test_untrusted_text_is_escaped_in_summary(tmp_path):
     nasty = (f"@user #12 GH-12 {'0123456789abcdef' * 2}abcdef01 [x](https://e) <img src=x> "
-             f"bi‮di zero​width {GH_TOKEN}")
-    path = "src/@user-#12-‮.py"
+             f"bi\u202edi zero​width {GH_TOKEN}")
+    path = "src/@user-#12-\u202e.py"
     files = [{"path": path, "old_path": None, "status": "added", "base_content": None, "head_content": "x = 1\n"}]
     short = "@user #12 GH-12 [x](https://e) <img src=x> bi\u202edi"
     passes = clean_passes(review=[finding(file=path, line=1, quote="x = 1", title=short, explanation=nasty)],
@@ -900,13 +900,13 @@ def test_untrusted_text_is_escaped_in_summary(tmp_path):
     assert "](https://e)" not in s and "https://e" not in s
     assert not re.search(r"(?<!\\)<img", body) and "\\<img" in body
     assert "[x]" not in body and "\\[x\\]" in body
-    assert "‮" not in s and "zero​width" not in s
+    assert "\u202e" not in s and "zero​width" not in s
     plain = s.replace(HEAD, "").replace(MB, "").replace("f" * 64, "").replace(HEAD[:7], "")
     assert not re.search(r"[0-9a-f]{7,}", plain)
     # The inline comment is escaped the same way.
     (rv,) = r.gh.bodies("POST", "/reviews")
     c = rv["comments"][0]["body"]
-    assert GH_TOKEN not in c and "@user" not in c and "‮" not in c
+    assert GH_TOKEN not in c and "@user" not in c and "\u202e" not in c
     assert not re.search(r"(?<!\\)<img", c) and "[x]" not in c
 
 

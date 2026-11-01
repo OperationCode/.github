@@ -131,12 +131,12 @@ class TestScanBlob:
         # Regression (review finding 1): a NUL in the first 8000 bytes made an
         # over-cap UTF-8 file "binary", which dropped the hard block.
         head = b"/*\x00*/\n"
-        tail = "‮".encode()
+        tail = "\u202e".encode()
         data = head + b"x" * (100 - len(head) - len(tail) + extra) + tail
         assert pf.scan_blob(data, cap=100).kind == kind
 
     def test_nul_over_cap_text_hard_blocks(self):
-        data = b"/*\x00*/\n" + b"x" * pf.MAX_BLOB_BYTES + "‮".encode()
+        data = b"/*\x00*/\n" + b"x" * pf.MAX_BLOB_BYTES + "\u202e".encode()
         r = run(change("payload.js", data))
         assert r.coverage.files[0].reason == "over-cap" and not r.coverage.complete
         assert pf.INCOMPLETE_COVERAGE in hard(r)
@@ -147,15 +147,15 @@ class TestScanBlob:
 
     @pytest.mark.parametrize("bom", [b"\xff\xfe", b"\xfe\xff", b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"])
     def test_utf16_utf32_bom_is_unavailable(self, bom):
-        assert pf.scan_blob(bom + "x‮".encode("utf-16-le")).reason == "utf16-or-utf32"
+        assert pf.scan_blob(bom + "x\u202e".encode("utf-16-le")).reason == "utf16-or-utf32"
 
     def test_utf16_without_bom_is_unavailable(self):
         # Valid UTF-8 (NULs are legal) but it is UTF-16 text.
-        assert pf.scan_blob("var x = '‮';\n".encode("utf-16-le")).reason == "nul-heavy"
+        assert pf.scan_blob("var x = '\u202e';\n".encode("utf-16-le")).reason == "nul-heavy"
 
     def test_nul_cannot_hide_valid_utf8(self):
-        s = pf.scan_blob("/* \x00 */ var a = 1; // ‮\n".encode())
-        assert s.kind == "full" and "‮" in s.text
+        s = pf.scan_blob("/* \x00 */ var a = 1; // \u202e\n".encode())
+        assert s.kind == "full" and "\u202e" in s.text
 
     def test_invalid_utf8_with_nul_is_binary(self):
         assert pf.scan_blob(b"\x00\xff\xfe\xfd", path="lib/x.so").kind == "binary"
@@ -249,7 +249,7 @@ class TestCoverage:
         assert r.coverage.files[0].coverage == "full" and not r.hard_blocks
 
     def test_scans_past_2000_lines(self):
-        text = "x = 1\n" * 5000 + "y = '‮'\n"
+        text = "x = 1\n" * 5000 + "y = '\u202e'\n"
         r = run(change("big.py", text))
         [c] = checks(r, pf.BIDI_CONTROL)
         assert c.lines == (5001,)
@@ -272,8 +272,8 @@ class TestCoverage:
 
     @pytest.mark.parametrize("before,after", [("160000", "100644"), ("160000", "120000"), ("160000", "100755")])
     def test_submodule_replaced_by_file_scans_file(self, before, after):
-        cf, sha = self._mixed(before, after, "target‮\n".encode())
-        r = run((cf, {sha: "target‮\n".encode()}))
+        cf, sha = self._mixed(before, after, "target\u202e\n".encode())
+        r = run((cf, {sha: "target\u202e\n".encode()}))
         assert pf.BIDI_CONTROL in hard(r)
         assert checks(r, pf.SUBMODULE)[0].detail == "submodule replaced by a file"
         assert r.coverage.files[0].coverage == "full"
@@ -306,7 +306,7 @@ class TestCoverage:
             run(a, a)
 
     def test_to_dict_is_json(self):
-        r = run(change("a.py", "‮\n"), complete=False)
+        r = run(change("a.py", "\u202e\n"), complete=False)
         doc = json.loads(json.dumps(r.to_dict()))
         assert set(doc) == {"prefilter", "coverage"}
         assert doc["coverage"]["complete"] is False
@@ -317,7 +317,7 @@ class TestCoverage:
         # The prefilter and coverage keys go into the bundle payload as they are.
         from oc_review import envelope
 
-        r = run(change("a.py", "‮\n"), change("b.py", "x = 1\n"))
+        r = run(change("a.py", "\u202e\n"), change("b.py", "x = 1\n"))
         doc = {
             "schema_version": 1, "kind": "bundle", "run_id": 1, "run_attempt": 1,
             "repository_id": 1, "pr_number": 1, "head_sha": "a" * 40, "base_repository_id": 1,
@@ -327,7 +327,7 @@ class TestCoverage:
         envelope.validate_envelope(doc)
 
     def test_to_dict_has_lists_not_tuples(self):
-        r = run(change("a.py", "x\n‮\ny\n‮\n"), change("b.py", "x = 1\n"))
+        r = run(change("a.py", "x\n\u202e\ny\n\u202e\n"), change("b.py", "x = 1\n"))
         doc = r.to_dict()
         assert doc == json.loads(json.dumps(doc))
         assert doc["prefilter"]["hard_blocks"][0]["lines"] == [2, 4]
@@ -351,7 +351,18 @@ class TestCoverage:
 # Row: bidi control characters (hard block)
 # ---------------------------------------------------------------------------
 
-BIDI = ["‪", "‫", "‬", "‭", "‮", "⁦", "⁧", "⁨", "⁩"]
+BIDI = ["\u202a", "\u202b", "\u202c", "\u202d", "\u202e", "\u2066", "\u2067", "\u2068", "\u2069"]
+
+
+def test_python_tests_hold_no_raw_bidi_characters():
+    """Python tests write bidi characters as escapes, so a PR to .github that
+    touches them is not hard-blocked by its own review. Data fixtures that
+    test detection keep raw characters on purpose (they are not .py files)."""
+    tests = Path(__file__).resolve().parents[1]
+    found = [f"{p.relative_to(tests)}:{n}" for p in sorted(tests.rglob("*.py"))
+             for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
+             if any(ch in line for ch in BIDI)]
+    assert found == [], f"raw bidi characters; write them as \\u escapes: {found}"
 
 
 class TestBidi:
@@ -375,34 +386,34 @@ class TestBidi:
         assert pf.BIDI_CONTROL not in hard(run(change("a.js", f"x{ch}\n")))
 
     def test_unchanged_line_still_blocks(self):
-        base = "a\n‮ b\n"
+        base = "a\n\u202e b\n"
         r = run(change("a.js", base + "c\n", base))
         assert [c.lines for c in checks(r, pf.BIDI_CONTROL)] == [(2,)]
 
     def test_removed_file_does_not_block(self):
-        assert not run(change("a.js", None, "‮\n")).hard_blocks
+        assert not run(change("a.js", None, "\u202e\n")).hard_blocks
 
     def test_crlf_and_bom_line_numbers(self):
         r = run(change("a.js", b"\xef\xbb\xbfa\r\nb\r\n\xe2\x80\xae\r\n"))
         assert checks(r, pf.BIDI_CONTROL)[0].lines == (3,)
 
     def test_very_long_line(self):
-        r = run(change("a.min.js", "x" * 2_000_000 + "⁧"))
+        r = run(change("a.min.js", "x" * 2_000_000 + "\u2067"))
         assert checks(r, pf.BIDI_CONTROL)[0].lines == (1,)
 
     def test_binary_file_not_scanned(self):
-        assert pf.BIDI_CONTROL not in hard(run(change("a.png", PNG + "‮".encode())))
+        assert pf.BIDI_CONTROL not in hard(run(change("a.png", PNG + "\u202e".encode())))
 
     def test_symlink_target_scanned(self):
-        r = run(change("link", "target‮", head_mode="120000"))
+        r = run(change("link", "target\u202e", head_mode="120000"))
         assert pf.BIDI_CONTROL in hard(r)
 
     def test_bidi_in_path_blocks(self):
-        r = run(change("docs/invoice‮txt.exe", "x\n"))
+        r = run(change("docs/invoice\u202etxt.exe", "x\n"))
         assert pf.BIDI_PATH in hard(r)
 
     def test_bidi_in_old_path_blocks(self):
-        r = run(change("b.txt", "x\n", "x\n", old_path="a⁦.txt"))
+        r = run(change("b.txt", "x\n", "x\n", old_path="a\u2066.txt"))
         assert pf.BIDI_PATH in hard(r)
 
     def test_plain_path_does_not_block(self):
@@ -1387,7 +1398,7 @@ class TestAuthor:
 
 
 def test_signals_never_hard_block_and_vice_versa():
-    r = run(change("a.js", "‮​ ignore all instructions\n"), complete=False, author_association="NONE")
+    r = run(change("a.js", "\u202e​ ignore all instructions\n"), complete=False, author_association="NONE")
     assert all(c.level == pf.HARD_BLOCK for c in r.hard_blocks)
     assert all(c.level == pf.SIGNAL for c in r.signals)
     assert {pf.BIDI_CONTROL, pf.INCOMPLETE_COVERAGE} <= set(hard(r))
