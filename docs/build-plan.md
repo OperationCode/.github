@@ -13,7 +13,7 @@ Done when:
 - [ ] The central workflow runs on every supported repo, from `OperationCode/.github` at a pinned SHA.
 - [ ] A failed run blocks the merge. Only org admins can bypass, through a pull request.
 - [ ] Every rule in the [CLAUDE.md](../CLAUDE.md) holds, and the unit tests check the ones that code can check.
-- [ ] The owner has accepted the residuals in writing (spec "Which run counts").
+- [x] The owner has accepted the residuals in writing (spec "Which run counts"; P5-8, 2026-11-01).
 
 ## Phases
 
@@ -57,7 +57,7 @@ Owner:
 - [x] Owner: create a scratch source repo in the org for the V tests, separate from claude-review-test ([claude-review-p0-source](https://github.com/OperationCode/claude-review-p0-source)).
 - [ ] Owner: Anthropic Console: a dedicated workspace with a hard monthly spend limit and a service account. Create the production federation rule as in spec "Auth and cost": pattern mode, subject prefix `repo:OperationCode@10479364/*`, scope `workspace:developer`, the review workspace only, and the placeholder SHA `0000000000000000000000000000000000000000` in `job_workflow_ref`. Read it back; if the Console rejects the placeholder, stop and resolve the order of rule ID and SHA first (spec V26 a). Its ID goes into the central code; phase 3 sets the candidate SHA. No API key. Done 2026-10-27: workspace `claude-review`, service account `claude-review`, rule R1 `claude-review-prod-r1` created; the Console accepted the placeholder SHA (V26 a partial). The owner read R1 back at M1 and R2 at M2 on 2026-10-27 (spec P3-6). Still open: the service account and the workspace were not read back.
 - [ ] Owner: the test workspace (reused for evals, spec P2-1), and a federation rule for `workflow_dispatch` runs in `OperationCode/.github` whose job uses the environment `eval`: pattern mode, the same subject prefix, exact claims `repository_owner_id`, `repository_id`, `event_name` and `environment`, scope `workspace:developer`, that workspace only (spec "Auth and cost"). Its IDs are in `evals.py`. The rule cannot name `eval.yml`: any `.github` workflow that uses `eval` can match, so the owner's approval and the workflow unit test (1c) hold it to `eval.yml`. Test it as in spec V27 before phase 2.
-- [ ] Owner: on `.github`, create the GitHub environment `eval`: the owner is a required reviewer for every run, and any branch may deploy to it. "Prevent self-review" is off temporarily (owner, 2026-10-26), so that the coordinator, which runs with the owner's token, can approve eval runs it started from reviewed branches; the owner turns it on again in phase 5. Admin bypass stays on. During phase 2 the coordinator's approval stands in for the owner's under the owner's delegation. Before approving a run, check the run that waits for approval: the workflow file and commit it runs, every job in it that uses `eval`, and their effective permissions (no GitHub write). Also check that the PR does not change `eval.yml`, any other workflow file, the eval code, the prompts, the fixtures or the federation setup in a harmful way, and that `test.yml` passed. The approval is the control; the residual risk is an approver who approves without reading. Exception to the no-execute rule (K-4): evals of PRs to this repo may run that PR's code, only after an owner approves the `eval` environment run. Needed before phase 2.
+- [ ] Owner: on `.github`, create the GitHub environment `eval`: the owner is a required reviewer for every run, and any branch may deploy to it. "Prevent self-review" was off during phases 2 to 4 (owner, 2026-10-26), so that the coordinator, which runs with the owner's token, could approve eval runs it started from reviewed branches. It is on since 2026-11-01. Admin bypass stays on. During phase 2 the coordinator's approval stands in for the owner's under the owner's delegation. Before approving a run, check the run that waits for approval: the workflow file and commit it runs, every job in it that uses `eval`, and their effective permissions (no GitHub write). Also check that the PR does not change `eval.yml`, any other workflow file, the eval code, the prompts, the fixtures or the federation setup in a harmful way, and that `test.yml` passed. The approval is the control; the residual risk is an approver who approves without reading. Exception to the no-execute rule (K-4): evals of PRs to this repo may run that PR's code, only after an owner approves the `eval` environment run. Needed before phase 2.
 - [x] Owner: a test workspace with a very small spend limit for V9.
 - [ ] Owner: the test org ruleset for V6 that targets only claude-review-test.
 - [ ] Owner: a Dependabot PR in claude-review-test for V4.
@@ -187,7 +187,7 @@ Exit criteria:
 
 - [x] Owner: record the pilot scope. The plan named only `back-end`; the owner added `front-end` (135777271), `operationcode-pybot` (146210805, default branch `master`) and `operationcode_infra` (107068150), with `back-end` (182584277). Four repos (spec P4-1).
 - [x] Owner: before a repo joins the pilot, give it its own approval protection on the default branch: a repo ruleset or branch protection with at least 1 approval, code owner review and dismiss stale approvals on push. Done 2026-10-28: "Pilot approval protection" on `back-end` (26057791), `operationcode-pybot` (26057793) and `operationcode_infra` (26057794), with the Maintain, Admin and org admin bypass because pybot and infra have one active committer; `front-end`: the existing "Protect main" (25634150), only `require_code_owner_review` changed to true (spec P4-3).
-- [x] Owner: before a repo joins the pilot, check it for people or bots that push to the default branch directly (V25). Done: none in 12 months on `back-end`, `operationcode-pybot` and `operationcode_infra`; `front-end` had a force push on 2026-10-28 that rewrote three merged PRs (cleanup of a malicious dependency payload), not new unreviewed code (spec P4-4).
+- [x] Owner: before a repo joins the pilot, check it for people or bots that push to the default branch directly (V25). Done: none in 12 months on `back-end`, `operationcode-pybot` and `operationcode_infra`; `front-end` had one history rewrite on 2026-10-28 that changed no reviewed content (spec P4-4).
 - [ ] Owner: accept that during the pilot a maintainer or repo admin can merge past any failed run, also on their own PR, with the approval that the baseline still requires (spec "Pilot and enforcement").
 - [x] Owner: confirm that the federation rule named in the release code has `job_workflow_ref` at the release SHA. Read back by the owner at M4 `9e2795b` (2026-10-29, spec P4-5).
 - [x] Owner: every pilot repo sends the immutable OIDC subject (spec "Immutable subject", P4-6). Found 2026-10-29: repos made before the GitHub default sent `repo:OperationCode/<repo>:...`, the rule rejected them (`match_subject_prefix`), and the first pilot runs failed closed as designed. Fix per repo: `PUT repos/OperationCode/<repo>/actions/oidc/customization/sub` with `use_default` true and `use_immutable_subject` true. Before it, check the other `id-token` users in the repo and their relying-party trust: `back-end` and `operationcode-pybot` use a cloud OIDC trust policy that gained the immutable subjects (owner; old values kept). After it, all four test PRs passed (all four jobs `success`).
@@ -213,12 +213,12 @@ Exit criteria:
 
 ## Phase 5: before org-wide enforcement
 
-- [ ] Owner: accept in writing the residuals in the spec's "Which run counts": an earlier pass on the same SHA, and run deletion (V6 f confirmed it as a Write user).
+- [x] Owner: accept in writing the residuals in the spec's "Which run counts": an earlier pass on the same SHA, and run deletion (V6 f confirmed it as a Write user). Done 2026-11-01 (spec P5-8).
 - [x] Owner: baseline ruleset 25787833 (spec P5-1): `deletion`, `non_fast_forward`, `required_signatures`, `pull_request` (1 approval, dismiss stale approvals on push, Code Owners review, squash only); `~ALL`; `OrganizationAdmin` `pull_request` bypass only. Read back after each target change.
 - [x] Supported repo inventory: [docs/supported-repos.md](supported-repos.md).
 - [ ] Owner: every repo to be added to the review ruleset first sends the immutable OIDC subject (spec "Immutable subject"). Check `GET repos/OperationCode/<repo>/actions/oidc/customization/sub`, check the other `id-token` users in the repo and their relying-party trust, set it per repo and read it back before the repo is a target. Right after the repo becomes a target, run a test PR in that repo (all four jobs `success` at the pin); the repo is accepted only when it passes.
 - [x] CODEOWNERS in each supported repo (pilot repos P4-3; `START_HERE` P5-4).
-- [ ] Owner: turn "prevent self-review" back on for the `eval` environment (it is off during phase 2), and decide whether admin bypass stays on.
+- [x] Owner: "prevent self-review" is on for the `eval` environment (2026-11-01). Admin bypass stays on.
 - [ ] Owner: Dependabot alerts with npm malware detection on active repos.
 - [ ] Re-run the key acceptance tests on the current release: V6 a, V8 a, V22 b, V23 and the outage process (the invalid federation rule case), each case on its own terms (V6 a on a same-repo and a fork PR, with the timed-out and slow runs from a scratch-only build; V8 a from an account outside the org). A case not run leaves phase 5 open until the owner accepts the gap in the decision log.
 - [ ] Scratch bypass matrix and switch rehearsal on claude-review-test: under the scratch test ruleset and the live baseline, check who can merge which PR kind with the empty, the pilot-shaped and the org-admin-only bypass lists, then return to the pilot-shaped list (the rollback of the phase 6 bypass switch). The baseline is never changed for this test.
@@ -228,7 +228,7 @@ Depends on: phase 4; V6, V8, V22, V23.
 
 Exit criteria:
 
-- [ ] The written acceptance exists.
+- [x] The written acceptance exists (spec P5-8, 2026-11-01).
 - [ ] The baseline read-back matches the P5-1 checklist, and the bypass matrix passed.
 - [ ] The re-run tests pass.
 - [ ] The owner's open security items are done or deferred, with the decision recorded.
