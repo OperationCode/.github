@@ -233,7 +233,7 @@ jobs:
     needs: [collect, analyze, dependency-review]
     if: always()
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 8  # SCRATCH P5-9 V6 a part 2: shorter than the attempt-2 sleep
     permissions:
       contents: read
       pull-requests: write
@@ -303,6 +303,17 @@ jobs:
           artifact-ids: ${{ needs.analyze.outputs.supply-chain-artifact-id }}
           path: ${{ runner.temp }}/data/pass-supply-chain
           digest-mismatch: error
+      # SCRATCH ONLY (P5-9 V6 a part 2, branch p5-v6a-slow, never merged).
+      # Controlled wait before the gate and its final check: 180 s on every
+      # attempt except attempt 2, which sleeps 600 s and so passes the 8 min
+      # job timeout (a timed-out run).
+      - name: Scratch controlled wait (never merge)
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          if [ "$RUN_ATTEMPT" = "2" ]; then secs=600; else secs=180; fi
+          echo "scratch wait: attempt $RUN_ATTEMPT sleeps $secs s"
+          sleep "$secs"
       # The exit code of publish is the gate: 0 only for `pass`.
       - name: Compute the gate and write the PR comments
         env:
