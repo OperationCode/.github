@@ -267,6 +267,25 @@ class GitHubApi(collect.GitHubClient):
             url = nxt
         raise collect.HttpError(f"{path}: more than {max_pages} pages")
 
+    def get_status(self, path: str, *, max_bytes: int) -> collect.HttpResponse | None:
+        """One GET, no retry, any status: the response (body cut at `max_bytes`),
+        or None on a network error or a response from another host. For a
+        display-only probe whose status is the answer."""
+        headers = {
+            "Accept": collect.ACCEPT_JSON,
+            "Authorization": f"Bearer {self._token}",
+            "User-Agent": "oc-claude-review",
+            "X-GitHub-Api-Version": collect.API_VERSION,
+        }
+        try:
+            resp = self._transport(collect.HttpRequest("GET", self._url(path, None), headers, max_bytes, self._timeout))
+        except OSError:
+            return None
+        served = urllib.parse.urlsplit(resp.url)
+        if served.scheme != "https" or served.hostname != collect.API_HOST or served.port is not None:
+            return None
+        return resp
+
     def write(self, method: str, path: str, body: Mapping[str, Any]) -> Mapping[str, Any]:
         """POST or PATCH one of `_WRITE_ROUTES`. Returns the response object."""
         if not any(method == m and rx.fullmatch(path) for m, rx in _WRITE_ROUTES):
@@ -660,6 +679,117 @@ def read_runs(api: GitHubApi, ctx: PublishContext, head_sha: str) -> verdict.Run
 
 
 # ---------------------------------------------------------------------------
+# Display-only reads. The gate never reads these facts: they only label rows
+# and add the informational commit signing row. They cannot change the
+# result, a reason, the exit code or the waiver line.
+# ---------------------------------------------------------------------------
+
+# GitHub lists at most 250 commits of a PR.
+COMMITS_MAX = 250
+SIGNING_GUIDE_URL = "https://docs.github.com/en/authentication/managing-commit-signature-verification"
+DEPENDENCY_PROBE_MAX_BYTES = 64 * 1024
+
+
+@dataclass(frozen=True)
+class CommitSigning:
+    """Signature state of the PR's commits, as GitHub lists them."""
+
+    total: int
+    unsigned: int  # commits whose `commit.verification.verified` is not true
+
+    @property
+    def capped(self) -> bool:
+        return self.total >= COMMITS_MAX
+
+
+@dataclass(frozen=True)
+class SummaryFacts:
+    """Facts the publisher read from GitHub for the summary display only."""
+
+    commits: CommitSigning | None = None
+    dependency_graph_off: bool = False
+
+
+def read_commit_signing(api: GitHubApi, ctx: PublishContext) -> CommitSigning | None:
+    """`GET /pulls/{n}/commits`, every page. None when the list cannot be read
+    (then the summary shows no signing row)."""
+    try:
+        items = api.get_pages(f"{ctx.repo_path}/pulls/{ctx.pr_number}/commits")
+    except collect.CollectError as exc:
+        print(f"publish: commit list not read ({str(exc)[:200]}); no signing row", file=sys.stderr)
+        return None
+    unsigned = 0
+    for item in items:
+        commit = item.get("commit") if isinstance(item, Mapping) else None
+        ver = commit.get("verification") if isinstance(commit, Mapping) else None
+        if not (isinstance(ver, Mapping) and ver.get("verified") is True):
+            unsigned += 1
+    return CommitSigning(len(items), unsigned)
+
+
+# GitHub's own error message must say the Dependency graph is off. A 403
+# alone is not evidence: GitHub also answers 403 for a private repo without
+# Advanced Security, for a fork, for a missing permission and for a secondary
+# rate limit (and the action prints the same advice for every 403).
+_GRAPH_OFF_RE = re.compile(
+    r"\bdependency[ -]graph\b[^.]*\b(?:is\s+)?(?:disabled|not\s+enabled|turned\s+off)\b", re.IGNORECASE
+)
+_GRAPH_OFF_EXCLUDE_RE = re.compile(r"rate[ -]limit|advanced security|abuse", re.IGNORECASE)
+
+
+def dependency_graph_off_evidence(resp: collect.HttpResponse | None) -> bool:
+    """True only on positive evidence: HTTP 403, no rate limit headers, and a
+    JSON error `message` from GitHub that says the Dependency graph is
+    disabled or not enabled. Anything else (no response, another status, an
+    empty, non-JSON or other message) is False, so the row keeps the neutral
+    dependency review wording."""
+    if resp is None or resp.status != 403:
+        return False
+    if resp.headers.get("x-ratelimit-remaining") == "0" or "retry-after" in resp.headers:
+        return False
+    try:
+        doc = envelope.parse_json(resp.body)
+    except envelope.EnvelopeError:
+        return False
+    message = doc.get("message") if isinstance(doc, Mapping) else None
+    if not isinstance(message, str) or len(message) > 1000:
+        return False
+    return bool(_GRAPH_OFF_RE.search(message)) and not _GRAPH_OFF_EXCLUDE_RE.search(message)
+
+
+def read_dependency_graph_off(api: GitHubApi, ctx: PublishContext, snap: snapshot.Snapshot | None) -> bool:
+    """The dependency comparison of the reviewed pair, read once, judged by
+    `dependency_graph_off_evidence`."""
+    if snap is None:
+        return False
+    resp = api.get_status(
+        f"{ctx.repo_path}/dependency-graph/compare/{snap.merge_base_sha}...{snap.head_sha}",
+        max_bytes=DEPENDENCY_PROBE_MAX_BYTES,
+    )
+    return dependency_graph_off_evidence(resp)
+
+
+def read_summary_facts(
+    api: GitHubApi, ctx: PublishContext, snap: snapshot.Snapshot | None, needs: Any, outcome: str | None
+) -> SummaryFacts:
+    """The display-only reads. The dependency probe runs only when the
+    dependency-review job or step reported `failure`. Never raises: any error
+    in a read gives no fact (no signing row, the neutral dependency row)."""
+    dr_failed = job_results(needs).get(verdict.DEPENDENCY_REVIEW_JOB) == "failure" or outcome == "failure"
+    try:
+        commits = read_commit_signing(api, ctx)
+    except Exception as exc:  # noqa: BLE001 - display only, never fails the run
+        print(f"publish: commit list not read ({type(exc).__name__}); no signing row", file=sys.stderr)
+        commits = None
+    try:
+        graph_off = dr_failed and read_dependency_graph_off(api, ctx, snap)
+    except Exception as exc:  # noqa: BLE001 - display only, never fails the run
+        print(f"publish: dependency probe failed ({type(exc).__name__}); neutral row", file=sys.stderr)
+        graph_off = False
+    return SummaryFacts(commits=commits, dependency_graph_off=graph_off)
+
+
+# ---------------------------------------------------------------------------
 # Inline review
 # ---------------------------------------------------------------------------
 
@@ -1023,6 +1153,18 @@ EFFECT_NONE = "Does not block"
 HARD_BLOCK_CELL = "🚫 **Hard block**"
 NOT_RUN_CELL = "⚠️ **Not run**"
 BLOCKED_CELL = "🚫 **Blocked**"
+SETTING_CELL = "⚙️ **Repo setting**"
+INFO_CELL = "ℹ️ **Info**"
+EFFECT_INFO = "No effect on this review"
+COMMIT_CHECK_ROW = "Commit check (code, no model)"
+
+# An owner setting, not the author's change (item: label setting problems).
+DEPENDENCY_GRAPH_CLAIM = (
+    "Dependency review cannot run: the Dependency graph is off for this repo. Only a repo admin can fix "
+    "this: turn it on in the repo settings (Security, Advanced Security), then re-run the newest run. "
+    "The author does not need to change anything."
+)
+DEPENDENCY_GRAPH_DETAIL = "Cause: the Dependency graph is off (a repo setting that only a repo admin can change)."
 
 # Reasons that mean part of the review did not complete.
 _INCOMPLETE_CODES = frozenset(
@@ -1045,6 +1187,37 @@ def _n(count: int, word: str) -> str:
     return f"{count} {word}" + ("" if count == 1 else "s")
 
 
+def _join(names: Sequence[str]) -> str:
+    """"A", "A and B", "A, B and C"."""
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _is_dependency_reason(r: verdict.Reason) -> bool:
+    """The dependency-review job result and the step outcome reasons. They
+    report one cause, so the summary shows them as one row."""
+    return r.code == verdict.R_DEPENDENCY_REVIEW or (
+        r.code == verdict.R_JOB_RESULT and r.detail.split(":", 1)[0] == verdict.DEPENDENCY_REVIEW_JOB
+    )
+
+
+_PASS_FAILED_RE = re.compile(r"pass (?:review|security|supply-chain) failed(?:: (.*))?", re.S)
+
+
+def _cause_key(r: verdict.Reason) -> tuple[str, str]:
+    """Reasons with one key have one root cause and show once: the
+    dependency-review reasons, and passes that failed for the same reason."""
+    if _is_dependency_reason(r):
+        return (verdict.R_DEPENDENCY_REVIEW, "")
+    m = _PASS_FAILED_RE.fullmatch(r.detail) if r.code == verdict.R_PASS_RECORDS else None
+    if m:
+        return (r.code, "failed: " + (m.group(1) or ""))
+    return (r.code, r.detail)
+
+
+def _dependency_failed(result: verdict.GateResult) -> bool:
+    return any(_is_dependency_reason(r) for r in result.reasons)
+
+
 def _code_span(kind: str, text: str, suffix: str = "") -> str:
     """A code span that is safe in a table cell. `escape_field` backslash-escapes
     punctuation, which would show inside a code span, so a span is cleaned
@@ -1054,8 +1227,27 @@ def _code_span(kind: str, text: str, suffix: str = "") -> str:
 
 def _span_of(joined: str, cut: bool, suffix: str = "") -> str:
     """The code span of text that `_clean_text` already cut: one marker only."""
-    joined = _defang(joined).replace("`", "'").replace("<", "‹").replace("|", "\\|") + ("…" if cut else "")
+    joined = _defang(joined).replace("`", "'").replace("<", "‹")
+    joined = _escape_span_pipes(joined) + ("…" if cut else "")
     return f"`{joined or 'unknown'}{suffix}`"
+
+
+_BACKSLASHES_BEFORE_PIPE = re.compile(r"(\\+)(?=\|)")
+
+
+def _escape_span_pipes(text: str) -> str:
+    """Escape every `|` as `\\|` so a table cell stays whole. A backslash run
+    right before a pipe is first split from it with a ZWSP, so the pipe always
+    has exactly one escaping backslash before it. Table parsers differ on
+    `\\\\|` (cmark-gfm keeps it in the cell, others end the cell there); with
+    the ZWSP no parser sees two backslashes before a pipe."""
+    return _BACKSLASHES_BEFORE_PIPE.sub(lambda m: m.group(1) + ZWSP, text).replace("|", "\\|")
+
+
+def _path_span(value: Any, kind: str = "path") -> str:
+    """A file path as plain text in a code span (no backslash escapes): the
+    `_code_span` rules, so it stays safe. A non-string reads `unknown`."""
+    return _code_span(kind, value if isinstance(value, str) else "")
 
 
 def _cell(text: str) -> str:
@@ -1133,6 +1325,7 @@ class _Row:
     members: tuple[verdict.CitedFinding, ...] = ()
     is_model: bool = False
     label: str = ""  # a hard block row: its fixed label
+    info: bool = False  # informational: not a reason, not counted in the heading
 
 
 def _found_by(pass_name: str, members: Sequence[verdict.CitedFinding]) -> str:
@@ -1204,7 +1397,7 @@ def _check_evidence(item: Mapping[str, Any]) -> str:
     """The label, detail, file, subject and lines of a prefilter item, as one line."""
     text = f"{_check_label(item.get('id'))}: {_esc('evidence', item.get('detail'))}"
     if item.get("file"):
-        text += f", in {_esc('path', item.get('file'))}"
+        text += f", in {_path_span(item.get('file'))}"
     if item.get("subject"):
         text += f", {_esc('evidence', item.get('subject'))}"
     lines = item.get("lines")
@@ -1250,36 +1443,55 @@ def _hard_rows(result: verdict.GateResult, payload: Mapping[str, Any] | None) ->
         label = "Incomplete file coverage" if r.detail.startswith("incomplete-coverage") else "File check result"
         out.append(
             _Row((0, len(items) + n), HARD_BLOCK_CELL, EFFECT_NO_WAIVER, "Whole PR",
-                 f"{label}: {_esc('reason', r.detail)}", FILE_CHECKS_ROW, label=label)
+                 f"{label}: {_code_span('reason', r.detail)}", FILE_CHECKS_ROW, label=label)
         )
     return out
 
 
-def _not_run_rows(result: verdict.GateResult) -> list[_Row]:
+def _not_run_rows(result: verdict.GateResult, facts: SummaryFacts) -> list[_Row]:
     """Rows for every pass or job that did not complete, and for every other
-    reason that is not a finding or a hard block."""
+    reason that is not a finding or a hard block. Rows with one cause show
+    once: passes that failed for the same reason share a row, and the
+    dependency-review job result and step outcome are one row."""
     out: list[_Row] = []
     by_pass = {p.name: p for p in result.passes}
     size_gate = any(r.code == verdict.R_SIZE_GATE for r in result.reasons)
-    pass_rows = 0
+    pass_claims: dict[str, list[str]] = {}
     for name in verdict.PASS_NAMES:
         info = by_pass.get(name)
         label = PASS_LABELS[name]
         if info is None:
-            claim = f"No valid record of the {label} pass. The pass returned no result."
+            claim = "No valid pass record. The pass returned no result."
         elif info.status == "ok" or (info.status == "skipped-size" and size_gate):
             continue
         else:
             reason = info.meta.get("reason")
             why = reason.strip().rstrip(".") if isinstance(reason, str) and reason.strip() else info.status
             claim = f"{_esc('reason', why)}. The pass returned no result."
+        pass_claims.setdefault(claim, []).append(label)
+    pass_rows = 0
+    for claim, labels in pass_claims.items():
         pass_rows += 1
-        out.append(_Row((1, pass_rows), NOT_RUN_CELL, EFFECT_NO_WAIVER, f"{label} pass", claim, CODE_ROW))
+        where = f"{_join(labels)} pass" + ("es" if len(labels) > 1 else "")
+        out.append(_Row((1, pass_rows), NOT_RUN_CELL, EFFECT_NO_WAIVER, where, claim, CODE_ROW))
+    dependency = [r for r in result.reasons if _is_dependency_reason(r)]
     n = 0
     for r in result.reasons:
         if r.code in (verdict.R_HARD_BLOCK, verdict.R_BLOCKING_FINDING):
             continue
         if r.code == verdict.R_PASS_RECORDS and pass_rows:
+            continue
+        if _is_dependency_reason(r):
+            if r is not dependency[0]:
+                continue
+            n += 1
+            if facts.dependency_graph_off:
+                out.append(_Row((1, 100 + n), SETTING_CELL, EFFECT_NO_WAIVER, "Repo settings",
+                                DEPENDENCY_GRAPH_CLAIM, CODE_ROW))
+            else:
+                details = ", ".join(_code_span("reason", x.detail) for x in dependency)
+                out.append(_Row((1, 100 + n), NOT_RUN_CELL, EFFECT_NO_WAIVER, "Dependency review",
+                                f"{_reason_label(verdict.R_DEPENDENCY_REVIEW)}: {details}", CODE_ROW))
             continue
         n += 1
         if r.code == verdict.R_SIZE_GATE:
@@ -1291,16 +1503,31 @@ def _not_run_rows(result: verdict.GateResult) -> list[_Row]:
             continue
         cell = BLOCKED_CELL if r.code in (verdict.R_STALE, verdict.R_SUPERSEDED, verdict.R_BASE_NOT_DEFAULT) else NOT_RUN_CELL
         out.append(
-            _Row((1, 100 + n), cell, EFFECT_NO_WAIVER, "Gate", f"{_reason_label(r.code)}: {_esc('reason', r.detail)}", CODE_ROW)
+            _Row((1, 100 + n), cell, EFFECT_NO_WAIVER, "Gate", f"{_reason_label(r.code)}: {_code_span('reason', r.detail)}", CODE_ROW)
         )
     return out
+
+
+def _signing_row(facts: SummaryFacts) -> list[_Row]:
+    """The informational unsigned-commit row; none when every commit is
+    verified-signed or the list could not be read. It never changes the gate."""
+    c = facts.commits
+    if c is None or c.unsigned == 0:
+        return []
+    of = f"{c.unsigned} of the first {c.total}" if c.capped else f"{c.unsigned} of {c.total}"
+    claim = (
+        f"**Unsigned commits:** {of} commits in this PR {'is' if c.unsigned == 1 else 'are'} not "
+        "verified-signed. The org requires signed commits, so the merge box blocks until every commit is "
+        f"signed. [How to sign commits]({SIGNING_GUIDE_URL})"
+    )
+    return [_Row((3, 0), INFO_CELL, EFFECT_INFO, "Commits", claim, COMMIT_CHECK_ROW, info=True)]
 
 
 def _findings_table(rows: list[_Row]) -> list[_Block]:
     if not rows:
         return []
     out = [
-        _Block("\n| Severity | Effect | Where | Finding | Found by |"),
+        _Block("\n| Severity | Effect | Where | Finding | Found by |"),  # = _FINDINGS_HEADER
         _Block("|---|---|---|---|---|"),
     ]
     for r in rows:
@@ -1351,12 +1578,17 @@ def _blocking_phrase(model_rows: list[_Row]) -> str:
     return f"{len(blocking)} findings"
 
 
-def _callout(result: verdict.GateResult, rows: list[_Row], hard: list[_Row], has_payload: bool) -> str:
+def _callout(
+    result: verdict.GateResult, rows: list[_Row], hard: list[_Row], has_payload: bool, facts: SummaryFacts
+) -> str:
     """The colored callout. Kind: TIP for a pass with no findings, NOTE for a
     pass with findings, CAUTION for every fail, waivable or not (ruling 1).
-    The text says whether a waiver can clear it."""
+    The text says whether a waiver can clear it. A repo setting problem is
+    never given to the author as a step."""
     model = _model_rows(rows)
     codes = result.codes
+    setting = facts.dependency_graph_off and _dependency_failed(result)
+    setting_also = " A repo setting also blocks the dependency review; only a repo admin can fix it (see its row)."
     if result.status != verdict.FAIL:
         if result.override_applied:
             login = _esc("login", result.valid_overrides[0].author_login) if result.valid_overrides else "a maintainer"
@@ -1388,7 +1620,22 @@ def _callout(result: verdict.GateResult, rows: list[_Row], hard: list[_Row], has
         else:
             first = f"**{label} and {len(hard) - 1} other hard block(s) block this PR. No waiver can clear them.**{also}"
         nxt = "**Next step for the author:** fix the cause named in the row, then push. The review runs again on the new commit."
+        if setting:
+            nxt += setting_also
     elif codes & _INCOMPLETE_CODES:
+        other_incomplete = [r for r in result.reasons if r.code in _INCOMPLETE_CODES and not _is_dependency_reason(r)]
+        if setting and not other_incomplete:
+            first = f"**A repo setting stops the dependency review, so this PR could not be judged. No waiver can clear this.**{also}"
+            nxt = (
+                "**Next step for a repo admin:** turn on the Dependency graph in the repo settings, then re-run "
+                "the newest run of the required workflow. "
+            )
+            nxt += (
+                f"The author also fixes or waives the finding{'' if len(blocking) == 1 else 's'}."
+                if blocking
+                else "The author does not need to change anything."
+            )
+            return "\n".join(f"> {x}" for x in ("[!CAUTION]", first, nxt))
         if failed and verdict.R_PASS_RECORDS in codes:
             who = " and ".join(failed) if len(failed) <= 2 else "Review, Security and Supply chain"
             first = f"**The {who} {'review' if len(failed) == 1 else 'reviews'} did not run, so this PR could not be judged. No waiver can clear this.**{also}"
@@ -1400,6 +1647,8 @@ def _callout(result: verdict.GateResult, rows: list[_Row], hard: list[_Row], has
             if blocking
             else "The author does not need to change anything."
         )
+        if setting:
+            nxt += setting_also
     elif verdict.R_BASE_NOT_DEFAULT in codes:
         ref = _esc("ref", result.snapshot.base_ref) if result.snapshot else "another branch"
         first = f"**This PR targets {ref}, not the default branch. No waiver can clear this.**{also}"
@@ -1422,7 +1671,15 @@ def _callout(result: verdict.GateResult, rows: list[_Row], hard: list[_Row], has
     return "\n".join(f"> {x}" for x in ("[!CAUTION]", first, nxt))
 
 
-def _checks_strip(result: verdict.GateResult, payload: Mapping[str, Any] | None, hard_count: int) -> _Block:
+def _dependency_cell(result: verdict.GateResult, facts: SummaryFacts, ok: str) -> str:
+    if not _dependency_failed(result):
+        return ok
+    return "⚙️ repo setting" if facts.dependency_graph_off else "❌ failed"
+
+
+def _checks_strip(
+    result: verdict.GateResult, payload: Mapping[str, Any] | None, hard_count: int, facts: SummaryFacts
+) -> _Block:
     """One-row table: what ran. Never cut."""
     if payload is None:
         file_cell, coverage_cell = "❌ no result", "❌ unknown"
@@ -1450,11 +1707,7 @@ def _checks_strip(result: verdict.GateResult, payload: Mapping[str, Any] | None,
             cells.append("⚠️ skipped, too large")
         else:
             cells.append(f"❌ {_esc('label', info.status)}")
-    dep_failed = any(
-        r.code == verdict.R_DEPENDENCY_REVIEW or (r.code == verdict.R_JOB_RESULT and verdict.DEPENDENCY_REVIEW_JOB in r.detail)
-        for r in result.reasons
-    )
-    dep_cell = "❌ failed" if dep_failed else "✅ ok"
+    dep_cell = _dependency_cell(result, facts, "✅ ok")
     return _Block(
         "\n".join(
             (
@@ -1522,14 +1775,23 @@ def _snapshot_blocks(ctx: PublishContext, result: verdict.GateResult) -> list[_B
     ]
 
 
-def _reason_blocks(result: verdict.GateResult) -> list[_Block]:
+def _reason_blocks(result: verdict.GateResult, facts: SummaryFacts) -> list[_Block]:
+    """Every reason, one row per root cause (`_cause_key`): a row with several
+    reasons lists each detail."""
     out = [_title("Reasons the gate failed")]
     if not result.reasons:
         return out + [_Block("None. No reason applies.")]
     out += [_Block("| Reason | Waivable? | Detail |"), _Block("|---|---|---|")]
+    causes: dict[tuple[str, str], list[verdict.Reason]] = {}
     for r in result.reasons:
-        flag = ("✅ yes, waived" if result.override_applied else "✅ yes") if r.waivable else "🚫 no"
-        out.append(_Block(_row(_reason_label(r.code), flag, _esc("reason", r.detail))))
+        causes.setdefault(_cause_key(r), []).append(r)
+    for (code, _detail), members in causes.items():
+        waivable = all(r.waivable for r in members)
+        flag = ("✅ yes, waived" if result.override_applied else "✅ yes") if waivable else "🚫 no"
+        detail = ", ".join(_code_span("reason", r.detail) for r in members)
+        if code == verdict.R_DEPENDENCY_REVIEW and facts.dependency_graph_off:
+            detail += " " + DEPENDENCY_GRAPH_DETAIL
+        out.append(_Block(_row(_reason_label(code), flag, detail)))
     if result.status == verdict.FAIL and result.override_command is None:
         out.append(
             _Block(
@@ -1586,7 +1848,7 @@ def _delta_blocks(delta: Any) -> list[_Block]:
             f"- {_esc('label', ch.get('ecosystem'))} {_esc('package_name', ch.get('name'))}: "
             f"{olds} to {_esc('version', ch.get('new_version'))}, "
             f"source {_esc('label', source.get('kind'))} {_esc('url', source.get('normalized'))}, "
-            f"in {_esc('path', ch.get('path'))}"
+            f"in {_path_span(ch.get('path'))}"
         )
         reg = ch.get("registry")
         if isinstance(reg, Mapping):
@@ -1602,7 +1864,7 @@ def _delta_blocks(delta: Any) -> list[_Block]:
             src = s.get("source") if isinstance(s.get("source"), Mapping) else {}
             out.append(
                 _Block(
-                    f"- new file-wide source in {_esc('path', s.get('path'))}: {_esc('url', src.get('normalized'))}",
+                    f"- new file-wide source in {_path_span(s.get('path'))}: {_esc('url', src.get('normalized'))}",
                     CUT_DEPENDENCY,
                     "dependency",
                 )
@@ -1611,7 +1873,7 @@ def _delta_blocks(delta: Any) -> list[_Block]:
         if isinstance(fl, Mapping):
             out.append(
                 _Block(
-                    f"- failed: {_esc('path', fl.get('path'))}: {_esc('reason', fl.get('reason'))}",
+                    f"- failed: {_path_span(fl.get('path'))}: {_esc('reason', fl.get('reason'))}",
                     CUT_DEPENDENCY,
                     "dependency",
                 )
@@ -1619,7 +1881,9 @@ def _delta_blocks(delta: Any) -> list[_Block]:
     return out
 
 
-def _check_table_blocks(result: verdict.GateResult, payload: Mapping[str, Any] | None) -> list[_Block]:
+def _check_table_blocks(
+    result: verdict.GateResult, payload: Mapping[str, Any] | None, facts: SummaryFacts
+) -> list[_Block]:
     """The "Checks (code, no model)" table: hard blocks, coverage, dependency changes
     and the dependency-review job. Hard block evidence and unavailable files are never cut."""
     out = [_title("Checks (code, no model)"), _Block("| Check | Result | Detail |"), _Block("|---|---|---|")]
@@ -1649,15 +1913,20 @@ def _check_table_blocks(result: verdict.GateResult, payload: Mapping[str, Any] |
         for f in files if isinstance(files, list) else ():
             if isinstance(f, Mapping) and f.get("coverage") == "unavailable":
                 out.append(
-                    _Block(_row("Unavailable file", "⚠️ unavailable", f"{_esc('path', f.get('path'))}: {_esc('reason', f.get('reason'))}"))
+                    _Block(_row("Unavailable file", "⚠️ unavailable", f"{_path_span(f.get('path'))}: {_esc('reason', f.get('reason'))}"))
                 )
     has_delta = bool(_delta_blocks(payload.get("dependency_delta")))
     out.append(_Block(_row("Dependency changes", "ℹ️ listed below" if has_delta else "✅ none", "")))
-    dep_failed = any(
-        r.code == verdict.R_DEPENDENCY_REVIEW or (r.code == verdict.R_JOB_RESULT and verdict.DEPENDENCY_REVIEW_JOB in r.detail)
-        for r in result.reasons
+    setting = facts.dependency_graph_off and _dependency_failed(result)
+    out.append(
+        _Block(
+            _row(
+                "Dependency review job",
+                _dependency_cell(result, facts, "✅ success"),
+                DEPENDENCY_GRAPH_DETAIL if setting else "",
+            )
+        )
     )
-    out.append(_Block(_row("Dependency review job", "❌ failed" if dep_failed else "✅ success", "")))
     return out
 
 
@@ -1679,7 +1948,7 @@ def _finding_block(f: verdict.CitedFinding, inline: InlineOutcome) -> _Block | N
     state = _posting_state(f, inline)
     if state in _INLINE_STATES:
         return None
-    where = f"{_esc('file', f.file)} line {f.line} ({f.side})"
+    where = f"{_path_span(f.file, 'file')} line {f.line} ({f.side})"
     head = f"- {_finding_line(f)}, at {where}: {_esc('title', f.title)}"
     # A high or critical finding is never cut, also when it is unverified.
     protected = not _cuttable(f)
@@ -1797,13 +2066,20 @@ def _summary_table_blocks(result: verdict.GateResult) -> list[_Block]:
     return out
 
 
+TOKENS_NONE = "No token usage was recorded for any pass."
+
+
 def _token_blocks(result: verdict.GateResult) -> list[_Block]:
+    """The token table, or one line when no pass recorded any count (an
+    all-"not recorded" table is noise)."""
+    by_pass = {p.name: p for p in result.passes}
+    if not any(_usage_numbers(p.meta) for p in by_pass.values()):
+        return [_title("Token usage"), _Block(TOKENS_NONE)]
     out = [
         _title("Token usage"),
         _Block("| Pass | Input | Output | Cache write | Cache read | Attempts |"),
         _Block("|---|---:|---:|---:|---:|---:|"),
     ]
-    by_pass = {p.name: p for p in result.passes}
     totals: dict[str, int] = {}
     missing = False
     for name in verdict.PASS_NAMES:
@@ -1830,12 +2106,12 @@ def _token_blocks(result: verdict.GateResult) -> list[_Block]:
 
 
 def _record_blocks(ctx: PublishContext, result: verdict.GateResult, payload: Mapping[str, Any] | None,
-                   inline: InlineOutcome) -> list[_Block]:
+                   inline: InlineOutcome, facts: SummaryFacts) -> list[_Block]:
     inner: list[_Block] = []
     inner += _snapshot_blocks(ctx, result)
-    inner += _reason_blocks(result)
+    inner += _reason_blocks(result, facts)
     inner += _override_blocks(ctx, result)
-    inner += _check_table_blocks(result, payload)
+    inner += _check_table_blocks(result, payload, facts)
     inner += _signal_blocks(payload)
     inner.append(_title("Dependency changes"))
     delta = _delta_blocks(payload.get("dependency_delta")) if payload is not None else []
@@ -1901,23 +2177,25 @@ def _summary_blocks(
     payload: Mapping[str, Any] | None,
     inline: InlineOutcome,
     truncated: bool,
+    facts: SummaryFacts,
 ) -> list[_Block]:
     hard = _hard_rows(result, payload)
     rows = sorted(
-        [*hard, *_not_run_rows(result), *_merge_findings(result, inline)],
+        [*hard, *_not_run_rows(result, facts), *_merge_findings(result, inline)],
         key=lambda r: r.sort,
     )
     model = _model_rows(rows)
     b = [
         _Block(verdict.STICKY_MARKER),
         _Block(_status_heading(result, model, rows) + "\n" + MISSION_LINE),
-        _Block("\n" + _callout(result, rows, hard, payload is not None)),
+        _Block("\n" + _callout(result, rows, hard, payload is not None, facts)),
     ]
-    b += _findings_table(rows)
-    b.append(_checks_strip(result, payload, len(hard)))
+    # The signing row is informational: it is not in the heading count or the callout.
+    b += _findings_table([*rows, *_signing_row(facts)])
+    b.append(_checks_strip(result, payload, len(hard), facts))
     b.append(_provenance(ctx, result, truncated))
     b += _waiver_blocks(result)
-    b += _record_blocks(ctx, result, payload, inline)
+    b += _record_blocks(ctx, result, payload, inline, facts)
     return b
 
 
@@ -1928,16 +2206,55 @@ def render_summary(
     bundle: Mapping[str, Any] | None,
     inline: InlineOutcome,
     limit: int = SUMMARY_LIMIT,
+    facts: SummaryFacts | None = None,
 ) -> RenderedSummary:
     """The sticky summary body (D8). Every untrusted string goes through
     `escape_field` (or `_code_span`). Layout: result heading, callout, findings
-    table, checks strip, provenance, then the collapsed waiver and record."""
+    table, checks strip, provenance, then the collapsed waiver and record.
+    `facts` are display-only (`read_summary_facts`); `result` alone decides
+    the gate."""
+    facts = facts or SummaryFacts()
     payload = _payload_of(bundle)
-    body, cut = _fit(_summary_blocks(ctx, result, payload, inline, False), limit)
+    # The signing row is informational and must never change the comment
+    # otherwise: render without it, and keep it only when the body with it
+    # makes exactly the same cuts (and no overflow).
+    base = _render_fit(ctx, result, payload, inline, limit, replace(facts, commits=None))
+    if not _signing_row(facts) or base.overflow:
+        return base
+    row = _render_fit(ctx, result, payload, inline, limit, facts)
+    if row.overflow or row.cut != base.cut or _without_signing_row(row.body, facts) != base.body:
+        print("publish: no room for the unsigned-commit row; left out", file=sys.stderr)
+        return base
+    return row
+
+
+_FINDINGS_HEADER = "\n| Severity | Effect | Where | Finding | Found by |\n|---|---|---|---|---|"
+
+
+def _without_signing_row(body: str, facts: SummaryFacts) -> str:
+    """`body` with the signing row (and a findings table header that only it
+    needed) taken out: equal to the body without the row when the row changed
+    nothing else."""
+    [r] = _signing_row(facts)
+    out = body.replace("\n" + _row(r.severity, r.effect, r.where, r.claim, r.found_by), "", 1)
+    if out.count(_FINDINGS_HEADER) == 1 and out.find(_FINDINGS_HEADER + "\n|") == -1:
+        out = out.replace("\n" + _FINDINGS_HEADER, "", 1)
+    return out
+
+
+def _render_fit(
+    ctx: PublishContext,
+    result: verdict.GateResult,
+    payload: Mapping[str, Any] | None,
+    inline: InlineOutcome,
+    limit: int,
+    facts: SummaryFacts,
+) -> RenderedSummary:
+    body, cut = _fit(_summary_blocks(ctx, result, payload, inline, False, facts), limit)
     if body is not None and cut:
         # The provenance line says so when a cut was made. Its longer text is
         # in the fit, so the body still fits.
-        body, cut = _fit(_summary_blocks(ctx, result, payload, inline, True), limit)
+        body, cut = _fit(_summary_blocks(ctx, result, payload, inline, True, facts), limit)
     if body is None:
         return RenderedSummary(_overflow_body(ctx, result), True, overflow=True)
     return RenderedSummary(body, cut)
@@ -2208,14 +2525,16 @@ def publish(
         append_step_summary(step_summary, ctx, result, codes=[*result.codes, verdict.R_STALE])
         return 1
 
-    # b) sticky summary
+    # b) sticky summary. The display-only reads come first, so the snapshot
+    # check stays right before the write.
+    facts = read_summary_facts(api, ctx, snap, needs, dependency_review_outcome(needs, dependency_outcome_env))
     check = check_snapshot(api, ctx, snap)
     if check.blocks_writes:
         print(f"publish: {check.describe()} before the summary; no more writes", file=sys.stderr)
         append_step_summary(step_summary, ctx, result, codes=[*result.codes, verdict.R_STALE])
         return 1
     bundle_doc = bundle_read.envelope if bundle_read.error is None else None
-    summary = render_summary(ctx, result, bundle=bundle_doc, inline=inline)
+    summary = render_summary(ctx, result, bundle=bundle_doc, inline=inline, facts=facts)
     full = full_record(ctx, result, bundle_doc) if summary.cut else None
     if full is not None:
         log_full_record(full)
@@ -2243,7 +2562,7 @@ def publish(
     if result.passed and not final.passed:
         # Best effort: the exit code is non-zero whatever this write does. The
         # reads above can take many pages, so check the snapshot once more.
-        summary = render_summary(ctx, final, bundle=bundle_doc, inline=inline)
+        summary = render_summary(ctx, final, bundle=bundle_doc, inline=inline, facts=facts)
         check = check_snapshot(api, ctx, snap)
         if check.blocks_writes:
             print(f"publish: {check.describe()} before the summary update; no more writes", file=sys.stderr)

@@ -91,6 +91,12 @@ class FakeGitHub:
     runs_per_page: int | None = None
     runs_total: int | None = None
     review_status: int = 200
+    # PR commits (`GET /pulls/{n}/commits`): one verified commit by default.
+    commits: list = field(default_factory=lambda: [signed_commit(True)])
+    # Status of `GET /dependency-graph/compare/...` (403: Dependency graph off).
+    dependency_graph_status: int = 200
+    dependency_graph_headers: dict = field(default_factory=dict)
+    dependency_graph_body: bytes = b""
     fail: set = field(default_factory=set)  # (method, path, page) -> HTTP 500
     after: Callable[[FakeGitHub, HttpRequest], None] | None = None
     requests: list = field(default_factory=list)
@@ -157,10 +163,17 @@ class FakeGitHub:
             (f"/issues/{PR}/comments", self.issue_comments),
             (f"/issues/{PR}/timeline", self.timeline),
             (f"/pulls/{PR}/comments", self.review_comments),
+            (f"/pulls/{PR}/commits", self.commits),
         ):
             if m == "GET" and path == API + suffix:
                 chunk, headers = _page(items, query, req.url)
                 return self._json(req, chunk, headers=headers)
+        if m == "GET" and path.startswith(f"{API}/dependency-graph/compare/"):
+            assert path.rsplit("/", 1)[1] == f"{self.merge_base}...{self.head}"
+            if self.dependency_graph_status != 200:
+                return HttpResponse(self.dependency_graph_status, self.dependency_graph_body, req.url,
+                                    dict(self.dependency_graph_headers))
+            return self._json(req, [])
         if m == "GET" and path.startswith(f"{API}/collaborators/"):
             login = urllib.parse.unquote(path.split("/")[-2])
             if login not in self.permissions:
@@ -202,6 +215,11 @@ class FakeGitHub:
                 "repo": {"id": REPO_ID, "full_name": REPO, "default_branch": self.default_branch},
             },
         }
+
+
+def signed_commit(verified: bool, n: int = 0) -> dict:
+    """A `GET /pulls/{n}/commits` item with only the fields the publisher reads."""
+    return {"sha": f"{n:040x}", "commit": {"verification": {"verified": verified, "reason": "valid" if verified else "unsigned"}}}
 
 
 def api_comment(cid, login, body, created=None, updated=None, type="User"):
@@ -363,7 +381,9 @@ def reason_rows(text: str) -> list[tuple[str, bool, str]]:
     """The rows of the reasons table of the record, as (code, waivable, detail)."""
     m = re.search(r"\*\*Reasons the gate failed\*\*\n\n(.*?)(?:\n\n|\Z)", text, re.S)
     assert m, "no reasons section"
-    return [(LABEL_CODE[label], flag.startswith("✅"), plain(detail)) for label, flag, detail in _REASON_ROW.findall(m.group(1))]
+    # Details are code spans: drop the backticks (a span never holds one).
+    return [(LABEL_CODE[label], flag.startswith("✅"), plain(detail).replace("`", ""))
+            for label, flag, detail in _REASON_ROW.findall(m.group(1))]
 
 
 def reason_codes(text: str) -> set[str]:
@@ -734,7 +754,7 @@ def test_moved_line_alone_shows_the_finding_in_the_summary(tmp_path):
     second = run(tmp_path / "2", FakeGitHub(review_comments=posted_by(first)), bundle=moved_bundle(),
                  passes=clean_passes(review=[finding(title="bug", line=11, explanation="Same words.")]))
     assert second.gh.bodies("POST", "/reviews") == []
-    assert "src/app.py line 11 (head)" in plain(second.summary)
+    assert "`src/app.py` line 11 (head)" in plain(second.summary)
     assert "Differs from the inline comment of an earlier run" in plain(second.summary)
 
 
@@ -938,13 +958,21 @@ def test_strings_cut_by_analyze_render_escaped(tmp_path):
     s = r.summary
     assert r.code == 1 and s.startswith(verdict.STICKY_MARKER)
     assert "Not verified: file is not in the changed files" in plain(s)
+    # A path shows as plain text in a code span: no backslash escapes, no
+    # backtick (it ends the span), no "<", and references still broken.
+    span = publish._path_span(cut["file"], "file")
+    assert span in s
+    assert span.endswith("\\'‹!--&amp;@" + ZWSP + "user #" + ZWSP + "12 [/`")
+    assert span.count("`") == 2 and "<" not in span
     for kind, value in cut.items():
+        if kind == "file":
+            continue
         shown = publish.escape_field(kind, value)
         assert shown in s, kind
         assert not shown.endswith(publish.TRUNCATED)
         assert plain(shown) == value, kind  # every character shows as text
         escaped_end = r"\\\`\<\!\-\-\&amp\;\@" + ZWSP + r"user \#" + ZWSP + r"12 \["
-        assert shown.endswith(escaped_end + "\\/" * (kind == "file")), kind
+        assert shown.endswith(escaped_end), kind
     body = s.replace(verdict.STICKY_MARKER, "")
     assert not re.search(r"(?<!\\)<!--", body) and "<b>" not in body and "**bold**" not in body
 

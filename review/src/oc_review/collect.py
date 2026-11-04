@@ -232,7 +232,14 @@ def default_transport(
             return HttpResponse(resp.status, b"".join(chunks), resp.url, headers)
     except urllib.error.HTTPError as exc:
         headers = {k.lower(): v for k, v in (exc.headers or {}).items()}
-        return HttpResponse(exc.code, b"", request.url, headers)
+        # The error body, cut at the byte cap. Only a display-only probe reads
+        # it (publish.dependency_graph_off_evidence); every other caller fails
+        # on the status alone.
+        try:
+            body = exc.read(request.max_bytes + 1) if clock() <= deadline else b""
+        except (OSError, ValueError):
+            body = b""
+        return HttpResponse(exc.code, body or b"", request.url, headers)
 
 
 class GitHubClient:
