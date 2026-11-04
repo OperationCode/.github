@@ -727,35 +727,66 @@ def read_commit_signing(api: GitHubApi, ctx: PublishContext) -> CommitSigning | 
     return CommitSigning(len(items), unsigned)
 
 
+# GitHub's own error message must say the Dependency graph is off. A 403
+# alone is not evidence: GitHub also answers 403 for a private repo without
+# Advanced Security, for a fork, for a missing permission and for a secondary
+# rate limit (and the action prints the same advice for every 403).
+_GRAPH_OFF_RE = re.compile(
+    r"\bdependency[ -]graph\b[^.]*\b(?:is\s+)?(?:disabled|not\s+enabled|turned\s+off)\b", re.IGNORECASE
+)
+_GRAPH_OFF_EXCLUDE_RE = re.compile(r"rate[ -]limit|advanced security|abuse", re.IGNORECASE)
+
+
+def dependency_graph_off_evidence(resp: collect.HttpResponse | None) -> bool:
+    """True only on positive evidence: HTTP 403, no rate limit headers, and a
+    JSON error `message` from GitHub that says the Dependency graph is
+    disabled or not enabled. Anything else (no response, another status, an
+    empty, non-JSON or other message) is False, so the row keeps the neutral
+    dependency review wording."""
+    if resp is None or resp.status != 403:
+        return False
+    if resp.headers.get("x-ratelimit-remaining") == "0" or "retry-after" in resp.headers:
+        return False
+    try:
+        doc = envelope.parse_json(resp.body)
+    except envelope.EnvelopeError:
+        return False
+    message = doc.get("message") if isinstance(doc, Mapping) else None
+    if not isinstance(message, str) or len(message) > 1000:
+        return False
+    return bool(_GRAPH_OFF_RE.search(message)) and not _GRAPH_OFF_EXCLUDE_RE.search(message)
+
+
 def read_dependency_graph_off(api: GitHubApi, ctx: PublishContext, snap: snapshot.Snapshot | None) -> bool:
-    """True when GitHub refuses the dependency comparison of the reviewed pair
-    with HTTP 403 that is not a rate limit. `actions/dependency-review-action`
-    reports every 403 of this endpoint as "Dependency review is not supported
-    on this repository. Please ensure that Dependency graph is enabled", so a
-    403 here means an owner setting, not the author's change. Any other answer
-    (200, another status, a network error) is False: the row then stays the
-    generic dependency review failure."""
+    """The dependency comparison of the reviewed pair, read once, judged by
+    `dependency_graph_off_evidence`."""
     if snap is None:
         return False
     resp = api.get_status(
         f"{ctx.repo_path}/dependency-graph/compare/{snap.merge_base_sha}...{snap.head_sha}",
         max_bytes=DEPENDENCY_PROBE_MAX_BYTES,
     )
-    if resp is None or resp.status != 403:
-        return False
-    return resp.headers.get("x-ratelimit-remaining") != "0" and "retry-after" not in resp.headers
+    return dependency_graph_off_evidence(resp)
 
 
 def read_summary_facts(
     api: GitHubApi, ctx: PublishContext, snap: snapshot.Snapshot | None, needs: Any, outcome: str | None
 ) -> SummaryFacts:
     """The display-only reads. The dependency probe runs only when the
-    dependency-review job or step reported `failure`."""
+    dependency-review job or step reported `failure`. Never raises: any error
+    in a read gives no fact (no signing row, the neutral dependency row)."""
     dr_failed = job_results(needs).get(verdict.DEPENDENCY_REVIEW_JOB) == "failure" or outcome == "failure"
-    return SummaryFacts(
-        commits=read_commit_signing(api, ctx),
-        dependency_graph_off=dr_failed and read_dependency_graph_off(api, ctx, snap),
-    )
+    try:
+        commits = read_commit_signing(api, ctx)
+    except Exception as exc:  # noqa: BLE001 - display only, never fails the run
+        print(f"publish: commit list not read ({type(exc).__name__}); no signing row", file=sys.stderr)
+        commits = None
+    try:
+        graph_off = dr_failed and read_dependency_graph_off(api, ctx, snap)
+    except Exception as exc:  # noqa: BLE001 - display only, never fails the run
+        print(f"publish: dependency probe failed ({type(exc).__name__}); neutral row", file=sys.stderr)
+        graph_off = False
+    return SummaryFacts(commits=commits, dependency_graph_off=graph_off)
 
 
 # ---------------------------------------------------------------------------
@@ -1196,8 +1227,21 @@ def _code_span(kind: str, text: str, suffix: str = "") -> str:
 
 def _span_of(joined: str, cut: bool, suffix: str = "") -> str:
     """The code span of text that `_clean_text` already cut: one marker only."""
-    joined = _defang(joined).replace("`", "'").replace("<", "‹").replace("|", "\\|") + ("…" if cut else "")
+    joined = _defang(joined).replace("`", "'").replace("<", "‹")
+    joined = _escape_span_pipes(joined) + ("…" if cut else "")
     return f"`{joined or 'unknown'}{suffix}`"
+
+
+_BACKSLASHES_BEFORE_PIPE = re.compile(r"(\\+)(?=\|)")
+
+
+def _escape_span_pipes(text: str) -> str:
+    """Escape every `|` as `\\|` so a table cell stays whole. A backslash run
+    right before a pipe is first split from it with a ZWSP, so the pipe always
+    has exactly one escaping backslash before it. Table parsers differ on
+    `\\\\|` (cmark-gfm keeps it in the cell, others end the cell there); with
+    the ZWSP no parser sees two backslashes before a pipe."""
+    return _BACKSLASHES_BEFORE_PIPE.sub(lambda m: m.group(1) + ZWSP, text).replace("|", "\\|")
 
 
 def _path_span(value: Any, kind: str = "path") -> str:
@@ -1483,7 +1527,7 @@ def _findings_table(rows: list[_Row]) -> list[_Block]:
     if not rows:
         return []
     out = [
-        _Block("\n| Severity | Effect | Where | Finding | Found by |"),
+        _Block("\n| Severity | Effect | Where | Finding | Found by |"),  # = _FINDINGS_HEADER
         _Block("|---|---|---|---|---|"),
     ]
     for r in rows:
@@ -2171,6 +2215,41 @@ def render_summary(
     the gate."""
     facts = facts or SummaryFacts()
     payload = _payload_of(bundle)
+    # The signing row is informational and must never change the comment
+    # otherwise: render without it, and keep it only when the body with it
+    # makes exactly the same cuts (and no overflow).
+    base = _render_fit(ctx, result, payload, inline, limit, replace(facts, commits=None))
+    if not _signing_row(facts) or base.overflow:
+        return base
+    row = _render_fit(ctx, result, payload, inline, limit, facts)
+    if row.overflow or row.cut != base.cut or _without_signing_row(row.body, facts) != base.body:
+        print("publish: no room for the unsigned-commit row; left out", file=sys.stderr)
+        return base
+    return row
+
+
+_FINDINGS_HEADER = "\n| Severity | Effect | Where | Finding | Found by |\n|---|---|---|---|---|"
+
+
+def _without_signing_row(body: str, facts: SummaryFacts) -> str:
+    """`body` with the signing row (and a findings table header that only it
+    needed) taken out: equal to the body without the row when the row changed
+    nothing else."""
+    [r] = _signing_row(facts)
+    out = body.replace("\n" + _row(r.severity, r.effect, r.where, r.claim, r.found_by), "", 1)
+    if out.count(_FINDINGS_HEADER) == 1 and out.find(_FINDINGS_HEADER + "\n|") == -1:
+        out = out.replace("\n" + _FINDINGS_HEADER, "", 1)
+    return out
+
+
+def _render_fit(
+    ctx: PublishContext,
+    result: verdict.GateResult,
+    payload: Mapping[str, Any] | None,
+    inline: InlineOutcome,
+    limit: int,
+    facts: SummaryFacts,
+) -> RenderedSummary:
     body, cut = _fit(_summary_blocks(ctx, result, payload, inline, False, facts), limit)
     if body is not None and cut:
         # The provenance line says so when a cut was made. Its longer text is

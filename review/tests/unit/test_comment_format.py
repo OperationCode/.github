@@ -6,9 +6,15 @@ row. No network: the gate job runs against the fake GitHub of test_publish.
 
 from __future__ import annotations
 
+import io
+import json
+import re
+import urllib.error
+
 import pytest
 
-from oc_review import publish, verdict
+from oc_review import collect, publish, verdict
+from oc_review.collect import HttpRequest, HttpResponse
 
 from .test_publish import (
     BLOCKING,
@@ -98,9 +104,21 @@ def test_passes_that_failed_for_different_reasons_keep_their_rows(tmp_path):
 # ---------------------------------------------------------------- 2. owner setting problems
 
 
+def graph_off_github(**kw) -> FakeGitHub:
+    """GitHub answers the dependency comparison with 403 and an error message
+    that says the Dependency graph is disabled: positive evidence."""
+    return FakeGitHub(dependency_graph_status=403, dependency_graph_body=error_body(GRAPH_OFF_MESSAGE), **kw)
+
+
+GRAPH_OFF_MESSAGE = "Dependency graph is disabled for this repository. Enable it in the repository settings."
+
+
+def error_body(message: str) -> bytes:
+    return json.dumps({"message": message, "documentation_url": "https://docs.github.com/rest"}).encode()
+
+
 def test_dependency_graph_off_is_a_repo_setting_not_the_authors_fault(tmp_path):
-    gh = FakeGitHub(dependency_graph_status=403)
-    r = run(tmp_path, gh, needs=dr_failed_needs())
+    r = run(tmp_path, graph_off_github(), needs=dr_failed_needs())
     s = r.summary
     [row] = findings_rows(s)
     assert row[:3] == [publish.SETTING_CELL, "Blocks, no waiver", "Repo settings"]
@@ -116,22 +134,56 @@ def test_dependency_graph_off_is_a_repo_setting_not_the_authors_fault(tmp_path):
 
 def test_setting_label_never_changes_the_gate(tmp_path):
     plain_run = run(tmp_path / "a", needs=dr_failed_needs())
-    setting_run = run(tmp_path / "b", FakeGitHub(dependency_graph_status=403), needs=dr_failed_needs())
+    setting_run = run(tmp_path / "b", graph_off_github(), needs=dr_failed_needs())
+    assert publish.SETTING_CELL in setting_run.summary
     assert gate(setting_run) == gate(plain_run)
     assert setting_run.code == 1
     assert "/oc-review override" not in setting_run.summary  # still not waivable
 
 
-@pytest.mark.parametrize(
-    "status,headers",
-    [(200, {}), (404, {}), (403, {"x-ratelimit-remaining": "0"}), (403, {"retry-after": "60"}), (500, {})],
-)
-def test_other_probe_answers_keep_the_generic_row(tmp_path, status, headers):
-    gh = FakeGitHub(dependency_graph_status=status, dependency_graph_headers=headers)
-    s = run(tmp_path, gh, needs=dr_failed_needs()).summary
+# A 403 alone is not evidence. Each case keeps the neutral dependency row.
+NOT_EVIDENCE = {
+    "200": (200, {}, b""),
+    "404": (404, {}, b""),
+    "500": (500, {}, b""),
+    "403-empty-body": (403, {}, b""),
+    "403-fork-forbidden": (403, {}, error_body("Forbidden")),
+    "403-advanced-security-off": (403, {}, error_body(
+        "Dependency review is not supported on this repository: GitHub Advanced Security is not enabled.")),
+    "403-advanced-security-and-graph": (403, {}, error_body(
+        "Dependency graph is not enabled, or Advanced Security is disabled for this repository.")),
+    "403-permission": (403, {}, error_body("Resource not accessible by integration")),
+    "403-secondary-rate-limit-no-headers": (403, {}, error_body(
+        "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.")),
+    "403-rate-limit-headers": (403, {"x-ratelimit-remaining": "0"}, error_body(GRAPH_OFF_MESSAGE)),
+    "403-retry-after": (403, {"retry-after": "60"}, error_body(GRAPH_OFF_MESSAGE)),
+    "403-not-json": (403, {}, b"Dependency graph is disabled"),
+    "403-message-not-a-string": (403, {}, json.dumps({"message": ["Dependency graph is disabled"]}).encode()),
+    "200-with-the-message": (200, {}, error_body(GRAPH_OFF_MESSAGE)),
+}
+
+
+@pytest.mark.parametrize("case", NOT_EVIDENCE)
+def test_without_positive_evidence_the_row_stays_neutral(tmp_path, case):
+    status, headers, body = NOT_EVIDENCE[case]
+    gh = FakeGitHub(dependency_graph_status=status, dependency_graph_headers=headers, dependency_graph_body=body)
+    r = run(tmp_path, gh, needs=dr_failed_needs())
+    s = r.summary
     [row] = findings_rows(s)
     assert row[2] == "Dependency review" and publish.SETTING_CELL not in s
+    assert "repo setting" not in s.lower() and "Next step for a repo admin" not in s
     assert "| ❌ failed |" in s
+    assert r.code == 1
+
+
+@pytest.mark.parametrize("message", [
+    GRAPH_OFF_MESSAGE,
+    "The dependency graph is not enabled for this repository.",
+    "Dependency-graph is turned off for this repository",
+])
+def test_evidence_messages(message):
+    resp = HttpResponse(403, error_body(message), "https://api.github.com/x", {})
+    assert publish.dependency_graph_off_evidence(resp)
 
 
 def test_probe_runs_only_when_dependency_review_failed(tmp_path):
@@ -141,14 +193,38 @@ def test_probe_runs_only_when_dependency_review_failed(tmp_path):
     assert [p for p in r.gh.paths() if "/dependency-graph/" in p]
 
 
+def test_probe_error_keeps_the_neutral_row(tmp_path):
+    gh = FakeGitHub()
+
+    def boom(gh_, req):
+        if "/dependency-graph/" in req.url:
+            raise RuntimeError("unexpected")
+
+    gh.after = boom
+    r = run(tmp_path, gh, needs=dr_failed_needs())
+    assert r.code == 1 and publish.SETTING_CELL not in r.summary
+    assert findings_rows(r.summary)[0][2] == "Dependency review"
+
+
 def test_hard_block_and_setting_tell_the_author_only_their_part(tmp_path):
     item = {"id": "bidi-control", "level": "hard_block", "detail": "bidi control characters U+202E, line 1",
             "file": "bidi.txt", "subject": None, "lines": [1], "count": 1}
-    gh = FakeGitHub(dependency_graph_status=403)
-    s = run(tmp_path, gh, bundle=bundle_doc(hard_blocks=[item]), needs=dr_failed_needs()).summary
+    s = run(tmp_path, graph_off_github(), bundle=bundle_doc(hard_blocks=[item]), needs=dr_failed_needs()).summary
     assert "**Next step for the author:** fix the cause named in the row" in s
     assert "only a repo admin can fix it" in s
     assert [x[0] for x in findings_rows(s)] == ["🚫 **Hard block**", publish.SETTING_CELL]
+
+
+def test_default_transport_keeps_a_bounded_error_body():
+    class Opener:
+        def open(self, req, timeout):
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {"X-Test": "1"},
+                                         io.BytesIO(error_body(GRAPH_OFF_MESSAGE) + b" " * 500))
+
+    req = HttpRequest("GET", "https://api.github.com/x", {}, 100, 5.0)
+    resp = collect.default_transport(req, opener=Opener())
+    assert resp.status == 403 and resp.headers == {"x-test": "1"}
+    assert len(resp.body) == 101  # cut at the byte cap + 1, like a 200 body
 
 
 # ---------------------------------------------------------------- 3. plain paths
@@ -256,3 +332,134 @@ def test_commit_data_never_reaches_the_gate_inputs():
     """The gate reads no commit or setting fact: `GateInputs` has no field for them."""
     fields = set(verdict.GateInputs.__dataclass_fields__)
     assert not {f for f in fields if "commit" in f or "sign" in f or "setting" in f}
+
+
+# ---------------------------------------------------------------- fix 1: the signing row never fails a review
+
+
+def near_limit_passes():
+    """Review AB Important 1: 35 advisory high findings with long fields. High
+    severity is never cut, so the summary is close to the comment limit."""
+    def many(n):
+        return [finding("bug", "high", file="z" * 390 + str(i), title="T" * 120, quote="Q" * 300,
+                        explanation="x" * 304) for i in range(n)]
+    return clean_passes(review=many(10), security=many(10), supply_chain=many(15))
+
+
+def test_signing_row_never_overflows_a_passing_review(tmp_path):
+    passes = near_limit_passes()
+    signed = run(tmp_path / "a", FakeGitHub(commits=[signed_commit(True)]), passes=passes)
+    unsigned = run(tmp_path / "b", FakeGitHub(commits=[signed_commit(False)]), passes=passes)
+    assert signed.code == 0 and len(signed.summary) > 60_000  # the boundary case
+    assert gate(unsigned) == gate(signed) and unsigned.code == 0
+    assert "publish_error" not in unsigned.record
+    # Exactly the same comment: the row did not fit, so it is left out.
+    assert unsigned.summary == signed.summary and "Unsigned commits" not in unsigned.summary
+
+
+def test_signing_row_is_left_out_when_it_would_cause_a_cut():
+    from .test_publish import CTX
+
+    r = run_result_for_render()
+    base = publish.render_summary(CTX, r, bundle=None, inline=publish.InlineOutcome())
+    facts = publish.SummaryFacts(commits=publish.CommitSigning(3, 2))
+    # Room for the body, not for the body plus the row: same body, no cut.
+    tight = publish.render_summary(CTX, r, bundle=None, inline=publish.InlineOutcome(),
+                                   limit=len(base.body) + 5, facts=facts)
+    assert tight == base
+    roomy = publish.render_summary(CTX, r, bundle=None, inline=publish.InlineOutcome(), facts=facts)
+    assert "Unsigned commits" in roomy.body and not roomy.cut and not roomy.overflow
+
+
+def run_result_for_render() -> verdict.GateResult:
+    return verdict.GateResult(status=verdict.PASS, run_id=1000, reasons=(), findings=(), snapshot=None,
+                              overrides=(), override_applied=False)
+
+
+@pytest.mark.parametrize("error", [RuntimeError("boom"), TimeoutError("slow"), ValueError("bad")])
+def test_commit_read_errors_give_no_row_and_keep_the_pass(tmp_path, error):
+    gh = FakeGitHub(commits=[signed_commit(False)])
+
+    def fail(gh_, req):
+        if req.url.split("?")[0].endswith("/pulls/7/commits"):
+            raise error
+
+    gh.after = fail
+    r = run(tmp_path, gh)
+    assert r.code == 0 and r.record["result"] == verdict.PASS
+    assert "Unsigned commits" not in r.summary
+
+
+@pytest.mark.parametrize("items", [
+    [{"sha": "x"}],  # no commit object
+    [{"commit": {"verification": None}}],
+    ["not an object"],
+])
+def test_commits_with_missing_data_never_change_the_pass(tmp_path, items):
+    r = run(tmp_path, FakeGitHub(commits=items))
+    assert r.code == 0 and r.record["result"] == verdict.PASS
+
+
+# ---------------------------------------------------------------- fix 3: hostile file names stay in one cell
+
+
+def cells_cmark_gfm(line: str) -> list[str]:
+    """cmark-gfm: a cell ends at a `|` that has no backslash right before it."""
+    return re.split(r"(?<!\\)\|", line)[1:-1]
+
+
+def cells_even_backslashes(line: str) -> list[str]:
+    """Parsers such as marked: a `|` is escaped only after an odd number of
+    backslashes, so `\\\\|` ends the cell."""
+    out, cur, i = [], "", 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "|":
+            n = len(cur) - len(cur.rstrip("\\"))
+            if n % 2 == 0:
+                out.append(cur)
+                cur = ""
+                i += 1
+                continue
+        cur += ch
+        i += 1
+    out.append(cur)
+    return out[1:-1]
+
+
+HOSTILE = {
+    "pipe": "a|b.py",
+    "backslash-pipe": "a\\|b.py",
+    "two-backslashes-pipe": "a\\\\|b.py",
+    "three-backslashes-pipe": "a\\\\\\|b.py",
+    "trailing-backslash": "dir\\",
+    "backtick": "a`b`|c.py",
+    "newline": "a\nb|c.py",
+    "bidi": "a\u202eb|c.py",
+    "mix": "\\|`\\\\|\n\u2066|<x>|@u/#1\\",
+}
+
+
+@pytest.mark.parametrize("case", HOSTILE)
+def test_hostile_path_stays_in_its_cell(tmp_path, case):
+    path = HOSTILE[case]
+    item = {"id": "binary-file", "level": "hard_block", "detail": "binary", "file": path,
+            "subject": None, "lines": [], "count": 1}
+    s = run(tmp_path, bundle=bundle_doc(hard_blocks=[item])).summary
+    rows = [line for line in s.split("\n") if line.startswith("| 🚫 **Hard block** |")]
+    assert len(rows) == 1
+    for split in (cells_cmark_gfm, cells_even_backslashes):
+        cells = split(rows[0])
+        assert len(cells) == 5, (case, split.__name__, cells)
+        assert cells[1].strip() == "Blocks, no waiver" and cells[4].strip() == "File checks (code, no model)"
+        assert cells[2].strip().startswith("`") and cells[2].strip().endswith("`")
+    span = publish._path_span(path)
+    assert span.count("`") == 2 and "\n" not in span and "\u202e" not in span and "\u2066" not in span
+    assert "<" not in span
+    # Every pipe has exactly one backslash before it.
+    assert not re.search(r"(?<!\\)\|", span.replace("\\|", "")) and "\\\\|" not in span
+
+
+def test_findings_header_constant_matches_the_table(tmp_path):
+    s = run(tmp_path, passes=clean_passes(review=[finding()])).summary
+    assert publish._FINDINGS_HEADER + "\n|" in s

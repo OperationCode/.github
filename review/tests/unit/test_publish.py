@@ -96,6 +96,7 @@ class FakeGitHub:
     # Status of `GET /dependency-graph/compare/...` (403: Dependency graph off).
     dependency_graph_status: int = 200
     dependency_graph_headers: dict = field(default_factory=dict)
+    dependency_graph_body: bytes = b""
     fail: set = field(default_factory=set)  # (method, path, page) -> HTTP 500
     after: Callable[[FakeGitHub, HttpRequest], None] | None = None
     requests: list = field(default_factory=list)
@@ -170,7 +171,8 @@ class FakeGitHub:
         if m == "GET" and path.startswith(f"{API}/dependency-graph/compare/"):
             assert path.rsplit("/", 1)[1] == f"{self.merge_base}...{self.head}"
             if self.dependency_graph_status != 200:
-                return HttpResponse(self.dependency_graph_status, b"", req.url, dict(self.dependency_graph_headers))
+                return HttpResponse(self.dependency_graph_status, self.dependency_graph_body, req.url,
+                                    dict(self.dependency_graph_headers))
             return self._json(req, [])
         if m == "GET" and path.startswith(f"{API}/collaborators/"):
             login = urllib.parse.unquote(path.split("/")[-2])
