@@ -219,9 +219,9 @@ Exit criteria:
 - [ ] Owner: every repo to be added to the review ruleset first sends the immutable OIDC subject (spec "Immutable subject"). Check `GET repos/OperationCode/<repo>/actions/oidc/customization/sub`, check the other `id-token` users in the repo and their relying-party trust, set it per repo and read it back before the repo is a target. Right after the repo becomes a target, run a test PR in that repo (all four jobs `success` at the pin); the repo is accepted only when it passes.
 - [x] CODEOWNERS in each supported repo (pilot repos P4-3; `START_HERE` P5-4).
 - [x] Owner: "prevent self-review" is on for the `eval` environment (2026-11-01). Admin bypass stays on.
-- [ ] Owner: Dependabot alerts with npm malware detection on active repos.
-- [ ] Re-run the key acceptance tests on the current release: V6 a, V8 a, V22 b, V23 and the outage process (the invalid federation rule case), each case on its own terms (V6 a on a same-repo and a fork PR, with the timed-out and slow runs from a scratch-only build; V8 a from an account outside the org). A case not run leaves phase 5 open until the owner accepts the gap in the decision log.
-- [ ] Scratch bypass matrix and switch rehearsal on claude-review-test: under the scratch test ruleset and the live baseline, check who can merge which PR kind with the empty, the pilot-shaped and the org-admin-only bypass lists, then return to the pilot-shaped list (the rollback of the phase 6 bypass switch). The baseline is never changed for this test.
+- [x] Owner: Dependabot alerts with npm malware detection on active repos. On for the active repos (owner, by 2026-11-04; spec P5-11).
+- [x] Re-run the key acceptance tests on the current release: V6 a, V8 a, V22 b, V23 and the outage process (the invalid federation rule case), each case on its own terms (V6 a on a same-repo and a fork PR, with the timed-out and slow runs from a scratch-only build; V8 a from an account outside the org). A case not run leaves phase 5 open until the owner accepts the gap in the decision log. Done 2026-11-02 at `88e055f`: all 8 rows pass, and the merge box read mergeable on a run that was not `success` only in the stated residuals (spec P5-9). Finding: the baseline blocks a PR with unsigned commits, also from a fork; the summary now names them (spec P6-1).
+- [x] Scratch bypass matrix and switch rehearsal on claude-review-test: under the scratch test ruleset and the live baseline, check who can merge which PR kind with the empty, the pilot-shaped and the org-admin-only bypass lists, then return to the pilot-shaped list (the rollback of the phase 6 bypass switch). The baseline is never changed for this test. Pass 2026-11-04: 27 merge cells and 6 direct pushes as expected, the return test passed, every ruleset read back as before (spec P5-10).
 - [ ] Revisit harden-runner block mode (spec K-14): switch to block when harden-runner [issue 708](https://github.com/step-security/harden-runner/issues/708) is fixed in a harden-runner release. Pin that release, measure the `test.yml` and `eval.yml` lists in audit mode, and re-test block mode. If no job hangs, set `egress-policy: block` and `disable-telemetry: true` in every job, and update the unit tests and the spec.
 
 Depends on: phase 4; V6, V8, V22, V23.
@@ -229,15 +229,16 @@ Depends on: phase 4; V6, V8, V22, V23.
 Exit criteria:
 
 - [x] The written acceptance exists (spec P5-8, 2026-11-01).
-- [ ] The baseline read-back matches the P5-1 checklist, and the bypass matrix passed.
-- [ ] The re-run tests pass.
-- [ ] The owner's open security items are done or deferred, with the decision recorded.
+- [x] The baseline read-back matches the P5-1 checklist, and the bypass matrix passed (2026-11-04, spec P5-10, P5-11).
+- [x] The re-run tests pass (2026-11-02, spec P5-9).
+- [x] The owner's open security items are done or deferred, with the decision recorded: `eval` prevent self-review on, malware alerts on, harden-runner block mode deferred (K-14). Phase 5 exit met 2026-11-04 (spec P5-11).
 
 ## Phase 6: org-wide enforcement
 
 - [ ] Owner: add each supported repo to the review ruleset 26132750 (immutable subject first, test PR right after). After each add, start a run on each open PR. After the last add, set its bypass list to org admins in `pull_request` mode (rehearsed on the scratch test ruleset first) and rename it `claude-review`.
 - [ ] Keep the supported repo inventory current. A repo joins or leaves through a PR to this repo.
 - [ ] Owner: Phase 6 also applies the org security configuration. Details are kept in the owner's records.
+- [ ] Release item: summary comment format (spec P6-1): one row per cause, the repo setting label for a Dependency graph that is off, plain paths, no empty token table, and the informational unsigned-commit row with the signing guide link. Display only; the gate does not change. Ships as in "Each release".
 
 Exit criteria:
 
