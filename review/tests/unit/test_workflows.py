@@ -117,21 +117,26 @@ EVAL_JOB_PERMISSIONS = {"contents": "read", "id-token": "write"}
 # that only in block mode). No disable-sudo-and-containers (V10).
 EGRESS_POLICY = "audit"
 ENDPOINT_RE = re.compile(r"(?:\*\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+:[0-9]{1,5}")
-# The allowlist per central job that V10 measured (kit K3, block mode).
+# setup-uv v10.3.3 fetches the uv version manifest from the Astral mirror
+# first (GitHub raw is the fallback; src/utils/constants.ts at its commit). Added
+# to every job that runs setup-uv, not measured (spec K-14).
+SETUP_UV_MANIFEST_HOST = "releases.astral.sh:443"
+# The allowlist per central job that V10 measured (kit K3, block mode), plus
+# SETUP_UV_MANIFEST_HOST where the job runs setup-uv.
 V10_ALLOWLISTS = {
     COLLECT: {
-        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443",
+        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443", SETUP_UV_MANIFEST_HOST,
         "release-assets.githubusercontent.com:443", "files.pythonhosted.org:443", "pypi.org:443",
         "registry.npmjs.org:443", "results-receiver.actions.githubusercontent.com:443", "*.blob.core.windows.net:443",
     },
     ANALYZE: {
-        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443",
+        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443", SETUP_UV_MANIFEST_HOST,
         "release-assets.githubusercontent.com:443", "files.pythonhosted.org:443", "api.anthropic.com:443",
         "*.actions.githubusercontent.com:443", "*.blob.core.windows.net:443",
     },
     DEPENDENCY_REVIEW: {"api.github.com:443"},
     GATE: {
-        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443",
+        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443", SETUP_UV_MANIFEST_HOST,
         "release-assets.githubusercontent.com:443", "files.pythonhosted.org:443",
         "results-receiver.actions.githubusercontent.com:443", "*.blob.core.windows.net:443",
     },
