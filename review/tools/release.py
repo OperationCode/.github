@@ -78,8 +78,9 @@ RULESET_MAX_PAGES = 10
 # name-bound stand-in for the review, which a same-name job can satisfy.
 REVIEW_CHECK_NAMES = ("oc-claude-review", "claude of duty")
 # The run each release needs at the SHA: (file, event, branch). test.yml runs
-# on the push to main; the release eval is an owner-approved dispatch on main
-# (as for cc710fb, cf19216 and 96f4966). A pull_request run at the same head
+# on the push to main; the release eval is a dispatch on main, which needs no
+# approval (the `eval` environment allows only main; earlier releases such as
+# cc710fb, cf19216 and 96f4966 were approved by the owner). A pull_request run at the same head
 # SHA tested a merge ref, so it does not count.
 RELEASE_WORKFLOWS: tuple[tuple[str, str, str], ...] = (("test.yml", "push", "main"),
                                                        ("eval.yml", "workflow_dispatch", "main"))

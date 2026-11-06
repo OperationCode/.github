@@ -81,7 +81,8 @@ class EvalRule:
 EVAL_FEDERATION: Mapping[str, EvalRule] = MappingProxyType({
     # `eval`: runs on main only (reviewed code), no approval.
     EVAL_ENVIRONMENT_MAIN: EvalRule("fdrl_01BL4n1gQzkrroCmDZoXUePm", "svac_017eR3ohB6rP5MEAsda6U7X6"),
-    # `eval-test`: any other ref, owner approval with prevent self-review.
+    # `eval-test`: any other ref; the owner is the required reviewer and approves
+    # each run (prevent self-review is off: the owner is also the run actor).
     # Rule `eval-test-federation-rule` (created 2026-11-06): a copy of the
     # `eval` rule with the claim `environment: eval-test`. It uses the
     # `eval` service account.

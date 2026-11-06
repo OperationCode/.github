@@ -608,6 +608,25 @@ def environment_name(value: Any) -> str | None:
     return name
 
 
+def eval_shell_violations(wf: Workflow, r: "Report") -> None:
+    """The select script means what it says only under the default shell. A
+    shell set at the workflow level (`defaults.run.shell`), the job level
+    (`defaults.run.shell`) or in a step (`shell:`) can change that, so eval.yml
+    sets none of them."""
+    def set_shell(node: Any) -> bool:
+        run = node.get("defaults", {}).get("run") if isinstance(node.get("defaults"), dict) else None
+        return isinstance(run, dict) and "shell" in run
+
+    if "defaults" in wf.doc:
+        r.add("workflow", "eval-environment", "no `defaults:` in eval.yml (a workflow default shell changes the select script)")
+    for name, job in jobs(wf.doc).items():
+        if "defaults" in job or set_shell(job):
+            r.add(name, "eval-environment", "no `defaults:` in an eval.yml job")
+        for st in steps(job):
+            if "shell" in st:
+                r.add(name, "eval-environment", "no step `shell:` in eval.yml")
+
+
 def eval_select_violations(wf: Workflow, r: "Report") -> None:
     """eval.yml has the select job: no environment, `permissions: {}`, the
     one output, harden-runner steps and exactly one run step, the fixed
@@ -658,6 +677,7 @@ def eval_boundary_violations(directory: Path) -> list[str]:
             if wf.doc.get("permissions") == "write-all":
                 r.add("workflow", "eval-permissions", "write-all at workflow level")
             eval_select_violations(wf, r)
+            eval_shell_violations(wf, r)
         for name, job in jobs(wf.doc).items():
             if "environment" not in job:
                 continue

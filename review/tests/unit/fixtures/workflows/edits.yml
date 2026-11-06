@@ -648,6 +648,21 @@
   old: "    timeout-minutes: 5\n"
   new: "    timeout-minutes: 30\n"
   expect: timeout
+- id: eval-workflow-default-shell
+  file: eval.yml
+  old: "jobs:\n"
+  new: "defaults:\n  run:\n    shell: sh\n\njobs:\n"
+  expect: eval-environment
+- id: eval-job-default-shell
+  file: eval.yml
+  old: "    needs: select-environment\n"
+  new: "    needs: select-environment\n    defaults:\n      run:\n        shell: sh\n"
+  expect: eval-environment
+- id: eval-step-shell
+  file: eval.yml
+  old: "        run: uv sync --locked --no-dev --project review\n"
+  new: "        shell: sh\n        run: uv sync --locked --no-dev --project review\n"
+  expect: eval-environment
 - id: eval-needs-removed
   file: eval.yml
   old: "    needs: select-environment\n"
