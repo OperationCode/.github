@@ -6,10 +6,12 @@ row. No network: the gate job runs against the fake GitHub of test_publish.
 
 from __future__ import annotations
 
+import http.client
 import io
 import json
 import re
 import urllib.error
+from dataclasses import replace
 
 import pytest
 
@@ -180,10 +182,30 @@ def test_without_positive_evidence_the_row_stays_neutral(tmp_path, case):
     GRAPH_OFF_MESSAGE,
     "The dependency graph is not enabled for this repository.",
     "Dependency-graph is turned off for this repository",
+    "Review failed. Dependency graph is disabled for this repository",
 ])
 def test_evidence_messages(message):
     resp = HttpResponse(403, error_body(message), "https://api.github.com/x", {})
     assert publish.dependency_graph_off_evidence(resp)
+
+
+@pytest.mark.parametrize("message", [
+    "Dependency graph is not disabled for this repository.",
+    "Dependency graph isn't disabled.",
+    "Dependency graph isn\u2019t turned off.",
+    "Dependency graph is no longer disabled.",
+    "Dependency graph is never turned off here.",
+    "The dependency graph is not not enabled.",
+    "Dependency graph is enabled, but the submission is disabled.",
+    "Dependency graph is enabled but the submission is disabled.",
+    "Dependency graph is on; the snapshot upload is disabled.",
+    "Dependency graph is on and the snapshot API is turned off.",
+])
+def test_negated_or_joined_messages_are_not_evidence(message):
+    """Display only: a negated state, or a state from another clause, keeps
+    the neutral dependency review row."""
+    resp = HttpResponse(403, error_body(message), "https://api.github.com/x", {})
+    assert not publish.dependency_graph_off_evidence(resp)
 
 
 def test_probe_runs_only_when_dependency_review_failed(tmp_path):
@@ -225,6 +247,34 @@ def test_default_transport_keeps_a_bounded_error_body():
     resp = collect.default_transport(req, opener=Opener())
     assert resp.status == 403 and resp.headers == {"x-test": "1"}
     assert len(resp.body) == 101  # cut at the byte cap + 1, like a 200 body
+
+
+class _BadBody(io.BytesIO):
+    def __init__(self, error: Exception) -> None:
+        super().__init__(b"")
+        self.error = error
+
+    def read(self, *args, **kwargs):
+        raise self.error
+
+
+@pytest.mark.parametrize("error", [
+    http.client.IncompleteRead(b"Dependency graph is dis", 40),
+    http.client.HTTPException("bad chunk"),
+    OSError("reset"),
+    ValueError("closed"),
+])
+def test_default_transport_error_body_read_failure_keeps_the_status(error):
+    """A cut-off error body is empty: the status stays, so every caller still
+    fails on it (fail closed), and the display probe finds no evidence."""
+    class Opener:
+        def open(self, req, timeout):
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, _BadBody(error))
+
+    req = HttpRequest("GET", "https://api.github.com/x", {}, 100, 5.0)
+    resp = collect.default_transport(req, opener=Opener())
+    assert resp.status == 403 and resp.body == b""
+    assert not publish.dependency_graph_off_evidence(resp)
 
 
 # ---------------------------------------------------------------- 3. plain paths
@@ -300,6 +350,53 @@ def test_unsigned_commits_row_has_count_and_link_and_leaves_the_pass(tmp_path):
     assert "**Unsigned commits:** 2 of 3 commits in this PR are not verified-signed." in row[3]
     assert f"[How to sign commits]({publish.SIGNING_GUIDE_URL})" in row[3]
     assert row[4] == publish.COMMIT_CHECK_ROW
+    # The TIP must not say "nothing to do" next to a row that says the merge box blocks.
+    assert publish.NOTHING_TO_DO not in s and f"** {publish.SIGNING_STEP}" in callout(s)
+
+
+@pytest.mark.parametrize(("total", "unsigned", "text"), [
+    (1, 1, "1 of 1 commit in this PR is not verified-signed."),
+    (2, 1, "1 of 2 commits in this PR is not verified-signed."),
+    (2, 2, "2 of 2 commits in this PR are not verified-signed."),
+    (3, 2, "2 of 3 commits in this PR are not verified-signed."),
+    (publish.COMMITS_MAX, 1, f"1 of the first {publish.COMMITS_MAX} commits in this PR is not verified-signed."),
+    (publish.COMMITS_MAX, 7, f"7 of the first {publish.COMMITS_MAX} commits in this PR are not verified-signed."),
+])
+def test_signing_row_grammar(total, unsigned, text):
+    [row] = publish._signing_row(publish.SummaryFacts(commits=publish.CommitSigning(total, unsigned)))
+    assert row.claim.startswith(f"**Unsigned commits:** {text} ")
+
+
+def callout(s: str) -> str:
+    """The callout lines (each starts with "> ")."""
+    return "\n".join(line for line in s.split("\n") if line.startswith("> "))
+
+
+def test_tip_says_nothing_to_do_only_without_unsigned_commits(tmp_path):
+    clean = run(tmp_path / "a", FakeGitHub(commits=[signed_commit(True)])).summary
+    assert callout_kind(clean) == "TIP" and f"** {publish.NOTHING_TO_DO}" in callout(clean)
+    assert publish.SIGNING_STEP not in clean
+
+
+def test_waiver_tip_names_the_signing_step():
+    from .test_publish import CTX
+
+    r = replace(run_result_for_render(), override_applied=True)
+    facts = publish.SummaryFacts(commits=publish.CommitSigning(2, 1))
+    body = publish.render_summary(CTX, r, bundle=None, inline=publish.InlineOutcome(), facts=facts).body
+    assert "Unsigned commits" in body and callout_kind(body) == "TIP"
+    assert "A maintainer waiver was applied by a maintainer" in callout(body)
+    assert publish.NOTHING_TO_DO not in body and f"** {publish.SIGNING_STEP}" in callout(body)
+    plain_body = publish.render_summary(CTX, r, bundle=None, inline=publish.InlineOutcome()).body
+    assert f"** {publish.NOTHING_TO_DO}" in callout(plain_body) and publish.SIGNING_STEP not in plain_body
+
+
+def test_note_callout_is_unchanged_by_unsigned_commits(tmp_path):
+    passes = clean_passes(review=[finding("bug", "low", file="a.py", line=1, quote="x")])
+    signed = run(tmp_path / "a", FakeGitHub(commits=[signed_commit(True)]), passes=passes).summary
+    unsigned = run(tmp_path / "b", FakeGitHub(commits=[signed_commit(False)]), passes=passes).summary
+    assert callout_kind(unsigned) == "NOTE" and callout(unsigned) == callout(signed)
+    assert publish.NOTHING_TO_DO not in unsigned and publish.SIGNING_STEP not in unsigned
 
 
 def test_unsigned_commits_never_change_a_fail(tmp_path):
@@ -311,7 +408,7 @@ def test_unsigned_commits_never_change_a_fail(tmp_path):
     head = signed.summary.split("\n")[1]
     assert unsigned.summary.split("\n")[1] == head
     rows = findings_rows(unsigned.summary)
-    assert rows[-1][0] == publish.INFO_CELL and "1 of 1 commits in this PR is not" in rows[-1][3]
+    assert rows[-1][0] == publish.INFO_CELL and "1 of 1 commit in this PR is not" in rows[-1][3]
     assert "/oc-review override" in unsigned.summary  # the waiver line is unchanged
 
 
@@ -367,8 +464,11 @@ def test_signing_row_is_left_out_when_it_would_cause_a_cut():
     tight = publish.render_summary(CTX, r, bundle=None, inline=publish.InlineOutcome(),
                                    limit=len(base.body) + 5, facts=facts)
     assert tight == base
+    # With the row left out, the TIP keeps "nothing to do": it never names a row that is not there.
+    assert f"** {publish.NOTHING_TO_DO}" in callout(tight.body) and publish.SIGNING_STEP not in tight.body
     roomy = publish.render_summary(CTX, r, bundle=None, inline=publish.InlineOutcome(), facts=facts)
     assert "Unsigned commits" in roomy.body and not roomy.cut and not roomy.overflow
+    assert f"** {publish.SIGNING_STEP}" in callout(roomy.body)
 
 
 def run_result_for_render() -> verdict.GateResult:
