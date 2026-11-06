@@ -41,7 +41,7 @@ jobs:
       environment: ${{ steps.select.outputs.environment }}
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3, released 2026-10-27
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4, released 2026-11-06
         with:
           egress-policy: audit
           allowed-endpoints: >
@@ -70,7 +70,7 @@ jobs:
       EVAL_ENVIRONMENT: ${{ needs.select-environment.outputs.environment }}
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3, released 2026-10-27
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4, released 2026-11-06
         with:
           egress-policy: audit
           allowed-endpoints: >

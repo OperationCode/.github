@@ -18,9 +18,9 @@
 # - no ${{ }} inside run: scripts; values reach scripts through env:
 #
 # Harden-runner runs in audit mode (spec K-14): in V10, block mode hung 2 of
-# 24 jobs in "Complete job" (symptoms match open harden-runner issue 708;
-# v2.22.3 has a partial fix only, the safe-by-default fix is not released,
-# .github issue 24). Each job keeps the allowlist that V10 measured, plus
+# 24 jobs in "Complete job" (symptoms match harden-runner issue 708, which
+# v2.22.4 fixes upstream; audit mode stays until the .github issue 24 soak and
+# block-mode runs pass). Each job keeps the allowlist that V10 measured, plus
 # releases.astral.sh:443 where setup-uv runs (v10.3.3 fetches the uv
 # version manifest there first; not measured), so block mode needs only
 # egress-policy: block plus disable-telemetry: true (the action accepts that
@@ -52,9 +52,9 @@ jobs:
       merge-base-sha: ${{ steps.collect.outputs.merge-base-sha }}
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3, released 2026-10-27
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4, released 2026-11-06
         with:
-          # Audit until https://github.com/step-security/harden-runner/issues/708 is fixed (spec K-14).
+          # Audit until the issue 24 soak and block-mode runs pass; upstream issue 708 is fixed in v2.22.4 (spec K-14).
           egress-policy: audit
           allowed-endpoints: >
             api.github.com:443
@@ -119,9 +119,9 @@ jobs:
       supply-chain-digest: ${{ steps.analyze.outputs.supply-chain-digest }}
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3, released 2026-10-27
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4, released 2026-11-06
         with:
-          # Audit until https://github.com/step-security/harden-runner/issues/708 is fixed (spec K-14).
+          # Audit until the issue 24 soak and block-mode runs pass; upstream issue 708 is fixed in v2.22.4 (spec K-14).
           egress-policy: audit
           allowed-endpoints: >
             api.github.com:443
@@ -216,9 +216,9 @@ jobs:
       outcome: ${{ steps.dr.outcome }}
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3, released 2026-10-27
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4, released 2026-11-06
         with:
-          # Audit until https://github.com/step-security/harden-runner/issues/708 is fixed (spec K-14).
+          # Audit until the issue 24 soak and block-mode runs pass; upstream issue 708 is fixed in v2.22.4 (spec K-14).
           egress-policy: audit
           allowed-endpoints: >
             api.github.com:443
@@ -249,9 +249,9 @@ jobs:
       UV_PYTHON: python3.12
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3, released 2026-10-27
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4, released 2026-11-06
         with:
-          # Audit until https://github.com/step-security/harden-runner/issues/708 is fixed (spec K-14).
+          # Audit until the issue 24 soak and block-mode runs pass; upstream issue 708 is fixed in v2.22.4 (spec K-14).
           egress-policy: audit
           allowed-endpoints: >
             api.github.com:443

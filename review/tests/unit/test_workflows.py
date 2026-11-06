@@ -907,6 +907,20 @@ def test_publish_stub_check_fails_on_hidden_exit(case, tmp_path):
     assert code == 0
 
 
+HARDEN_RUNNER_PIN = "step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a"  # v2.22.4 (spec K-16)
+
+
+def test_every_harden_runner_step_pins_v2_22_4():
+    """Issue 24 / K-16: one harden-runner pin everywhere, with its tag in the comment."""
+    count = 0
+    for path in workflow_files(WORKFLOWS):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "step-security/harden-runner@" in line:
+                count += 1
+                assert line.split("uses:")[1].strip().startswith(HARDEN_RUNNER_PIN + " # v2.22.4"), f"{path.name}: {line}"
+    assert count == 7
+
+
 @pytest.mark.release
 def test_harden_runner_egress_lists_are_the_v10_lists():
     """V10 and K-14: audit mode, and each central job keeps the list that V10
