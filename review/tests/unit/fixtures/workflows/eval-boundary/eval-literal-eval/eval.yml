@@ -1,0 +1,29 @@
+# Bad: a literal eval; the environment must come from the fixed expression.
+on: workflow_dispatch
+permissions: {}
+jobs:
+  select-environment:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      environment: ${{ steps.select.outputs.environment }}
+    steps:
+      - id: select
+        run: |
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            echo "environment=eval" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=eval-test" >> "$GITHUB_OUTPUT"
+          fi
+  evals:
+    needs: select-environment
+    runs-on: ubuntu-24.04
+    environment: eval
+    env:
+      EVAL_ENVIRONMENT: ${{ needs.select-environment.outputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - run: echo evals

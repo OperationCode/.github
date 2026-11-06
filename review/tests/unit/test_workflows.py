@@ -27,7 +27,26 @@ EVAL_BOUNDARY = FIXTURES / "eval-boundary"
 CENTRAL = "claude-review.yml"
 TEST = "test.yml"
 EVAL = "eval.yml"
-EVAL_ENVIRONMENT = "eval"
+# eval.yml picks its environment from the ref (spec "Fixture eval credential"):
+# main runs reviewed code in `eval` (no approval); any other ref runs in
+# `eval-test` (owner approval, prevent self-review). Actions expressions
+# compare strings without case (`github.ref == 'refs/heads/main'` is true for
+# refs/heads/MAIN), so the choice is made by an exact shell test in a select
+# job with no permissions. The evals job takes its one output for the
+# environment and for EVAL_ENVIRONMENT (read by evals.py).
+EVAL_ENVIRONMENTS = frozenset({"eval", "eval-test"})
+EVAL_SELECT_JOB = "select-environment"
+EVAL_SELECT_STEP_ID = "select"
+EVAL_SELECT_RUN = (
+    'if [ "$GITHUB_REF" = "refs/heads/main" ]; then\n'
+    '  echo "environment=eval" >> "$GITHUB_OUTPUT"\n'
+    "else\n"
+    '  echo "environment=eval-test" >> "$GITHUB_OUTPUT"\n'
+    "fi\n"
+)
+EVAL_SELECT_OUTPUTS = {"environment": f"${{{{ steps.{EVAL_SELECT_STEP_ID}.outputs.environment }}}}"}
+EVAL_ENVIRONMENT_EXPRESSION = f"${{{{ needs.{EVAL_SELECT_JOB}.outputs.environment }}}}"
+EVAL_ENVIRONMENT_VAR = "EVAL_ENVIRONMENT"
 
 HARDEN = "step-security/harden-runner"
 CHECKOUT = "actions/checkout"
@@ -48,6 +67,8 @@ SECRETS_RE = re.compile(r"(?<![\w.-])secrets(?![\w-])", re.IGNORECASE)
 # timeout-minutes per job, by workflow file (spec "Workflow details", plan 2.1).
 TIMEOUT_MINUTES = {"claude-review.yml": 10, "test.yml": 10, "eval.yml": 30}
 DEFAULT_TIMEOUT_MINUTES = 10
+# A job that differs from its file's value (the eval select job runs one shell test).
+JOB_TIMEOUT_MINUTES = {("eval.yml", "select-environment"): 5}
 # Central workflow (spec "Architecture", "Workflow details").
 COLLECT, ANALYZE, DEPENDENCY_REVIEW, GATE = "collect", "analyze", "dependency-review", "oc-claude-review"
 CENTRAL_PERMISSIONS = {
@@ -111,21 +132,26 @@ EVAL_JOB_PERMISSIONS = {"contents": "read", "id-token": "write"}
 # that only in block mode). No disable-sudo-and-containers (V10).
 EGRESS_POLICY = "audit"
 ENDPOINT_RE = re.compile(r"(?:\*\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+:[0-9]{1,5}")
-# The allowlist per central job that V10 measured (kit K3, block mode).
+# setup-uv v10.3.3 fetches the uv version manifest from the Astral mirror
+# first (GitHub raw is the fallback; src/utils/constants.ts at its commit). Added
+# to every job that runs setup-uv, not measured (spec K-14).
+SETUP_UV_MANIFEST_HOST = "releases.astral.sh:443"
+# The allowlist per central job that V10 measured (kit K3, block mode), plus
+# SETUP_UV_MANIFEST_HOST where the job runs setup-uv.
 V10_ALLOWLISTS = {
     COLLECT: {
-        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443",
+        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443", SETUP_UV_MANIFEST_HOST,
         "release-assets.githubusercontent.com:443", "files.pythonhosted.org:443", "pypi.org:443",
         "registry.npmjs.org:443", "results-receiver.actions.githubusercontent.com:443", "*.blob.core.windows.net:443",
     },
     ANALYZE: {
-        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443",
+        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443", SETUP_UV_MANIFEST_HOST,
         "release-assets.githubusercontent.com:443", "files.pythonhosted.org:443", "api.anthropic.com:443",
         "*.actions.githubusercontent.com:443", "*.blob.core.windows.net:443",
     },
     DEPENDENCY_REVIEW: {"api.github.com:443"},
     GATE: {
-        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443",
+        "api.github.com:443", "github.com:443", "raw.githubusercontent.com:443", SETUP_UV_MANIFEST_HOST,
         "release-assets.githubusercontent.com:443", "files.pythonhosted.org:443",
         "results-receiver.actions.githubusercontent.com:443", "*.blob.core.windows.net:443",
     },
@@ -310,9 +336,10 @@ def common_violations(wf: Workflow) -> list[str]:
     used = [s for s in strings(doc) if SECRETS_RE.search(s)]
     if used:
         r.add("workflow", "secrets", f"no secrets context in any form, got {used!r}")
-    want_timeout = TIMEOUT_MINUTES.get(wf.name, DEFAULT_TIMEOUT_MINUTES)
+    file_timeout = TIMEOUT_MINUTES.get(wf.name, DEFAULT_TIMEOUT_MINUTES)
     parsed_uses = 0
     for name, job in jobs(doc).items():
+        want_timeout = JOB_TIMEOUT_MINUTES.get((wf.name, name), file_timeout)
         timeout = job.get("timeout-minutes")
         if type(timeout) is not int or timeout != want_timeout:
             r.add(name, "timeout", f"timeout-minutes must be {want_timeout}, got {timeout!r}")
@@ -581,10 +608,41 @@ def environment_name(value: Any) -> str | None:
     return name
 
 
+def eval_select_violations(wf: Workflow, r: "Report") -> None:
+    """eval.yml has the select job: no environment, `permissions: {}`, the
+    one output, harden-runner steps and exactly one run step, the fixed
+    case-sensitive script with no if, env or shell."""
+    job = jobs(wf.doc).get(EVAL_SELECT_JOB)
+    if not isinstance(job, dict):
+        r.add("workflow", "eval-environment", f"needs the job {EVAL_SELECT_JOB!r}")
+        return
+    where = EVAL_SELECT_JOB
+    if set(job) - {"runs-on", "timeout-minutes", "permissions", "outputs", "steps"}:
+        r.add(where, "eval-environment", f"unexpected keys {sorted(set(job) - {'runs-on', 'timeout-minutes', 'permissions', 'outputs', 'steps'})}")
+    if job.get("permissions") != {}:
+        r.add(where, "eval-environment", f"permissions must be {{}}, got {job.get('permissions')!r}")
+    if job.get("outputs") != EVAL_SELECT_OUTPUTS:
+        r.add(where, "eval-environment", f"outputs must be exactly {EVAL_SELECT_OUTPUTS!r}, got {job.get('outputs')!r}")
+    runs = [st for st in steps(job) if "uses" not in st]
+    others = [st for st in steps(job) if "uses" in st and action(st) != HARDEN]
+    if others:
+        r.add(where, "eval-environment", "only harden-runner and the select script may run here")
+    if len(runs) != 1:
+        r.add(where, "eval-environment", f"exactly one run step, got {len(runs)}")
+        return
+    [st] = runs
+    if st.get("id") != EVAL_SELECT_STEP_ID or st.get("run") != EVAL_SELECT_RUN or set(st) - {"name", "id", "run"}:
+        r.add(where, "eval-environment", "the select step must be the fixed script (id, run; no if, env or shell)")
+
+
 def eval_boundary_violations(directory: Path) -> list[str]:
-    """Only eval.yml may use `eval`, and each job that does states exactly
-    contents: read and id-token: write itself. Environment names are not case
-    sensitive, so `EVAL` counts; a name that is not a literal counts too."""
+    """Only eval.yml may use `eval` or `eval-test`. eval.yml has the select
+    job (`eval_select_violations`); each eval.yml job with an environment
+    needs that job, uses exactly EVAL_ENVIRONMENT_EXPRESSION, sets
+    EVAL_ENVIRONMENT to the same expression, and states exactly contents: read
+    and id-token: write itself. In any other workflow, an environment that is
+    not a literal counts as a use; names are not case sensitive, so `EVAL`
+    counts too."""
     out: list[str] = []
     for path in workflow_files(directory):
         r = Report(path.name)
@@ -599,17 +657,27 @@ def eval_boundary_violations(directory: Path) -> list[str]:
                 r.add("workflow", "eval-trigger", f"workflow_dispatch only, got {sorted(triggers(wf.doc))}")
             if wf.doc.get("permissions") == "write-all":
                 r.add("workflow", "eval-permissions", "write-all at workflow level")
+            eval_select_violations(wf, r)
         for name, job in jobs(wf.doc).items():
             if "environment" not in job:
                 continue
-            env_name = environment_name(job["environment"])
-            if env_name is None:
-                r.add(name, "eval-environment", f"environment must be a literal string, got {job['environment']!r}")
-            uses_eval = env_name is None or env_name.strip().casefold() == EVAL_ENVIRONMENT
-            if not uses_eval:
-                continue
-            if wf.name != EVAL:
-                r.add(name, "eval-environment", "only eval.yml may use the eval environment")
+            if wf.name == EVAL:
+                if job.get("needs") not in (EVAL_SELECT_JOB, [EVAL_SELECT_JOB]):
+                    r.add(name, "eval-environment", f"needs must be exactly {EVAL_SELECT_JOB!r}, got {job.get('needs')!r}")
+                if job["environment"] != EVAL_ENVIRONMENT_EXPRESSION:
+                    r.add(name, "eval-environment",
+                          f"environment must be exactly {EVAL_ENVIRONMENT_EXPRESSION!r}, got {job['environment']!r}")
+                if env(job).get(EVAL_ENVIRONMENT_VAR) != EVAL_ENVIRONMENT_EXPRESSION:
+                    r.add(name, "eval-environment",
+                          f"job env {EVAL_ENVIRONMENT_VAR} must be exactly {EVAL_ENVIRONMENT_EXPRESSION!r}")
+            else:
+                env_name = environment_name(job["environment"])
+                if env_name is None:
+                    r.add(name, "eval-environment", f"environment must be a literal string, got {job['environment']!r}")
+                elif env_name.strip().casefold() not in EVAL_ENVIRONMENTS:
+                    continue
+                else:
+                    r.add(name, "eval-environment", "only eval.yml may use the eval or eval-test environment")
             if "permissions" not in job:
                 r.add(name, "eval-permissions", "a job that uses eval sets job-level permissions")
             elif job["permissions"] != EVAL_JOB_PERMISSIONS:
@@ -675,14 +743,88 @@ def test_no_continue_on_error_anywhere():
             assert all("continue-on-error" not in s for s in steps(job)), f"{path.name} {name}"
 
 
-def test_only_eval_yml_uses_the_eval_environment():
+def test_only_eval_yml_uses_an_environment():
     users = [
-        (path.name, name)
+        (path.name, name, job["environment"])
         for path in workflow_files(WORKFLOWS)
         for name, job in jobs(load_workflow(path).doc).items()
-        if "environment" in job and (environment_name(job["environment"]) or EVAL_ENVIRONMENT).strip().casefold() == EVAL_ENVIRONMENT
+        if "environment" in job
     ]
-    assert users == [(EVAL, "fixture-evals")]
+    assert users == [(EVAL, "fixture-evals", EVAL_ENVIRONMENT_EXPRESSION)]
+
+
+def test_eval_environment_var_is_set_from_the_same_expression():
+    job = jobs(load_workflow(WORKFLOWS / EVAL).doc)["fixture-evals"]
+    assert env(job)[EVAL_ENVIRONMENT_VAR] == job["environment"] == EVAL_ENVIRONMENT_EXPRESSION
+
+
+def eval_select_script() -> str:
+    """The select step of the real eval.yml."""
+    job = jobs(load_workflow(WORKFLOWS / EVAL).doc)[EVAL_SELECT_JOB]
+    [st] = [st for st in steps(job) if st.get("id") == EVAL_SELECT_STEP_ID]
+    return st["run"]
+
+
+def eval_environment_for(ref: str, tmp_path: Path, script: str | None = None) -> str:
+    """Run the select script as the runner does (`bash -e`) with GITHUB_REF =
+    `ref`, and return the `environment` it writes to GITHUB_OUTPUT."""
+    path = tmp_path / "select.sh"
+    path.write_text(eval_select_script() if script is None else script, encoding="utf-8")
+    output = tmp_path / "output"
+    output.write_text("", encoding="utf-8")
+    proc = subprocess.run([*DEFAULT_SHELL, str(path)], env={"PATH": "/usr/bin:/bin", "GITHUB_REF": ref,
+                                                            "GITHUB_OUTPUT": str(output)},
+                          capture_output=True, text=True, timeout=30, check=False)
+    assert proc.returncode == 0, proc.stderr
+    lines = output.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 and lines[0].startswith("environment="), lines
+    return lines[0].removeprefix("environment=")
+
+
+@pytest.mark.parametrize(("ref", "environment"), [
+    ("refs/heads/main", "eval"),
+    ("refs/heads/MAIN", "eval-test"),  # Actions `==` ignores case; the shell test does not
+    ("refs/heads/Main", "eval-test"),
+    ("refs/heads/main ", "eval-test"),
+    ("refs/heads/feature", "eval-test"),
+    ("refs/heads/main-test", "eval-test"),
+    ("refs/heads/x/refs/heads/main", "eval-test"),
+    ("refs/tags/main", "eval-test"),
+    ("refs/tags/v1.0.0", "eval-test"),
+    ("refs/pull/1/merge", "eval-test"),
+    ("main", "eval-test"),
+    ("", "eval-test"),
+])
+def test_eval_environment_selection(ref, environment, tmp_path):
+    assert eval_select_script() == EVAL_SELECT_RUN
+    assert eval_environment_for(ref, tmp_path) == environment
+    assert environment in EVAL_ENVIRONMENTS
+
+
+def test_case_insensitive_selection_would_pick_eval_for_main_in_capitals(tmp_path):
+    """The defect the select job closes: a case-insensitive compare (what an
+    Actions expression does) sends refs/heads/MAIN to `eval`."""
+    loose = EVAL_SELECT_RUN.replace('[ "$GITHUB_REF" = "refs/heads/main" ]',
+                                    '[ "$(printf %s "$GITHUB_REF" | tr A-Z a-z)" = "refs/heads/main" ]')
+    assert loose != EVAL_SELECT_RUN
+    assert eval_environment_for("refs/heads/MAIN", tmp_path, loose) == "eval"
+    assert eval_environment_for("refs/heads/MAIN", tmp_path) == "eval-test"
+
+
+def test_eval_select_job_has_no_permissions_and_no_environment():
+    job = jobs(load_workflow(WORKFLOWS / EVAL).doc)[EVAL_SELECT_JOB]
+    assert job["permissions"] == {} and "environment" not in job
+    assert job["outputs"] == EVAL_SELECT_OUTPUTS
+    assert jobs(load_workflow(WORKFLOWS / EVAL).doc)["fixture-evals"]["needs"] == EVAL_SELECT_JOB
+
+
+def test_eval_environment_names_match_the_runner(tmp_path):
+    from oc_review import evals
+
+    assert set(evals.EVAL_FEDERATION) == EVAL_ENVIRONMENTS
+    assert evals.EVAL_ENVIRONMENT_VAR == EVAL_ENVIRONMENT_VAR
+    assert (evals.EVAL_ENVIRONMENT_MAIN, evals.EVAL_ENVIRONMENT_TEST) == (
+        eval_environment_for("refs/heads/main", tmp_path), eval_environment_for("refs/heads/other", tmp_path))
 
 
 def test_eval_upload_step_always_runs_and_keeps_data_out():
@@ -789,6 +931,22 @@ EDITS = yaml.safe_load((FIXTURES / "edits.yml").read_text(encoding="utf-8"))
 # Eval boundary fixture directory -> the tag its violation must carry.
 EVAL_CASES = {
     "other-file-uses-eval": "eval-environment",
+    "other-file-uses-eval-test": "eval-environment",
+    "other-file-uses-eval-test-uppercase": "eval-environment",
+    "other-file-same-expression": "eval-environment",
+    "eval-literal-eval": "eval-environment",
+    "eval-literal-eval-test": "eval-environment",
+    "eval-name-form": "eval-environment",
+    "eval-case-insensitive-expression": "eval-environment",
+    "select-job-missing": "eval-environment",
+    "select-job-id-token": "eval-environment",
+    "select-script-case-insensitive": "eval-environment",
+    "select-step-env": "eval-environment",
+    "select-job-outputs": "eval-environment",
+    "evals-job-needs-missing": "eval-environment",
+    "eval-input-expression": "eval-environment",
+    "eval-env-var-missing": "eval-environment",
+    "eval-env-var-literal": "eval-environment",
     "other-file-name-form": "eval-environment",
     "other-file-expression": "eval-environment",
     "other-file-uppercase": "eval-environment",

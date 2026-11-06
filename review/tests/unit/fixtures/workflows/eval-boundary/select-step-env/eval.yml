@@ -1,0 +1,31 @@
+# Bad: the select step takes no env (GITHUB_REF must be the runner's own value).
+on: workflow_dispatch
+permissions: {}
+jobs:
+  select-environment:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      environment: ${{ steps.select.outputs.environment }}
+    steps:
+      - id: select
+        env:
+          GITHUB_REF: refs/heads/main
+        run: |
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            echo "environment=eval" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=eval-test" >> "$GITHUB_OUTPUT"
+          fi
+  evals:
+    needs: select-environment
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.select-environment.outputs.environment }}
+    env:
+      EVAL_ENVIRONMENT: ${{ needs.select-environment.outputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - run: echo evals

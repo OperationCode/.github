@@ -1,18 +1,30 @@
 # Manual fixture evals against the live API (costs money; run on request only).
 #
 # workflow_dispatch only, on the branch to test: a dispatch run uses that
-# branch's copy of this file and of the code. The job uses the `eval`
-# environment, which needs the owner's approval for every run, and the eval
-# federation rule binds the token to that environment. Only this file may use
-# `eval`, and its job states contents: read and id-token: write and nothing
-# else, so the job that holds the Anthropic credential has no GitHub write
-# (spec "Fixture eval credential"; review/tests/unit/test_workflows.py).
+# branch's copy of this file and of the code. The environment comes from the
+# ref: a run on main uses `eval` (main-only branch policy, no approval: main is
+# reviewed code); a run on any other ref uses `eval-test` (the owner approves
+# every run, and prevent self-review is on: it can run unreviewed code with the
+# eval credential). Each environment has its own eval federation rule, which
+# binds the token to that environment.
 #
-# Harden-runner runs in audit mode (spec K-14). The allowlist is not measured
-# for this job: it holds the hosts that the same checkout, setup-uv, uv sync
-# and Anthropic token exchange and API steps reached in the V10 run of the
-# central workflow. Measure it in audit mode before block mode (build plan,
-# phase 5).
+# The choice is made in the shell of a job with no permissions, not in an
+# expression: Actions expressions compare strings without case, so
+# `github.ref == 'refs/heads/main'` is also true for a branch named MAIN or
+# Main. The shell `[ "$GITHUB_REF" = refs/heads/main ]` is exact. The evals job
+# takes that one output for its environment and for EVAL_ENVIRONMENT, so
+# evals.py picks that environment's rule. If the select job fails, the evals
+# job does not run. Only this file may use `eval` or `eval-test`, and the evals
+# job states contents: read and id-token: write and nothing else, so the job
+# that holds the Anthropic credential has no GitHub write (spec "Fixture eval
+# credential"; review/tests/unit/test_workflows.py).
+#
+# Harden-runner runs in audit mode (spec K-14). The allowlists are not
+# measured. The evals job holds the hosts that the same checkout, setup-uv,
+# uv sync and Anthropic token exchange and API steps reached in the V10 run of
+# the central workflow. The select job runs one shell test and calls nothing;
+# its list holds only hosts the runner itself reaches. Measure them in audit
+# mode before block mode (build plan, phase 5).
 
 name: eval
 
@@ -21,24 +33,50 @@ on: workflow_dispatch
 permissions: {}
 
 jobs:
+  select-environment:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      environment: ${{ steps.select.outputs.environment }}
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3, released 2026-10-27
+        with:
+          egress-policy: audit
+          allowed-endpoints: >
+            github.com:443
+            results-receiver.actions.githubusercontent.com:443
+      - name: Select the eval environment from the ref (exact, case-sensitive)
+        id: select
+        run: |
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            echo "environment=eval" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=eval-test" >> "$GITHUB_OUTPUT"
+          fi
+
   fixture-evals:
+    needs: select-environment
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    environment: eval
+    environment: ${{ needs.select-environment.outputs.environment }}
     permissions:
       contents: read
       id-token: write
     env:
       UV_PYTHON_DOWNLOADS: never
       UV_PYTHON: python3.12
+      EVAL_ENVIRONMENT: ${{ needs.select-environment.outputs.environment }}
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3, released 2026-10-27
         with:
           egress-policy: audit
           allowed-endpoints: >
             github.com:443
             raw.githubusercontent.com:443
+            releases.astral.sh:443
             release-assets.githubusercontent.com:443
             files.pythonhosted.org:443
             api.anthropic.com:443
@@ -49,7 +87,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2, released 2026-10-22
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3, released 2026-10-28
         with:
           version: 0.13.1
           checksum: eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220

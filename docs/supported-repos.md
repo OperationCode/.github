@@ -10,7 +10,6 @@ Every active repo also gets the baseline ruleset 25787833 (`~ALL`), whether it i
 | `back-end` | 182584277 | `main` | target | 2026-10-29 |
 | `operationcode_infra` | 107068150 | `main` | target | 2026-10-29 |
 | `operationcode-pybot` | 146210805 | `master` | target | 2026-10-29 |
-| `START_HERE` | 82613670 | `master` | candidate | |
 
 ## Excluded active repos
 
@@ -19,6 +18,7 @@ Every active repo also gets the baseline ruleset 25787833 (`~ALL`), whether it i
 | `.github` | 1432342572 | Never a target: it holds the central workflow, and a ruleset that requires a workflow from `.github` and also targets `.github` can deadlock. |
 | `claude-review-test` | 1432457406 | Test repo. Only the scratch test ruleset 25835887 requires the workflow there. |
 | `claude-review-p0-source` | 1433591286 | Test source repo for the acceptance tests. No review ruleset. |
+| `START_HERE` | 82613670 | Not a review target: it will be archived after its content moves into `.github` ([issue #27](https://github.com/OperationCode/.github/issues/27); spec P6-5). |
 
 Private repos are excluded (not supported): v1 supports public repos only.
 

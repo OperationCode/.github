@@ -1,0 +1,12 @@
+# Bad: a workflow other than eval.yml uses eval-test.
+on: workflow_dispatch
+permissions: {}
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: eval-test
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - run: echo deploy

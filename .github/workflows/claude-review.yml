@@ -19,9 +19,12 @@
 #
 # Harden-runner runs in audit mode (spec K-14): in V10, block mode hung 2 of
 # 24 jobs in "Complete job" (symptoms match open harden-runner issue 708;
-# no fix in v2.22.2). Each job keeps the allowlist that V10 measured,
-# so block mode needs only egress-policy: block plus disable-telemetry: true
-# (the action accepts that only in block mode). Block mode is revisited
+# v2.22.3 has a partial fix only, the safe-by-default fix is not released,
+# .github issue 24). Each job keeps the allowlist that V10 measured, plus
+# releases.astral.sh:443 where setup-uv runs (v10.3.3 fetches the uv
+# version manifest there first; not measured), so block mode needs only
+# egress-policy: block plus disable-telemetry: true (the action accepts that
+# only in block mode). Block mode is revisited
 # before org-wide enforcement (build plan, phase 5).
 
 name: Claude of Duty
@@ -49,7 +52,7 @@ jobs:
       merge-base-sha: ${{ steps.collect.outputs.merge-base-sha }}
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3, released 2026-10-27
         with:
           # Audit until https://github.com/step-security/harden-runner/issues/708 is fixed (spec K-14).
           egress-policy: audit
@@ -57,6 +60,7 @@ jobs:
             api.github.com:443
             github.com:443
             raw.githubusercontent.com:443
+            releases.astral.sh:443
             release-assets.githubusercontent.com:443
             files.pythonhosted.org:443
             pypi.org:443
@@ -71,7 +75,7 @@ jobs:
           path: central
           persist-credentials: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2, released 2026-10-22
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3, released 2026-10-28
         with:
           version: 0.13.1
           checksum: eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
@@ -115,7 +119,7 @@ jobs:
       supply-chain-digest: ${{ steps.analyze.outputs.supply-chain-digest }}
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3, released 2026-10-27
         with:
           # Audit until https://github.com/step-security/harden-runner/issues/708 is fixed (spec K-14).
           egress-policy: audit
@@ -123,6 +127,7 @@ jobs:
             api.github.com:443
             github.com:443
             raw.githubusercontent.com:443
+            releases.astral.sh:443
             release-assets.githubusercontent.com:443
             files.pythonhosted.org:443
             api.anthropic.com:443
@@ -136,7 +141,7 @@ jobs:
           path: central
           persist-credentials: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2, released 2026-10-22
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3, released 2026-10-28
         with:
           version: 0.13.1
           checksum: eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
@@ -211,7 +216,7 @@ jobs:
       outcome: ${{ steps.dr.outcome }}
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3, released 2026-10-27
         with:
           # Audit until https://github.com/step-security/harden-runner/issues/708 is fixed (spec K-14).
           egress-policy: audit
@@ -244,7 +249,7 @@ jobs:
       UV_PYTHON: python3.12
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3, released 2026-10-27
         with:
           # Audit until https://github.com/step-security/harden-runner/issues/708 is fixed (spec K-14).
           egress-policy: audit
@@ -252,6 +257,7 @@ jobs:
             api.github.com:443
             github.com:443
             raw.githubusercontent.com:443
+            releases.astral.sh:443
             release-assets.githubusercontent.com:443
             files.pythonhosted.org:443
             results-receiver.actions.githubusercontent.com:443
@@ -264,7 +270,7 @@ jobs:
           path: central
           persist-credentials: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2, released 2026-10-22
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3, released 2026-10-28
         with:
           version: 0.13.1
           checksum: eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220

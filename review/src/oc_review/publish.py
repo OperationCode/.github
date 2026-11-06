@@ -731,10 +731,24 @@ def read_commit_signing(api: GitHubApi, ctx: PublishContext) -> CommitSigning | 
 # alone is not evidence: GitHub also answers 403 for a private repo without
 # Advanced Security, for a fork, for a missing permission and for a secondary
 # rate limit (and the action prints the same advice for every 403).
+# Positive evidence only: a narrow affirmative phrase, "dependency graph",
+# an optional "for this repository", one verb ("is", "was", "has been"), an
+# optional "currently", then the state ("disabled", "not enabled", "turned
+# off"). Nothing else may stand between them, so a negation ("is not
+# disabled", "is neither disabled nor ..."), another clause ("is enabled but X
+# is disabled") or any other word gives no evidence, and the row stays
+# neutral.
 _GRAPH_OFF_RE = re.compile(
-    r"\bdependency[ -]graph\b[^.]*\b(?:is\s+)?(?:disabled|not\s+enabled|turned\s+off)\b", re.IGNORECASE
+    r"\bdependency[ -]graph(?:\s+for\s+this\s+repository)?\s+(?:is|was|has\s+been)\s+(?:currently\s+)?"
+    r"(?:disabled|not\s+enabled|turned\s+off)\b",
+    re.IGNORECASE,
 )
 _GRAPH_OFF_EXCLUDE_RE = re.compile(r"rate[ -]limit|advanced security|abuse", re.IGNORECASE)
+
+
+def _says_graph_off(message: str) -> bool:
+    """True when the message has the affirmative phrase `_GRAPH_OFF_RE`."""
+    return bool(_GRAPH_OFF_RE.search(message))
 
 
 def dependency_graph_off_evidence(resp: collect.HttpResponse | None) -> bool:
@@ -754,7 +768,7 @@ def dependency_graph_off_evidence(resp: collect.HttpResponse | None) -> bool:
     message = doc.get("message") if isinstance(doc, Mapping) else None
     if not isinstance(message, str) or len(message) > 1000:
         return False
-    return bool(_GRAPH_OFF_RE.search(message)) and not _GRAPH_OFF_EXCLUDE_RE.search(message)
+    return _says_graph_off(message) and not _GRAPH_OFF_EXCLUDE_RE.search(message)
 
 
 def read_dependency_graph_off(api: GitHubApi, ctx: PublishContext, snap: snapshot.Snapshot | None) -> bool:
@@ -1515,8 +1529,9 @@ def _signing_row(facts: SummaryFacts) -> list[_Row]:
     if c is None or c.unsigned == 0:
         return []
     of = f"{c.unsigned} of the first {c.total}" if c.capped else f"{c.unsigned} of {c.total}"
+    noun = "commit" if c.total == 1 else "commits"
     claim = (
-        f"**Unsigned commits:** {of} commits in this PR {'is' if c.unsigned == 1 else 'are'} not "
+        f"**Unsigned commits:** {of} {noun} in this PR {'is' if c.unsigned == 1 else 'are'} not "
         "verified-signed. The org requires signed commits, so the merge box blocks until every commit is "
         f"signed. [How to sign commits]({SIGNING_GUIDE_URL})"
     )
@@ -1554,6 +1569,11 @@ def _model_rows(rows: list[_Row]) -> list[_Row]:
 
 MISSION_LINE = "*Mission: Review the code. Protect the branch. Deploy the future.*"
 APPROVAL_NOTE = "*Claude of Duty never approves a PR. A human reviewer gives the final approval.*"
+# The TIP callout's last step. With the unsigned-commit row, "nothing to do"
+# would contradict the row (the merge box blocks until every commit is
+# signed), so the callout names the signing step instead. Display only.
+NOTHING_TO_DO = "Nothing to do for this review."
+SIGNING_STEP = "One step is left: sign the unsigned commits (see the Commits row)."
 
 
 def _status_heading(result: verdict.GateResult, model_rows: list[_Row], rows: list[_Row]) -> str:
@@ -1590,9 +1610,10 @@ def _callout(
     setting = facts.dependency_graph_off and _dependency_failed(result)
     setting_also = " A repo setting also blocks the dependency review; only a repo admin can fix it (see its row)."
     if result.status != verdict.FAIL:
+        step = SIGNING_STEP if _signing_row(facts) else NOTHING_TO_DO
         if result.override_applied:
             login = _esc("login", result.valid_overrides[0].author_login) if result.valid_overrides else "a maintainer"
-            lines = [f"**A maintainer waiver was applied by {login}. Findings stay listed.** Nothing to do for this review."]
+            lines = [f"**A maintainer waiver was applied by {login}. Findings stay listed.** {step}"]
         elif model:
             one = len(model) == 1
             lines = [
@@ -1601,7 +1622,7 @@ def _callout(
             ]
             return "\n".join(f"> {x}" for x in ("[!NOTE]", *lines))
         else:
-            lines = ["**No findings. This review found no reason to block.** Nothing to do for this review."]
+            lines = [f"**No findings. This review found no reason to block.** {step}"]
         lines.append("The merge box shows whether the other required checks pass.")
         return "\n".join(f"> {x}" for x in ("[!TIP]", *lines))
 
@@ -2233,10 +2254,13 @@ _FINDINGS_HEADER = "\n| Severity | Effect | Where | Finding | Found by |\n|---|-
 
 def _without_signing_row(body: str, facts: SummaryFacts) -> str:
     """`body` with the signing row (and a findings table header that only it
-    needed) taken out: equal to the body without the row when the row changed
-    nothing else."""
+    needed) taken out, and the TIP callout's signing step put back to "nothing
+    to do": equal to the body without the row when the row changed nothing
+    else. The callout comes before any untrusted text, so the first
+    `SIGNING_STEP` is the callout's."""
     [r] = _signing_row(facts)
     out = body.replace("\n" + _row(r.severity, r.effect, r.where, r.claim, r.found_by), "", 1)
+    out = out.replace(f"** {SIGNING_STEP}\n", f"** {NOTHING_TO_DO}\n", 1)
     if out.count(_FINDINGS_HEADER) == 1 and out.find(_FINDINGS_HEADER + "\n|") == -1:
         out = out.replace("\n" + _FINDINGS_HEADER, "", 1)
     return out

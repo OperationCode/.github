@@ -59,8 +59,15 @@ def test_excluded_list_names_github_and_the_test_repo_and_overlaps_nothing():
     assert not excluded & {r["id"] for r in supported()}
 
 
-def test_ids_match_the_plan_at_phase_5():
-    # Plan v2 section 2.1 (read-only GETs, 2026-11-01). Update with the list.
+START_HERE_ID = 82613670  # to be archived (issue #27); not a review target (spec P6-5)
+
+
+def test_ids_match_the_phase_6_scope():
+    # The 4 pilot repos (read-only GETs, 2026-11-01); START_HERE dropped (spec P6-5). Update with the list.
     assert {r["id"]: r["status"] for r in supported()} == {
-        135777271: "target", 182584277: "target", 107068150: "target", 146210805: "target",
-        82613670: "candidate"}
+        135777271: "target", 182584277: "target", 107068150: "target", 146210805: "target"}
+
+
+def test_start_here_is_excluded_not_a_candidate():
+    excluded = {int(cells[1]) for cells in table("Excluded active repos")}
+    assert START_HERE_ID in excluded

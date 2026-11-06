@@ -31,12 +31,13 @@ jobs:
       UV_PYTHON: python3.12
     steps:
       - name: Harden the runner
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2, released 2026-10-19
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3, released 2026-10-27
         with:
           egress-policy: audit
           allowed-endpoints: >
             github.com:443
             raw.githubusercontent.com:443
+            releases.astral.sh:443
             release-assets.githubusercontent.com:443
             files.pythonhosted.org:443
             results-receiver.actions.githubusercontent.com:443
@@ -45,7 +46,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2, released 2026-10-22
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3, released 2026-10-28
         with:
           version: 0.13.1
           checksum: eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220

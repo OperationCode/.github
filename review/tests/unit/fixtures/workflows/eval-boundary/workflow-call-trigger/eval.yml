@@ -2,9 +2,26 @@
 on: [workflow_dispatch, workflow_call]
 permissions: {}
 jobs:
-  evals:
+  select-environment:
     runs-on: ubuntu-24.04
-    environment: eval
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      environment: ${{ steps.select.outputs.environment }}
+    steps:
+      - id: select
+        run: |
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            echo "environment=eval" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=eval-test" >> "$GITHUB_OUTPUT"
+          fi
+  evals:
+    needs: select-environment
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.select-environment.outputs.environment }}
+    env:
+      EVAL_ENVIRONMENT: ${{ needs.select-environment.outputs.environment }}
     permissions:
       contents: read
       id-token: write

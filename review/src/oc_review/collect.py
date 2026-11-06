@@ -30,6 +30,7 @@ Rules this module keeps:
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import math
 import os
@@ -234,10 +235,11 @@ def default_transport(
         headers = {k.lower(): v for k, v in (exc.headers or {}).items()}
         # The error body, cut at the byte cap. Only a display-only probe reads
         # it (publish.dependency_graph_off_evidence); every other caller fails
-        # on the status alone.
+        # on the status alone. A body that cannot be read (also a cut-off
+        # body, http.client.IncompleteRead) is empty: the status still fails.
         try:
             body = exc.read(request.max_bytes + 1) if clock() <= deadline else b""
-        except (OSError, ValueError):
+        except (OSError, ValueError, http.client.HTTPException):
             body = b""
         return HttpResponse(exc.code, body or b"", request.url, headers)
 

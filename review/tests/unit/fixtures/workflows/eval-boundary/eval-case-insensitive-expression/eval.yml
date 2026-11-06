@@ -1,0 +1,29 @@
+# Bad: an Actions expression compares without case, so refs/heads/MAIN would select eval.
+on: workflow_dispatch
+permissions: {}
+jobs:
+  select-environment:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      environment: ${{ steps.select.outputs.environment }}
+    steps:
+      - id: select
+        run: |
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            echo "environment=eval" >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=eval-test" >> "$GITHUB_OUTPUT"
+          fi
+  evals:
+    needs: select-environment
+    runs-on: ubuntu-24.04
+    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}
+    env:
+      EVAL_ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - run: echo evals
