@@ -81,11 +81,11 @@ class EvalRule:
 EVAL_FEDERATION: Mapping[str, EvalRule] = MappingProxyType({
     # `eval`: runs on main only (reviewed code), no approval.
     EVAL_ENVIRONMENT_MAIN: EvalRule("fdrl_01BL4n1gQzkrroCmDZoXUePm", "svac_017eR3ohB6rP5MEAsda6U7X6"),
-    # `eval-test`: any other ref, owner approval with prevent self-review. The
-    # rule is not created yet (owner step); set its ID here when it exists.
-    # The service account is the `eval` one; the owner may give this rule
-    # its own service account and change it here.
-    EVAL_ENVIRONMENT_TEST: EvalRule(None, "svac_017eR3ohB6rP5MEAsda6U7X6"),
+    # `eval-test`: any other ref, owner approval with prevent self-review.
+    # Rule `eval-test-federation-rule` (created 2026-11-06): a copy of the
+    # `eval` rule with the claim `environment: eval-test`. It uses the
+    # `eval` service account.
+    EVAL_ENVIRONMENT_TEST: EvalRule("fdrl_01WkhnTsBLVnYBHgAfxkugnc", "svac_017eR3ohB6rP5MEAsda6U7X6"),
 })
 
 EVAL_REPOSITORY = "OperationCode/eval-fixtures"

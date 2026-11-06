@@ -241,9 +241,10 @@ def test_eval_environments_are_exactly_eval_and_eval_test():
     assert evals.EVAL_ENVIRONMENT_VAR == "EVAL_ENVIRONMENT"
 
 
-def test_eval_test_rule_is_unset_and_shares_the_eval_service_account():
-    # The owner has not created the eval-test rule yet; the owner may change its service account.
-    assert evals.EVAL_FEDERATION["eval-test"].rule_id is None
+def test_eval_test_rule_is_set_and_shares_the_eval_service_account():
+    # Rule `eval-test-federation-rule`, created 2026-11-06; the owner may change its service account.
+    assert evals.EVAL_FEDERATION["eval-test"].rule_id == "fdrl_01WkhnTsBLVnYBHgAfxkugnc"
+    assert evals.EVAL_FEDERATION["eval-test"].rule_id != evals.EVAL_FEDERATION["eval"].rule_id
     assert evals.EVAL_FEDERATION["eval-test"].service_account_id == evals.EVAL_FEDERATION["eval"].service_account_id
 
 
@@ -254,7 +255,10 @@ def test_every_set_eval_rule_id_has_the_real_id_form():
             assert analyze.ids_valid(ids) and not analyze.ids_are_placeholders(ids), name
 
 
-def test_eval_test_without_a_rule_fails_closed(tmp_path, capsys):
+def test_eval_test_without_a_rule_fails_closed(tmp_path, capsys, monkeypatch):
+    # Keeps the fail-closed path covered: the entry is set in the code, so unset it here.
+    unset = evals.EvalRule(None, evals.EVAL_FEDERATION["eval-test"].service_account_id)
+    monkeypatch.setattr(evals, "EVAL_FEDERATION", {**evals.EVAL_FEDERATION, "eval-test": unset})
     client, oidc_calls = FakeClient(), []
     assert main_in(tmp_path, "eval-test", client=client, oidc_calls=oidc_calls) == 1
     assert "eval-test federation rule not configured" in capsys.readouterr().err
