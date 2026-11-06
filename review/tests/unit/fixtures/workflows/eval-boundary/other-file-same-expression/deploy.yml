@@ -4,7 +4,7 @@ permissions: {}
 jobs:
   deploy:
     runs-on: ubuntu-24.04
-    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}
+    environment: ${{ needs.select-environment.outputs.environment }}
     permissions:
       contents: read
       id-token: write

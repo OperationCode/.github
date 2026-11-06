@@ -731,24 +731,24 @@ def read_commit_signing(api: GitHubApi, ctx: PublishContext) -> CommitSigning | 
 # alone is not evidence: GitHub also answers 403 for a private repo without
 # Advanced Security, for a fork, for a missing permission and for a secondary
 # rate limit (and the action prints the same advice for every 403).
-# The state words must be in the same clause as "dependency graph": no `.`,
-# `,`, `;`, `:`, `!` or `?` between them, and none of the words below (a
-# negation, a word that joins clauses, or "enabled"). So "is not disabled" and
-# "is enabled but X is disabled" are not evidence.
+# Positive evidence only: a narrow affirmative phrase, "dependency graph",
+# an optional "for this repository", one verb ("is", "was", "has been"), an
+# optional "currently", then the state ("disabled", "not enabled", "turned
+# off"). Nothing else may stand between them, so a negation ("is not
+# disabled", "is neither disabled nor ..."), another clause ("is enabled but X
+# is disabled") or any other word gives no evidence, and the row stays
+# neutral.
 _GRAPH_OFF_RE = re.compile(
-    r"\bdependency[ -]graph\b(?P<gap>[^.,;:!?]*?)\b(?:disabled|not\s+enabled|turned\s+off)\b", re.IGNORECASE
-)
-_GRAPH_OFF_GAP_REJECT_RE = re.compile(
-    r"\b(?:not|never|no|nor|but|and|or|while|whereas|although|though|however|yet|enabled)\b|n['\u2019]t\b",
+    r"\bdependency[ -]graph(?:\s+for\s+this\s+repository)?\s+(?:is|was|has\s+been)\s+(?:currently\s+)?"
+    r"(?:disabled|not\s+enabled|turned\s+off)\b",
     re.IGNORECASE,
 )
 _GRAPH_OFF_EXCLUDE_RE = re.compile(r"rate[ -]limit|advanced security|abuse", re.IGNORECASE)
 
 
 def _says_graph_off(message: str) -> bool:
-    """True when some clause says the Dependency graph is off: no negation,
-    clause join or "enabled" between "dependency graph" and the state words."""
-    return any(not _GRAPH_OFF_GAP_REJECT_RE.search(m.group("gap")) for m in _GRAPH_OFF_RE.finditer(message))
+    """True when the message has the affirmative phrase `_GRAPH_OFF_RE`."""
+    return bool(_GRAPH_OFF_RE.search(message))
 
 
 def dependency_graph_off_evidence(resp: collect.HttpResponse | None) -> bool:

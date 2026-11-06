@@ -1,0 +1,15 @@
+# Bad: no select job; the environment must come from its exact shell test.
+on: workflow_dispatch
+permissions: {}
+jobs:
+  evals:
+    needs: select-environment
+    runs-on: ubuntu-24.04
+    environment: ${{ needs.select-environment.outputs.environment }}
+    env:
+      EVAL_ENVIRONMENT: ${{ needs.select-environment.outputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - run: echo evals

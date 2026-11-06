@@ -610,27 +610,47 @@
   expect: eval-permissions
 - id: eval-duplicate-key
   file: eval.yml
-  old: "    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}\n"
-  new: "    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}\n    environment: other\n"
+  old: "    environment: ${{ needs.select-environment.outputs.environment }}\n"
+  new: "    environment: ${{ needs.select-environment.outputs.environment }}\n    environment: other\n"
   expect: parse
 - id: eval-environment-literal
   file: eval.yml
-  old: "    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}\n"
+  old: "    environment: ${{ needs.select-environment.outputs.environment }}\n"
   new: "    environment: eval\n"
   expect: eval-environment
-- id: eval-environment-always-eval
+- id: eval-environment-case-insensitive-expression
   file: eval.yml
-  old: "    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}\n"
-  new: "    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval' }}\n"
+  old: "    environment: ${{ needs.select-environment.outputs.environment }}\n"
+  new: "    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}\n"
   expect: eval-environment
 - id: eval-environment-var-differs
   file: eval.yml
-  old: "      EVAL_ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}\n"
+  old: "      EVAL_ENVIRONMENT: ${{ needs.select-environment.outputs.environment }}\n"
   new: "      EVAL_ENVIRONMENT: eval\n"
   expect: eval-environment
 - id: eval-environment-var-removed
   file: eval.yml
-  old: "      EVAL_ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}\n"
+  old: "      EVAL_ENVIRONMENT: ${{ needs.select-environment.outputs.environment }}\n"
+  new: ""
+  expect: eval-environment
+- id: eval-select-case-insensitive
+  file: eval.yml
+  old: "if [ \"$GITHUB_REF\" = \"refs/heads/main\" ]; then"
+  new: "if [ \"${GITHUB_REF,,}\" = \"refs/heads/main\" ]; then"
+  expect: eval-environment
+- id: eval-select-id-token
+  file: eval.yml
+  old: "    timeout-minutes: 5\n    permissions: {}\n"
+  new: "    timeout-minutes: 5\n    permissions:\n      id-token: write\n"
+  expect: eval-environment
+- id: eval-select-timeout
+  file: eval.yml
+  old: "    timeout-minutes: 5\n"
+  new: "    timeout-minutes: 30\n"
+  expect: timeout
+- id: eval-needs-removed
+  file: eval.yml
+  old: "    needs: select-environment\n"
   new: ""
   expect: eval-environment
 - id: eval-test-environment-in-test-yml

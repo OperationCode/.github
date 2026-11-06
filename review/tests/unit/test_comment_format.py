@@ -183,6 +183,9 @@ def test_without_positive_evidence_the_row_stays_neutral(tmp_path, case):
     "The dependency graph is not enabled for this repository.",
     "Dependency-graph is turned off for this repository",
     "Review failed. Dependency graph is disabled for this repository",
+    "The dependency graph for this repository is disabled.",
+    "Dependency graph has been turned off for this repository.",
+    "Dependency graph is currently disabled.",
 ])
 def test_evidence_messages(message):
     resp = HttpResponse(403, error_body(message), "https://api.github.com/x", {})
@@ -200,6 +203,12 @@ def test_evidence_messages(message):
     "Dependency graph is enabled but the submission is disabled.",
     "Dependency graph is on; the snapshot upload is disabled.",
     "Dependency graph is on and the snapshot API is turned off.",
+    # Review AC I2: the state words before "nor" are still negated.
+    "Dependency graph is neither disabled nor turned off.",
+    "Dependency graph is either disabled or enabled.",
+    "Dependency graph was not disabled.",
+    "Dependency graph is reportedly disabled.",
+    "Dependency graph is hardly ever turned off.",
 ])
 def test_negated_or_joined_messages_are_not_evidence(message):
     """Display only: a negated state, or a state from another clause, keeps
