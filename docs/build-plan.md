@@ -11,7 +11,7 @@ Every PR to a supported OperationCode repo gets the three-pass Claude review, an
 Done when:
 
 - [ ] The central workflow runs on every supported repo, from `OperationCode/.github` at a pinned SHA.
-- [ ] A failed run blocks the merge. Only org admins can bypass, through a pull request.
+- [ ] A failed run blocks the merge. Only org admins can bypass, through a pull request. (Follow-up work after phase 6: until someone asks the owner for a gate, maintainers keep the pilot bypass and the review is an advisory signal for them; spec P6-5.)
 - [ ] Every rule in the [CLAUDE.md](../CLAUDE.md) holds, and the unit tests check the ones that code can check.
 - [x] The owner has accepted the residuals in writing (spec "Which run counts"; P5-8, 2026-11-01).
 
@@ -23,8 +23,9 @@ Done when:
                                                          test, fork PR)    bypass on)
                                                                               │
                          6 org-wide enforcement <── 5 before org-wide <───────┘
-                           (org ruleset on,           (ruleset fixes,
-                            bypass: org admins)        risk acceptance, re-tests)
+                           (review ruleset on the     (ruleset fixes,
+                            supported repos, pilot     risk acceptance, re-tests)
+                            bypass stays, P6-5)
 
  Gate on each arrow: the exit criteria of the phase before it.
  Exception: 1a may start in parallel with phase 0 (see phase 1a).
@@ -209,7 +210,10 @@ Depends on: phase 3.
 
 Exit criteria:
 
-- [ ] Owner: the owner judges that the false positive rate and the run failures are acceptable on real PRs, after a period the owner picks.
+- [ ] Owner: the owner judges that the false positive rate and the run failures are acceptable on real PRs, after a period the owner picks. Evidence (owner, 2026-11-05, spec P6-5):
+  - [ ] 5 real PRs reviewed across the pilot repos at the live release or later (owner and Dependabot PRs count).
+  - [ ] 2 weekly metric reports.
+  - [ ] 7 days in a row with no unexplained failure: no unexplained false-positive hard block, no unexplained run failure, no maintainer bypass without a reason.
 
 ## Phase 5: before org-wide enforcement
 
@@ -235,16 +239,29 @@ Exit criteria:
 
 ## Phase 6: org-wide enforcement
 
-- [ ] Owner: add each supported repo to the review ruleset 26132750 (immutable subject first, test PR right after). After each add, start a run on each open PR. After the last add, set its bypass list to org admins in `pull_request` mode (rehearsed on the scratch test ruleset first) and rename it `claude-review`.
-- [ ] Keep the supported repo inventory current. A repo joins or leaves through a PR to this repo.
-- [ ] Owner: Phase 6 also applies the org security configuration. Details are kept in the owner's records.
+Scope (owner, 2026-11-05, spec P6-5): the review targets are the 4 pilot repos; `START_HERE` is not a target (it will be archived, issue #27); the pilot bypass stays.
+
+- [ ] Keep the supported repo inventory current. A repo joins or leaves through a PR to this repo. A new target: immutable subject first, a test PR right after, then a run on each open PR.
+- [x] Owner: Phase 6 also applies the org security configurations. Done and read back 2026-11-05: the configuration for public repos is enforced on the active public repos and is the default for new public repos; the dependency configuration is enforced and is the default for new private and internal repos. One planned change to the dependency configuration is skipped by owner decision (spec P6-5). Details are kept in the owner's records.
 - [x] Eval environment split, code part (spec P6-4): `eval.yml` uses `eval` on `main` and `eval-test` on any other ref, with one fixed expression that also sets `EVAL_ENVIRONMENT`; `evals.py` holds the federation IDs per environment and fails closed on another value and on an environment whose rule is not set; the workflow unit test allows the two names only in `eval.yml`.
 - [ ] Owner: create the `eval-test` environment on `.github` (required reviewer the owner, "prevent self-review" on, admin bypass as `eval`), and its federation rule on the test workspace (as the eval rule, with the exact claim `environment: "eval-test"`). Then set the rule ID in `evals.py` in a PR, and test it as V27: an approved `eval-test` run on a branch gets a token; a run with no environment, or in another environment, gets none. Until then branch evals fail closed ("eval-test federation rule not configured").
-- [ ] Release item: summary comment format (spec P6-1): one row per cause, the repo setting label for a Dependency graph that is off, plain paths, no empty token table, and the informational unsigned-commit row with the signing guide link. Display only; the gate does not change. Ships as in "Each release".
+- [x] Release item: summary comment format (spec P6-1): one row per cause, the repo setting label for a Dependency graph that is off, plain paths, no empty token table, and the informational unsigned-commit row with the signing guide link. Display only; the gate does not change. Shipped in 364058d (PR #26), released 2026-11-04.
+- [ ] Release item: comment fixes from the first live run (spec P6-3): the TIP callout names the signing step when the unsigned-commit row shows, "commit" for a one-commit PR, no setting label on a negated message, and an error body cut off mid-read is treated as empty. Display only; the gate does not change. Ships as in "Each release".
 
 Exit criteria:
 
-- [ ] Every supported repo is a target of the review ruleset and gets the baseline rules, and only org admins can bypass either one, through a pull request. The org security configuration is attached and read back (final acceptance test, checks 1-8).
+- [ ] Phase 4 exit is met, then the final acceptance test passes (read-only GETs; record the date and the output path here in a PR):
+  1. The review ruleset 26132750 is active, targets exactly the `target` repos in [supported-repos.md](supported-repos.md) by `repository_id` (the 4 pilot repos), on `~DEFAULT_BRANCH`, and never `.github`.
+  2. It has one rule, `workflows`, with one entry: the `repository_id` of `.github`, path `.github/workflows/claude-review.yml`, `sha` equal to the live release SHA, and no `ref`. The scratch test ruleset 25835887 has the same pin and targets only claude-review-test.
+  3. Its bypass list is the pilot bypass (see spec "Pilot and enforcement"), the accepted state (spec P6-5).
+  4. No other org ruleset has a `workflows` entry for the central workflow (the `make release-plan` drift check is `ok`).
+  5. On each target, `GET /repos/OperationCode/{repo}/rules/branches/{default branch}` lists `workflows` from 26132750, and `pull_request` (1 approval, dismiss stale approvals, Code Owners review), `non_fast_forward`, `deletion` and `required_signatures` from the baseline 25787833, whose only bypass is org admins in `pull_request` mode.
+  6. Each target passes its preflight: no merge queue, CODEOWNERS with no errors, the immutable OIDC subject, the Dependency graph on (SBOM 200), a recursive tree that is not truncated, and a passed run on record at the live release.
+  7. The security configurations are as live on 2026-11-05: the public configuration attached and enforced on each active public repo and the default for public repos; the dependency configuration enforced and the default for private and internal repos.
+
+Follow-up work (not a phase 6 exit item; spec P6-5):
+
+- [ ] When someone asks the owner for a gate: set the review ruleset's bypass list to org admins in `pull_request` mode (rehearsed on the scratch test ruleset, spec P5-10), rename it `claude-review`, read it back, and check live on one target that a Maintain user cannot bypass a failed run. Then update `RULESETS` in the release tool to the new name.
 
 ## Each release (from phase 4 on)
 
