@@ -1,10 +1,13 @@
-# Good: eval.yml uses eval, and its job states exactly contents: read and id-token: write.
+# Good: eval.yml picks eval or eval-test with the fixed expression, sets EVAL_ENVIRONMENT
+# from it, and its job states exactly contents: read and id-token: write.
 on: workflow_dispatch
 permissions: {}
 jobs:
   evals:
     runs-on: ubuntu-24.04
-    environment: eval
+    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}
+    env:
+      EVAL_ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}
     permissions:
       contents: read
       id-token: write

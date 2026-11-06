@@ -19,8 +19,13 @@ Each case is a directory of `D` with:
   - `summary_excludes`: strings that must not appear in the rendered summary.
   Another key, or a wrong type or value, fails the case before any call.
 
+The workflow names its GitHub environment in `EVAL_ENVIRONMENT` (`eval` on
+main, `eval-test` on any other ref). The runner refuses to start, before any
+OIDC token is minted, when that value is missing or another name, or when the
+federation rule of that environment is not configured.
+
 For each case the runner calls `analyze.analyze` with the eval federation IDs
-and a GitHub client on an in-memory transport (no GitHub read), writes the
+of that environment and a GitHub client on an in-memory transport (no GitHub read), writes the
 three pass records, and computes the gate with the same code the publisher
 uses and synthetic trusted inputs: every job `success`, dependency review
 `success`, a current snapshot, no overrides. It renders the sticky summary
@@ -44,17 +49,44 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from oc_review import analyze, collect, envelope, publish, snapshot, verdict
 
-# The eval federation rule, bound to the test workspace `claude-review-p0-test`
-# (never the review workspace; spec "Fixture eval credential"). They are
-# separate from the production IDs in `analyze`.
-EVAL_FEDERATION_RULE_ID = "fdrl_01BL4n1gQzkrroCmDZoXUePm"
+# The eval federation rules, one per GitHub environment, bound to the test
+# workspace `claude-review-p0-test` (never the review workspace; spec "Fixture
+# eval credential"). They are separate from the production IDs in `analyze`.
+# eval.yml picks the environment from the ref (main -> `eval`, any other ref ->
+# `eval-test`) and passes the same choice in EVAL_ENVIRONMENT_VAR. Each rule
+# binds its token to its own environment claim.
 EVAL_ORGANIZATION_ID = "2bc920f9-977b-43b2-870a-f840e4ce809c"
-EVAL_SERVICE_ACCOUNT_ID = "svac_017eR3ohB6rP5MEAsda6U7X6"
+EVAL_ENVIRONMENT_VAR = "EVAL_ENVIRONMENT"
+EVAL_ENVIRONMENT_MAIN = "eval"
+EVAL_ENVIRONMENT_TEST = "eval-test"
+
+
+@dataclass(frozen=True)
+class EvalRule:
+    """The federation rule and service account of one eval environment. A
+    rule ID of None means the owner has not created the rule yet: the runner
+    refuses to run in that environment."""
+
+    rule_id: str | None
+    service_account_id: str
+
+
+EVAL_FEDERATION: Mapping[str, EvalRule] = MappingProxyType({
+    # `eval`: runs on main only (reviewed code), no approval.
+    EVAL_ENVIRONMENT_MAIN: EvalRule("fdrl_01BL4n1gQzkrroCmDZoXUePm", "svac_017eR3ohB6rP5MEAsda6U7X6"),
+    # `eval-test`: any other ref, owner approval with prevent self-review. The
+    # rule is not created yet (owner step); set its ID here when it exists.
+    # The service account is the `eval` one; the owner may give this rule
+    # its own service account and change it here.
+    EVAL_ENVIRONMENT_TEST: EvalRule(None, "svac_017eR3ohB6rP5MEAsda6U7X6"),
+})
 
 EVAL_REPOSITORY = "OperationCode/eval-fixtures"
 EVAL_PR_AUTHOR = "eval-author"
@@ -70,8 +102,31 @@ class EvalError(Exception):
     """A case that cannot run (bad fixture). The case fails; the run goes on."""
 
 
-def eval_federation() -> analyze.FederationIds:
-    return analyze.FederationIds(EVAL_FEDERATION_RULE_ID, EVAL_ORGANIZATION_ID, EVAL_SERVICE_ACCOUNT_ID)
+class EvalConfigError(Exception):
+    """The run cannot start: no allowed eval environment, or its federation
+    rule is not configured. Every case fails closed (no OIDC token is minted)."""
+
+
+def eval_environment(env: Mapping[str, str]) -> str:
+    """The eval environment the workflow chose. Only `eval` and `eval-test`
+    are allowed; a missing or other value fails closed."""
+    name = env.get(EVAL_ENVIRONMENT_VAR)
+    if name not in EVAL_FEDERATION:
+        raise EvalConfigError(
+            f"{EVAL_ENVIRONMENT_VAR} must be one of {sorted(EVAL_FEDERATION)}, got {str(name)[:40]!r}"
+        )
+    return name
+
+
+def eval_federation(environment: str = EVAL_ENVIRONMENT_MAIN) -> analyze.FederationIds:
+    """The federation IDs of one eval environment. Raises EvalConfigError for
+    another name or a rule that is not configured."""
+    rule = EVAL_FEDERATION.get(environment)
+    if rule is None:
+        raise EvalConfigError(f"unknown eval environment {str(environment)[:40]!r}")
+    if rule.rule_id is None:
+        raise EvalConfigError(f"{environment} federation rule not configured")
+    return analyze.FederationIds(rule.rule_id, EVAL_ORGANIZATION_ID, rule.service_account_id)
 
 
 def pr_transport(bundle: Mapping[str, Any], repository: str = EVAL_REPOSITORY) -> collect.Transport:
@@ -341,7 +396,12 @@ def main(
     parser.add_argument("--out-dir", required=True)
     args = parser.parse_args(argv)
     env = os.environ if environ is None else environ
-    federation = federation or eval_federation()
+    try:
+        environment = eval_environment(env)
+        federation = federation or eval_federation(environment)
+    except EvalConfigError as exc:
+        print(f"evals: {exc}", file=sys.stderr)
+        return 1
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 

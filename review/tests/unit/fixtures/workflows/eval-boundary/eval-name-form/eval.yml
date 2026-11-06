@@ -1,0 +1,15 @@
+# Bad: the mapping form; the environment must be exactly the expression string.
+on: workflow_dispatch
+permissions: {}
+jobs:
+  evals:
+    runs-on: ubuntu-24.04
+    environment:
+      name: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}
+    env:
+      EVAL_ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - run: echo evals

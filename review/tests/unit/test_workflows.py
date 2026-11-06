@@ -27,7 +27,13 @@ EVAL_BOUNDARY = FIXTURES / "eval-boundary"
 CENTRAL = "claude-review.yml"
 TEST = "test.yml"
 EVAL = "eval.yml"
-EVAL_ENVIRONMENT = "eval"
+# eval.yml picks its environment from the ref (spec "Fixture eval credential"):
+# main runs reviewed code in `eval` (no approval); any other ref runs in
+# `eval-test` (owner approval, prevent self-review). The job uses exactly this
+# expression, and sets EVAL_ENVIRONMENT from the same expression for evals.py.
+EVAL_ENVIRONMENTS = frozenset({"eval", "eval-test"})
+EVAL_ENVIRONMENT_EXPRESSION = "${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}"
+EVAL_ENVIRONMENT_VAR = "EVAL_ENVIRONMENT"
 
 HARDEN = "step-security/harden-runner"
 CHECKOUT = "actions/checkout"
@@ -582,9 +588,12 @@ def environment_name(value: Any) -> str | None:
 
 
 def eval_boundary_violations(directory: Path) -> list[str]:
-    """Only eval.yml may use `eval`, and each job that does states exactly
-    contents: read and id-token: write itself. Environment names are not case
-    sensitive, so `EVAL` counts; a name that is not a literal counts too."""
+    """Only eval.yml may use `eval` or `eval-test`. Each eval.yml job with an
+    environment uses exactly EVAL_ENVIRONMENT_EXPRESSION, sets
+    EVAL_ENVIRONMENT to the same expression, and states exactly contents: read
+    and id-token: write itself. In any other workflow, an environment that is
+    not a literal counts as a use; names are not case sensitive, so `EVAL`
+    counts too."""
     out: list[str] = []
     for path in workflow_files(directory):
         r = Report(path.name)
@@ -602,14 +611,21 @@ def eval_boundary_violations(directory: Path) -> list[str]:
         for name, job in jobs(wf.doc).items():
             if "environment" not in job:
                 continue
-            env_name = environment_name(job["environment"])
-            if env_name is None:
-                r.add(name, "eval-environment", f"environment must be a literal string, got {job['environment']!r}")
-            uses_eval = env_name is None or env_name.strip().casefold() == EVAL_ENVIRONMENT
-            if not uses_eval:
-                continue
-            if wf.name != EVAL:
-                r.add(name, "eval-environment", "only eval.yml may use the eval environment")
+            if wf.name == EVAL:
+                if job["environment"] != EVAL_ENVIRONMENT_EXPRESSION:
+                    r.add(name, "eval-environment",
+                          f"environment must be exactly {EVAL_ENVIRONMENT_EXPRESSION!r}, got {job['environment']!r}")
+                if env(job).get(EVAL_ENVIRONMENT_VAR) != EVAL_ENVIRONMENT_EXPRESSION:
+                    r.add(name, "eval-environment",
+                          f"job env {EVAL_ENVIRONMENT_VAR} must be exactly {EVAL_ENVIRONMENT_EXPRESSION!r}")
+            else:
+                env_name = environment_name(job["environment"])
+                if env_name is None:
+                    r.add(name, "eval-environment", f"environment must be a literal string, got {job['environment']!r}")
+                elif env_name.strip().casefold() not in EVAL_ENVIRONMENTS:
+                    continue
+                else:
+                    r.add(name, "eval-environment", "only eval.yml may use the eval or eval-test environment")
             if "permissions" not in job:
                 r.add(name, "eval-permissions", "a job that uses eval sets job-level permissions")
             elif job["permissions"] != EVAL_JOB_PERMISSIONS:
@@ -675,14 +691,51 @@ def test_no_continue_on_error_anywhere():
             assert all("continue-on-error" not in s for s in steps(job)), f"{path.name} {name}"
 
 
-def test_only_eval_yml_uses_the_eval_environment():
+def test_only_eval_yml_uses_an_environment():
     users = [
-        (path.name, name)
+        (path.name, name, job["environment"])
         for path in workflow_files(WORKFLOWS)
         for name, job in jobs(load_workflow(path).doc).items()
-        if "environment" in job and (environment_name(job["environment"]) or EVAL_ENVIRONMENT).strip().casefold() == EVAL_ENVIRONMENT
+        if "environment" in job
     ]
-    assert users == [(EVAL, "fixture-evals")]
+    assert users == [(EVAL, "fixture-evals", EVAL_ENVIRONMENT_EXPRESSION)]
+
+
+def test_eval_environment_var_is_set_from_the_same_expression():
+    job = jobs(load_workflow(WORKFLOWS / EVAL).doc)["fixture-evals"]
+    assert env(job)[EVAL_ENVIRONMENT_VAR] == job["environment"] == EVAL_ENVIRONMENT_EXPRESSION
+
+
+def eval_environment_for(ref: str) -> str:
+    """Evaluate EVAL_ENVIRONMENT_EXPRESSION as Actions does for `ref`: `a && b
+    || c` gives b when a is true (b is a non-empty string), else c."""
+    m = re.fullmatch(r"\$\{\{ github\.ref == '([^']+)' && '([^']+)' \|\| '([^']+)' \}\}", EVAL_ENVIRONMENT_EXPRESSION)
+    assert m, EVAL_ENVIRONMENT_EXPRESSION
+    main_ref, on_main, otherwise = m.groups()
+    return on_main if ref == main_ref else otherwise
+
+
+@pytest.mark.parametrize(("ref", "environment"), [
+    ("refs/heads/main", "eval"),
+    ("refs/heads/feature", "eval-test"),
+    ("refs/heads/main-test", "eval-test"),
+    ("refs/heads/x/refs/heads/main", "eval-test"),
+    ("refs/tags/main", "eval-test"),
+    ("refs/tags/v1.0.0", "eval-test"),
+    ("main", "eval-test"),
+])
+def test_eval_environment_selection(ref, environment):
+    assert eval_environment_for(ref) == environment
+    assert environment in EVAL_ENVIRONMENTS
+
+
+def test_eval_environment_names_match_the_runner():
+    from oc_review import evals
+
+    assert set(evals.EVAL_FEDERATION) == EVAL_ENVIRONMENTS
+    assert evals.EVAL_ENVIRONMENT_VAR == EVAL_ENVIRONMENT_VAR
+    assert (evals.EVAL_ENVIRONMENT_MAIN, evals.EVAL_ENVIRONMENT_TEST) == (
+        eval_environment_for("refs/heads/main"), eval_environment_for("refs/heads/other"))
 
 
 def test_eval_upload_step_always_runs_and_keeps_data_out():
@@ -789,6 +842,16 @@ EDITS = yaml.safe_load((FIXTURES / "edits.yml").read_text(encoding="utf-8"))
 # Eval boundary fixture directory -> the tag its violation must carry.
 EVAL_CASES = {
     "other-file-uses-eval": "eval-environment",
+    "other-file-uses-eval-test": "eval-environment",
+    "other-file-uses-eval-test-uppercase": "eval-environment",
+    "other-file-same-expression": "eval-environment",
+    "eval-literal-eval": "eval-environment",
+    "eval-literal-eval-test": "eval-environment",
+    "eval-name-form": "eval-environment",
+    "eval-swapped-expression": "eval-environment",
+    "eval-input-expression": "eval-environment",
+    "eval-env-var-missing": "eval-environment",
+    "eval-env-var-literal": "eval-environment",
     "other-file-name-form": "eval-environment",
     "other-file-expression": "eval-environment",
     "other-file-uppercase": "eval-environment",

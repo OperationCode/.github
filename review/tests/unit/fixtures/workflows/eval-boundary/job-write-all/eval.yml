@@ -4,7 +4,9 @@ permissions: {}
 jobs:
   evals:
     runs-on: ubuntu-24.04
-    environment: eval
+    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}
+    env:
+      EVAL_ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}
     permissions: write-all
     steps:
       - run: echo evals

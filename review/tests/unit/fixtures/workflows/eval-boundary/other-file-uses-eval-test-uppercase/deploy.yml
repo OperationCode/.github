@@ -1,0 +1,12 @@
+# Bad: environment names are not case sensitive, so Eval-Test is eval-test (mapping form).
+on: workflow_dispatch
+permissions: {}
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment:
+      name: Eval-Test
+    permissions:
+      contents: read
+    steps:
+      - run: echo deploy

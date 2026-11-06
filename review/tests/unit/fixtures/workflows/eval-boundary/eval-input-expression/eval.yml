@@ -1,0 +1,18 @@
+# Bad: an environment from a dispatch input lets the caller pick it.
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        type: string
+permissions: {}
+jobs:
+  evals:
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.target }}
+    env:
+      EVAL_ENVIRONMENT: ${{ inputs.target }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - run: echo evals

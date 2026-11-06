@@ -104,7 +104,7 @@ def run(tmp_path, client, *, federation=CONFIGURED, seen=None, oidc_calls=None):
 
     env = {"JOB_WORKFLOW_SHA": JOB_SHA, "RUNNER_TEMP": str(tmp_path / "rt"),
            "ACTIONS_ID_TOKEN_REQUEST_URL": "https://pipelines.actions.githubusercontent.com/oidc?api-version=2.0",
-           "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "t"}
+           "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "t", "EVAL_ENVIRONMENT": "eval"}
     (tmp_path / "rt").mkdir(exist_ok=True)
     return evals.main(
         ["--fixtures-dir", str(tmp_path / "fixtures"), "--out-dir", str(tmp_path / "out")],
@@ -196,8 +196,10 @@ def test_eval_ids_differ_from_production_ids():
 
 def test_production_ids_differ_from_every_test_id():
     prod = analyze.federation_ids()
-    assert prod.rule_id not in {evals.eval_federation().rule_id, TEST_RULE_ID, SIMULATION_RULE_ID}
-    assert prod.service_account_id not in {evals.eval_federation().service_account_id, TEST_SERVICE_ACCOUNT_ID}
+    eval_rules = {r.rule_id for r in evals.EVAL_FEDERATION.values()}
+    eval_accounts = {r.service_account_id for r in evals.EVAL_FEDERATION.values()}
+    assert prod.rule_id not in {*eval_rules, TEST_RULE_ID, SIMULATION_RULE_ID}
+    assert prod.service_account_id not in {*eval_accounts, TEST_SERVICE_ACCOUNT_ID}
 
 
 def test_main_uses_the_eval_ids_by_default(tmp_path):
@@ -205,10 +207,90 @@ def test_main_uses_the_eval_ids_by_default(tmp_path):
     seen = []
     env = {"JOB_WORKFLOW_SHA": JOB_SHA, "RUNNER_TEMP": str(tmp_path),
            "ACTIONS_ID_TOKEN_REQUEST_URL": "https://pipelines.actions.githubusercontent.com/oidc?api-version=2.0",
-           "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "t"}
+           "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "t", "EVAL_ENVIRONMENT": "eval"}
     evals.main(["--fixtures-dir", str(tmp_path / "fixtures"), "--out-dir", str(tmp_path / "out")], environ=env,
                oidc_transport=oidc, client_factory=factory_for(FakeClient(), seen), sleep=lambda s: None)
     assert seen == [evals.eval_federation()]
+
+
+# ---------------------------------------------------------------- eval environments (eval, eval-test)
+
+
+def main_in(tmp_path, environment, *, client=None, seen=None, oidc_calls=None):
+    """evals.main with no injected federation, so it picks the IDs itself.
+    `environment` None leaves EVAL_ENVIRONMENT out."""
+    make_case(tmp_path / "fixtures")
+    env = {"JOB_WORKFLOW_SHA": JOB_SHA, "RUNNER_TEMP": str(tmp_path),
+           "ACTIONS_ID_TOKEN_REQUEST_URL": "https://pipelines.actions.githubusercontent.com/oidc?api-version=2.0",
+           "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "t"}
+    if environment is not None:
+        env["EVAL_ENVIRONMENT"] = environment
+
+    def oidc_transport(url, request_token):
+        if oidc_calls is not None:
+            oidc_calls.append(url)
+        return oidc(url, request_token)
+
+    return evals.main(["--fixtures-dir", str(tmp_path / "fixtures"), "--out-dir", str(tmp_path / "out")],
+                      environ=env, oidc_transport=oidc_transport,
+                      client_factory=factory_for(client or FakeClient(), seen), sleep=lambda s: None)
+
+
+def test_eval_environments_are_exactly_eval_and_eval_test():
+    assert set(evals.EVAL_FEDERATION) == {"eval", "eval-test"}
+    assert evals.EVAL_ENVIRONMENT_VAR == "EVAL_ENVIRONMENT"
+
+
+def test_eval_test_rule_is_unset_and_shares_the_eval_service_account():
+    # The owner has not created the eval-test rule yet; the owner may change its service account.
+    assert evals.EVAL_FEDERATION["eval-test"].rule_id is None
+    assert evals.EVAL_FEDERATION["eval-test"].service_account_id == evals.EVAL_FEDERATION["eval"].service_account_id
+
+
+def test_every_set_eval_rule_id_has_the_real_id_form():
+    for name, rule in evals.EVAL_FEDERATION.items():
+        if rule.rule_id is not None:
+            ids = analyze.FederationIds(rule.rule_id, evals.EVAL_ORGANIZATION_ID, rule.service_account_id)
+            assert analyze.ids_valid(ids) and not analyze.ids_are_placeholders(ids), name
+
+
+def test_eval_test_without_a_rule_fails_closed(tmp_path, capsys):
+    client, oidc_calls = FakeClient(), []
+    assert main_in(tmp_path, "eval-test", client=client, oidc_calls=oidc_calls) == 1
+    assert "eval-test federation rule not configured" in capsys.readouterr().err
+    assert client.calls == 0 and oidc_calls == []
+    with pytest.raises(evals.EvalConfigError, match="eval-test federation rule not configured"):
+        evals.eval_federation("eval-test")
+
+
+@pytest.mark.parametrize("environment", [None, "", "EVAL", "Eval-Test", "production", "eval ", "eval-test2"])
+def test_other_environment_values_fail_closed(tmp_path, capsys, environment):
+    client, oidc_calls = FakeClient(), []
+    assert main_in(tmp_path, environment, client=client, oidc_calls=oidc_calls) == 1
+    assert "EVAL_ENVIRONMENT must be one of ['eval', 'eval-test']" in capsys.readouterr().err
+    assert client.calls == 0 and oidc_calls == []
+    assert not (tmp_path / "out" / "results.jsonl").exists()
+
+
+def test_unknown_environment_has_no_ids():
+    with pytest.raises(evals.EvalConfigError):
+        evals.eval_federation("production")
+
+
+def test_main_picks_the_ids_of_its_environment(tmp_path, monkeypatch):
+    configured = evals.EvalRule("fdrl_01ZyXwVuTsRqPoNmLkJiHgFe", "svac_01ZyXwVuTsRqPoNmLkJiHgFe")
+    monkeypatch.setattr(evals, "EVAL_FEDERATION", {**evals.EVAL_FEDERATION, "eval-test": configured})
+    seen_test, seen_main = [], []
+    main_in(tmp_path / "t", "eval-test", seen=seen_test)
+    main_in(tmp_path / "m", "eval", seen=seen_main)
+    assert seen_test == [analyze.FederationIds(configured.rule_id, evals.EVAL_ORGANIZATION_ID,
+                                               configured.service_account_id)]
+    assert seen_main == [evals.eval_federation("eval")] != seen_test
+
+
+def test_eval_federation_map_is_read_only():
+    with pytest.raises(TypeError):
+        evals.EVAL_FEDERATION["eval-test"] = evals.EvalRule("fdrl_x", "svac_x")  # type: ignore[index]
 
 
 def test_failed_pass_is_not_a_match(tmp_path):

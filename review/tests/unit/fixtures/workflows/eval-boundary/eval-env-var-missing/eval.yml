@@ -1,0 +1,12 @@
+# Bad: no EVAL_ENVIRONMENT, so evals.py cannot pick the rule of the environment.
+on: workflow_dispatch
+permissions: {}
+jobs:
+  evals:
+    runs-on: ubuntu-24.04
+    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - run: echo evals

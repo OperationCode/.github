@@ -1,0 +1,14 @@
+# Bad: a literal eval-test; the environment must come from the fixed expression.
+on: workflow_dispatch
+permissions: {}
+jobs:
+  evals:
+    runs-on: ubuntu-24.04
+    environment: eval-test
+    env:
+      EVAL_ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - run: echo evals

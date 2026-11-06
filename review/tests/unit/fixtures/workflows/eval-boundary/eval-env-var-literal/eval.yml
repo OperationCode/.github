@@ -1,0 +1,14 @@
+# Bad: EVAL_ENVIRONMENT must come from the same expression as the environment.
+on: workflow_dispatch
+permissions: {}
+jobs:
+  evals:
+    runs-on: ubuntu-24.04
+    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}
+    env:
+      EVAL_ENVIRONMENT: eval
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - run: echo evals

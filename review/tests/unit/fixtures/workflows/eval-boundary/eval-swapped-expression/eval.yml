@@ -1,0 +1,14 @@
+# Bad: main must map to eval and every other ref to eval-test, not the reverse.
+on: workflow_dispatch
+permissions: {}
+jobs:
+  evals:
+    runs-on: ubuntu-24.04
+    environment: ${{ github.ref == 'refs/heads/main' && 'eval-test' || 'eval' }}
+    env:
+      EVAL_ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'eval-test' || 'eval' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - run: echo evals

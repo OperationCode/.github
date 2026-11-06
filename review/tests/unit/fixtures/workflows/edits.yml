@@ -610,6 +610,31 @@
   expect: eval-permissions
 - id: eval-duplicate-key
   file: eval.yml
-  old: "    environment: eval\n"
-  new: "    environment: eval\n    environment: other\n"
+  old: "    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}\n"
+  new: "    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}\n    environment: other\n"
   expect: parse
+- id: eval-environment-literal
+  file: eval.yml
+  old: "    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}\n"
+  new: "    environment: eval\n"
+  expect: eval-environment
+- id: eval-environment-always-eval
+  file: eval.yml
+  old: "    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}\n"
+  new: "    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval' }}\n"
+  expect: eval-environment
+- id: eval-environment-var-differs
+  file: eval.yml
+  old: "      EVAL_ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}\n"
+  new: "      EVAL_ENVIRONMENT: eval\n"
+  expect: eval-environment
+- id: eval-environment-var-removed
+  file: eval.yml
+  old: "      EVAL_ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}\n"
+  new: ""
+  expect: eval-environment
+- id: eval-test-environment-in-test-yml
+  file: test.yml
+  old: "    timeout-minutes: 10\n"
+  new: "    timeout-minutes: 10\n    environment: eval-test\n"
+  expect: [test-workflow, eval-environment, eval-permissions]

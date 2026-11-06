@@ -1,0 +1,12 @@
+# Bad: only eval.yml may use the eval environment expression.
+on: workflow_dispatch
+permissions: {}
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: ${{ github.ref == 'refs/heads/main' && 'eval' || 'eval-test' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - run: echo deploy
