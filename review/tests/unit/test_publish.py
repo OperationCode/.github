@@ -408,6 +408,41 @@ def test_clean_run_passes_and_posts_summary(tmp_path):
     assert r.record["result"] == "pass"
 
 
+def test_rejected_override_is_shown_in_summary_and_log(tmp_path, capsys):
+    """A rejected override is not silent: one line in the summary and one in
+    the log. The gate result does not change."""
+    passes = clean_passes(security=[finding("security", "high", title="Shell call")])
+    gh = FakeGitHub(issue_comments=[override(7, AUTHOR)])  # the PR author
+    r = run(tmp_path, gh, passes=passes)
+    assert r.code == 1  # still fails: the override was not valid
+    line = "A `/oc-review` override by contributor (comment 7) was ignored: the PR author cannot waive their own PR."
+    assert line in plain(r.summary)
+    assert f"publish: {line}" in capsys.readouterr().out
+
+
+def test_override_without_permission_is_ignored_with_reason(tmp_path):
+    gh = FakeGitHub(issue_comments=[override(8, "drive-by")], permissions={"drive-by": "read"})
+    r = run(tmp_path, gh, passes=clean_passes(security=[finding("security", "high")]))
+    assert r.code == 1
+    assert "(comment 8) was ignored: the author does not have write or admin access." in plain(r.summary)
+
+
+def test_valid_override_shows_no_ignored_line(tmp_path, capsys):
+    r = run(tmp_path, FakeGitHub(issue_comments=[override(1)]),
+            passes=clean_passes(security=[finding("security", "high")]))
+    assert r.code == 0
+    assert "was ignored" not in r.summary
+    assert "was ignored" not in capsys.readouterr().out
+
+
+def test_ignored_override_lines_are_capped_in_the_summary(tmp_path):
+    comments = [override(i, AUTHOR) for i in range(10, 16)]
+    r = run(tmp_path, FakeGitHub(issue_comments=comments), passes=clean_passes(security=[finding("security", "high")]))
+    s = plain(r.summary)
+    assert s.count("was ignored") == publish.IGNORED_OVERRIDE_SHOWN
+    assert "3 more ignored override comment(s) are not listed." in s
+
+
 def test_summary_has_every_required_field(tmp_path):
     passes = clean_passes(security=[finding("security", "high", title="Shell call")])
     gh = FakeGitHub(issue_comments=[override(1)])

@@ -131,6 +131,24 @@ OV_EDITED = "edited"
 OV_PR_AUTHOR = "pr-author"
 OV_NO_PERMISSION = "no-write-permission"
 
+# Why a rejected `/oc-review` comment was ignored, in words for the summary and
+# the job log. One entry per rejection code: a rule that changes later (who may
+# override) changes its `_override_rejection` line and this text, nothing else.
+# A bot-authored comment is the bot's own text, not an attempt, so it has no
+# entry and is never shown.
+OV_REJECTION_TEXT: Mapping[str, str] = MappingProxyType({
+    OV_MALFORMED: "the comment is not in the form `/oc-review override <head-sha> <merge-base-sha> <reason>`",
+    OV_EMPTY_REASON: "the reason is empty",
+    OV_NO_SNAPSHOT: "there is no valid reviewed snapshot to waive",
+    OV_WRONG_HEAD: "the head SHA is not the reviewed head",
+    OV_WRONG_MERGE_BASE: "the merge base SHA is not the reviewed merge base",
+    OV_TIMELINE_INCOMPLETE: "the PR timeline could not be read completely",
+    OV_BEFORE_EPOCH: "the comment is older than the last force push, reopen or base change",
+    OV_EDITED: "the comment was edited after it was posted",
+    OV_PR_AUTHOR: "the PR author cannot waive their own PR",
+    OV_NO_PERMISSION: "the author does not have write or admin access",
+})
+
 
 # ---------------------------------------------------------------- inputs
 
@@ -498,6 +516,12 @@ class GateResult:
     @property
     def valid_overrides(self) -> tuple[OverrideCandidate, ...]:
         return tuple(c for c in self.overrides if c.valid)
+
+    @property
+    def rejected_overrides(self) -> tuple[OverrideCandidate, ...]:
+        """Display only: `/oc-review` comments that were ignored, with the
+        reason in `OV_REJECTION_TEXT`. Never changes the verdict or the risk."""
+        return tuple(c for c in self.overrides if c.rejection in OV_REJECTION_TEXT)
 
     @property
     def waived(self) -> tuple[Reason, ...]:

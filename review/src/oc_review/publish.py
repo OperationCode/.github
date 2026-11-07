@@ -737,18 +737,37 @@ def read_commit_signing(api: GitHubApi, ctx: PublishContext) -> CommitSigning | 
 # off"). Nothing else may stand between them, so a negation ("is not
 # disabled", "is neither disabled nor ..."), another clause ("is enabled but X
 # is disabled") or any other word gives no evidence, and the row stays
-# neutral.
+# neutral. The same holds for text before the phrase in its sentence or
+# clause: a conditional or hypothetical lead ("If the dependency graph is
+# disabled, ...", "when", "unless", "whether", "would", "should", ...) or a
+# negation ("not", "never", "no") gives no evidence (`_GRAPH_OFF_LEAD_RE`).
 _GRAPH_OFF_RE = re.compile(
     r"\bdependency[ -]graph(?:\s+for\s+this\s+repository)?\s+(?:is|was|has\s+been)\s+(?:currently\s+)?"
     r"(?:disabled|not\s+enabled|turned\s+off)\b",
     re.IGNORECASE,
 )
+_GRAPH_OFF_LEAD_RE = re.compile(
+    r"\b(?:if|when|whenever|unless|whether|once|until|while|though|although|"
+    r"would|could|should|might|may|can|will|cannot|can't|not|no|never|neither|nor|"
+    r"isn't|wasn't|don't|doesn't|didn't|but|however|"
+    r"suppose|assuming|ensure|make\s+sure|check|verify|confirm)\b|[?\u2019']t\b",
+    re.IGNORECASE,
+)
+_CLAUSE_BREAK_RE = re.compile(r"[.!?;:\n]")
 _GRAPH_OFF_EXCLUDE_RE = re.compile(r"rate[ -]limit|advanced security|abuse", re.IGNORECASE)
 
 
 def _says_graph_off(message: str) -> bool:
-    """True when the message has the affirmative phrase `_GRAPH_OFF_RE`."""
-    return bool(_GRAPH_OFF_RE.search(message))
+    """True when the message has the affirmative phrase `_GRAPH_OFF_RE` and
+    the text before it, back to the start of its sentence, has no conditional
+    or negating word (`_GRAPH_OFF_LEAD_RE`)."""
+    for m in _GRAPH_OFF_RE.finditer(message):
+        lead = message[: m.start()]
+        breaks = list(_CLAUSE_BREAK_RE.finditer(lead))
+        sentence = lead[breaks[-1].end():] if breaks else lead
+        if not _GRAPH_OFF_LEAD_RE.search(sentence):
+            return True
+    return False
 
 
 def dependency_graph_off_evidence(resp: collect.HttpResponse | None) -> bool:
@@ -1778,6 +1797,32 @@ def _waiver_blocks(result: verdict.GateResult) -> list[_Block]:
     return _details("🔑 Waiver: how a maintainer clears this", [_Block(text)])
 
 
+IGNORED_OVERRIDE_SHOWN = 3
+
+
+def ignored_override_lines(result: verdict.GateResult) -> list[str]:
+    """One plain line per ignored `/oc-review` comment: the author, a link-free
+    comment id and why (`verdict.OV_REJECTION_TEXT`). Display only: the gate
+    never reads it. The author login is untrusted text, so it is escaped."""
+    return [
+        f"A `/oc-review` override by {_esc('login', c.author_login)} (comment {c.comment_id}) was ignored: "
+        f"{verdict.OV_REJECTION_TEXT[c.rejection or '']}."
+        for c in result.rejected_overrides
+    ]
+
+
+def _ignored_override_blocks(result: verdict.GateResult) -> list[_Block]:
+    """Right under the callout, so a rejected override is not silent. At most
+    `IGNORED_OVERRIDE_SHOWN` lines, so comment spam cannot grow the summary."""
+    lines = ignored_override_lines(result)
+    if not lines:
+        return []
+    shown = lines[:IGNORED_OVERRIDE_SHOWN]
+    if len(lines) > len(shown):
+        shown.append(f"{len(lines) - len(shown)} more ignored override comment(s) are not listed.")
+    return [_Block("\n" + "\n\n".join(f"> {x}" for x in shown).replace("\n\n> ", "\n>\n> "))]
+
+
 def _title(text: str) -> _Block:
     return _Block(f"\n**{text}**\n")
 
@@ -2210,6 +2255,7 @@ def _summary_blocks(
         _Block(verdict.STICKY_MARKER),
         _Block(_status_heading(result, model, rows) + "\n" + MISSION_LINE),
         _Block("\n" + _callout(result, rows, hard, payload is not None, facts)),
+        *_ignored_override_blocks(result),
     ]
     # The signing row is informational: it is not in the heading count or the callout.
     b += _findings_table([*rows, *_signing_row(facts)])
@@ -2607,6 +2653,8 @@ def publish(
     # d) exit code
     append_step_summary(step_summary, ctx, final, full=full, publish_error=publish_error)
     print(f"publish: result {final.status}, reasons {', '.join(sorted(final.codes)) or 'none'}")
+    for line in ignored_override_lines(final):
+        print(f"publish: {line}")
     if publish_error is not None:
         print(f"publish: {publish_error}; the run fails", file=sys.stderr)
         return 1

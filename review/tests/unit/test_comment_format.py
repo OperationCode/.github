@@ -186,6 +186,8 @@ def test_without_positive_evidence_the_row_stays_neutral(tmp_path, case):
     "The dependency graph for this repository is disabled.",
     "Dependency graph has been turned off for this repository.",
     "Dependency graph is currently disabled.",
+    "Dependency graph is not enabled. Contact your admin.",
+    "Review failed. Make sure it is set up: the dependency graph is disabled for this repository.",
 ])
 def test_evidence_messages(message):
     resp = HttpResponse(403, error_body(message), "https://api.github.com/x", {})
@@ -209,6 +211,14 @@ def test_evidence_messages(message):
     "Dependency graph was not disabled.",
     "Dependency graph is reportedly disabled.",
     "Dependency graph is hardly ever turned off.",
+    # Text before the phrase that makes it conditional or hypothetical.
+    "If the dependency graph is disabled, enable it in the settings.",
+    "Check whether the dependency graph is disabled for this repository.",
+    "Unless the dependency graph is disabled, this call returns the diff.",
+    "When the dependency graph is not enabled, the API would answer 403.",
+    "Your admin should check that the dependency graph is disabled.",
+    "This does not mean the dependency graph is disabled for this repository.",
+    "It is not true that the dependency graph is disabled.",
 ])
 def test_negated_or_joined_messages_are_not_evidence(message):
     """Display only: a negated state, or a state from another clause, keeps

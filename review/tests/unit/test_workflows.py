@@ -608,6 +608,25 @@ def environment_name(value: Any) -> str | None:
     return name
 
 
+def eval_shell_violations(wf: Workflow, r: "Report") -> None:
+    """The select script means what it says only under the default shell. A
+    shell set at the workflow level (`defaults.run.shell`), the job level
+    (`defaults.run.shell`) or in a step (`shell:`) can change that, so eval.yml
+    sets none of them."""
+    def set_shell(node: Any) -> bool:
+        run = node.get("defaults", {}).get("run") if isinstance(node.get("defaults"), dict) else None
+        return isinstance(run, dict) and "shell" in run
+
+    if "defaults" in wf.doc:
+        r.add("workflow", "eval-environment", "no `defaults:` in eval.yml (a workflow default shell changes the select script)")
+    for name, job in jobs(wf.doc).items():
+        if "defaults" in job or set_shell(job):
+            r.add(name, "eval-environment", "no `defaults:` in an eval.yml job")
+        for st in steps(job):
+            if "shell" in st:
+                r.add(name, "eval-environment", "no step `shell:` in eval.yml")
+
+
 def eval_select_violations(wf: Workflow, r: "Report") -> None:
     """eval.yml has the select job: no environment, `permissions: {}`, the
     one output, harden-runner steps and exactly one run step, the fixed
@@ -658,6 +677,7 @@ def eval_boundary_violations(directory: Path) -> list[str]:
             if wf.doc.get("permissions") == "write-all":
                 r.add("workflow", "eval-permissions", "write-all at workflow level")
             eval_select_violations(wf, r)
+            eval_shell_violations(wf, r)
         for name, job in jobs(wf.doc).items():
             if "environment" not in job:
                 continue
@@ -885,6 +905,20 @@ def test_publish_stub_check_fails_on_hidden_exit(case, tmp_path):
     assert script != PUBLISH_RUN
     code, _ = run_publish_script(script, tmp_path, 3)
     assert code == 0
+
+
+HARDEN_RUNNER_PIN = "step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a"  # v2.22.4 (spec K-16)
+
+
+def test_every_harden_runner_step_pins_v2_22_4():
+    """Issue 24 / K-16: one harden-runner pin everywhere, with its tag in the comment."""
+    count = 0
+    for path in workflow_files(WORKFLOWS):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "step-security/harden-runner@" in line:
+                count += 1
+                assert line.split("uses:")[1].strip().startswith(HARDEN_RUNNER_PIN + " # v2.22.4"), f"{path.name}: {line}"
+    assert count == 7
 
 
 @pytest.mark.release
