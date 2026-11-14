@@ -57,7 +57,7 @@ from typing import Any
 from oc_review import collect, envelope, linediff, snapshot, verdict
 from oc_review.render import redact_text
 
-ZWSP = "​"
+ZWSP = "\u200b"
 TRUNCATED = "… \\[truncated\\]"
 
 # Fixed limits in characters, per field. Claude fields match the findings
@@ -89,7 +89,7 @@ MULTILINE = frozenset({"summary", "explanation", "quote"})
 MAX_COMBINING = 4
 
 _PUNCT = frozenset(string.punctuation)
-_LINE_BREAKS = re.compile(r"\r\n|[\r\n\x0b\x0c\x1c-\x1e\x85  ]")
+_LINE_BREAKS = re.compile(r"\r\n|[\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
 _AT_SIGNS = ("@", "＠", "﹫")  # @, fullwidth @, small @
 _DEFANG = re.compile(r"(?<=:)(?=//)|(?<=\bwww)(?=\.)|(?<=#)(?=\d)|(?<=\bgh-)(?=\d)", re.IGNORECASE)
 # GitHub links a bare commit SHA, full or short (7+ hex characters), also in
