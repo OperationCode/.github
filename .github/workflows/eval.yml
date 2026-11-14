@@ -19,6 +19,12 @@
 # that holds the Anthropic credential has no GitHub write (spec "Fixture eval
 # credential"; review/tests/unit/test_workflows.py).
 #
+# The `set` input picks the fixture directory: `standard` (default) is
+# review/tests/fixtures, `long-context` is review/tests/fixtures-long-context
+# (one case at about 800,000 estimated tokens, spec "Testing"). The input
+# reaches the run step through env only, and a fixed shell `case` maps it to
+# one of the two directories; any other value fails the step.
+#
 # Harden-runner runs in audit mode (spec K-14). The allowlists are not
 # measured. The evals job holds the hosts that the same checkout, setup-uv,
 # uv sync and Anthropic token exchange and API steps reached in the V10 run of
@@ -28,7 +34,16 @@
 
 name: eval
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      set:
+        description: Fixture set to run
+        type: choice
+        options:
+          - standard
+          - long-context
+        default: standard
 
 permissions: {}
 
@@ -99,10 +114,16 @@ jobs:
         env:
           JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
           PYTHONPATH: ${{ github.workspace }}/review/src
-        run: >-
-          uv run --no-sync --project review python -m oc_review.evals
-          --fixtures-dir review/tests/fixtures
-          --out-dir "$RUNNER_TEMP/eval"
+          EVAL_SET: ${{ inputs.set }}
+        run: |
+          case "$EVAL_SET" in
+            standard) fixtures_dir=review/tests/fixtures ;;
+            long-context) fixtures_dir=review/tests/fixtures-long-context ;;
+            *) echo "unknown eval set" >&2; exit 1 ;;
+          esac
+          uv run --no-sync --project review python -m oc_review.evals \
+            --fixtures-dir "$fixtures_dir" \
+            --out-dir "$RUNNER_TEMP/eval"
       # results.jsonl and each case's summary.md only. The per-case data/ dirs
       # (bundle and pass records) stay out. No file holds a credential: the
       # Anthropic token lives in memory only (spec "Fixture eval credential").

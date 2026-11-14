@@ -20,6 +20,7 @@ from oc_review.verdict import (
     R_DEPENDENCY_REVIEW,
     R_HARD_BLOCK,
     R_JOB_RESULT,
+    R_PARTIAL_REVIEW,
     R_PASS_RECORDS,
     R_SIZE_GATE,
     R_STALE,
@@ -40,6 +41,8 @@ from oc_review.verdict import (
     load_artifact,
     prefilter_evidence_from_bundle,
 )
+
+from .bundles import size_record
 
 FIXTURES = Path(__file__).parent / "fixtures" / "verdict"
 
@@ -123,17 +126,18 @@ def env_doc(kind, status="ok", payload=None, pass_name=None, **over):
     return doc
 
 
-def bundle_payload(hard_blocks=()):
+def bundle_payload(hard_blocks=(), status="ok"):
     """The deterministic results; an `ok` bundle also has the content for Claude."""
     return {
         "prefilter": {"signals": [], "hard_blocks": [{"id": b, "level": "hard_block"} for b in hard_blocks]},
         "coverage": {"complete": True},
         "dependency_delta": {"packages": []},
+        "size": size_record(status),
     }
 
 
 def bundle(status="ok", hard_blocks=(), **over):
-    payload = bundle_payload(hard_blocks) if status in ("ok", "skipped-size") else None
+    payload = bundle_payload(hard_blocks, status) if status in ("ok", "skipped-size") else None
     return ArtifactRead(envelope=env_doc("bundle", status, payload=payload, **over))
 
 
@@ -233,13 +237,14 @@ ROWS = (
     R_HARD_BLOCK,
     R_DEPENDENCY_REVIEW,
     R_SIZE_GATE,
+    R_PARTIAL_REVIEW,
     R_BLOCKING_FINDING,
 )
 
 
 def test_rows_cover_reasons_table():
     assert set(ROWS) == set(WAIVABLE)
-    assert {c for c, w in WAIVABLE.items() if w} == {R_SIZE_GATE, R_BLOCKING_FINDING}
+    assert {c for c, w in WAIVABLE.items() if w} == {R_SIZE_GATE, R_PARTIAL_REVIEW, R_BLOCKING_FINDING}
 
 
 def scenario(rows, with_override):
@@ -265,13 +270,17 @@ def scenario(rows, with_override):
         base_not_default_branch=R_BASE_NOT_DEFAULT in rows,
     )
     overrides = ov_inputs([override_comment()] if with_override else [])
+    doc = bundle(
+        "skipped-size" if size else "ok",
+        hard_blocks=("bidi-control-characters",) if R_HARD_BLOCK in rows else (),
+    )
+    if R_PARTIAL_REVIEW in rows:
+        doc.envelope["payload"]["size"]["mode"] = "partial"
+        doc.envelope["payload"]["files"] = [{"path": "docs/big.md", "model_view": "not-reviewed"}]
     inputs = gate_inputs(
         job_results=jobs,
         dependency_review_outcome="failure" if R_DEPENDENCY_REVIEW in rows else "success",
-        bundle=bundle(
-            "skipped-size" if size else "ok",
-            hard_blocks=("bidi-control-characters",) if R_HARD_BLOCK in rows else (),
-        ),
+        bundle=doc,
         passes=passes,
         revalidation=reval,
         overrides=overrides,
@@ -291,8 +300,9 @@ def expected_status(rows, with_override):
 
 
 def reachable(rows):
-    # The size gate means no Claude call, so no finding can exist with it.
-    return not (R_SIZE_GATE in rows and R_BLOCKING_FINDING in rows)
+    # The size gate means no Claude call, so no finding can exist with it. A
+    # partial review is an `ok` bundle, so it never comes with the size gate.
+    return R_SIZE_GATE not in rows or not rows & {R_BLOCKING_FINDING, R_PARTIAL_REVIEW}
 
 
 ALL_SUBSETS = [
@@ -330,13 +340,13 @@ def test_no_reason_passes():
 
 @pytest.mark.parametrize("with_override", [False, True], ids=["no-override", "override"])
 def test_every_combination(with_override):
-    assert len(ALL_SUBSETS) == 2 ** len(ROWS) - 2 ** (len(ROWS) - 2)
+    assert len(ALL_SUBSETS) == 2 ** len(ROWS) - 3 * 2 ** (len(ROWS) - 3)
     for rows in ALL_SUBSETS:
         check_scenario(rows, with_override)
 
 
 @pytest.mark.parametrize("not_waivable", [r for r in ROWS if not WAIVABLE[r]])
-@pytest.mark.parametrize("waivable", [R_SIZE_GATE, R_BLOCKING_FINDING])
+@pytest.mark.parametrize("waivable", [R_SIZE_GATE, R_PARTIAL_REVIEW, R_BLOCKING_FINDING])
 def test_override_never_clears_a_not_waivable_reason(not_waivable, waivable):
     final = check_scenario(frozenset({not_waivable, waivable}), True)
     assert final.status == FAIL

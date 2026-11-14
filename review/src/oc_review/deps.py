@@ -113,6 +113,27 @@ UNSUPPORTED_DEP_FILES = frozenset(
     }
 )
 
+# Lockfiles this module does not parse (lower-case basenames). With
+# LOCKFILE_FAMILIES and `requirements*.txt` they are the lockfile paths: never
+# full `content` for Claude, and a hash-masked patch (spec "Lockfiles in the
+# bundle").
+UNPARSED_LOCKFILES = frozenset(
+    {
+        "gemfile.lock",
+        "go.sum",
+        "cargo.lock",
+        "composer.lock",
+        "pipfile.lock",
+        "pdm.lock",
+        "npm-shrinkwrap.json",
+        "gradle.lockfile",
+        "mix.lock",
+        "pubspec.lock",
+        "packages.lock.json",
+        "bun.lock",
+    }
+)
+
 # Lockfile versions each parser accepts. Anything else is "unknown version".
 SUPPORTED_NPM_LOCK_VERSIONS = frozenset({2, 3})
 SUPPORTED_YARN_BERRY_VERSIONS = frozenset({4, 5, 6, 7, 8})
@@ -224,6 +245,16 @@ class PackageChange:
     has_install_script: bool | None
 
 
+@dataclass(frozen=True)
+class RemovedPackage:
+    """A name the merge base has and the head does not (context for Claude only)."""
+
+    path: str
+    ecosystem: str
+    name: str
+    old_versions: tuple[str, ...]
+
+
 # ---------------------------------------------------------------------------
 # File family detection and signals
 # ---------------------------------------------------------------------------
@@ -243,6 +274,15 @@ def family_for_path(path: str) -> str | None:
     if _REQUIREMENTS_RE.match(base):
         return "requirements"
     return None
+
+
+def is_lockfile_path(path: str) -> bool:
+    """True for a lockfile path (spec "Lockfiles in the bundle"). A file is a
+    lockfile when its head path or its old path is one."""
+    family = family_for_path(path)
+    if family in LOCKFILE_FAMILIES or family == "requirements":
+        return True
+    return _basename(path).lower() in UNPARSED_LOCKFILES
 
 
 def is_unsupported_dep_file(path: str) -> bool:
@@ -1442,6 +1482,21 @@ def compute_delta(old: ParsedDeps | None, new: ParsedDeps) -> list[PackageChange
             )
         )
     return changes
+
+
+def compute_removed(old: ParsedDeps, new: ParsedDeps) -> list[RemovedPackage]:
+    """Every (ecosystem, name) in `old` that `new` does not have, one row per
+    name with its sorted base versions, in (ecosystem, name) order. A name
+    still in `new` with another version is a change, not a removed row."""
+    new_names = {(pkg.ecosystem, pkg.name) for pkg in new.packages}
+    gone: dict[tuple[str, str], set[str]] = {}
+    for pkg in old.packages:
+        if (pkg.ecosystem, pkg.name) not in new_names:
+            gone.setdefault((pkg.ecosystem, pkg.name), set()).add(pkg.version)
+    return [
+        RemovedPackage(new.path, ecosystem, name, tuple(sorted(versions)))
+        for (ecosystem, name), versions in sorted(gone.items())
+    ]
 
 
 # ---------------------------------------------------------------------------

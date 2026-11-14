@@ -37,6 +37,7 @@
         "binary": false,
         "size": 431,
         "coverage": "full",
+        "model_view": "full",
         "patch": "@@ -1,12 +1,20 @@\n \"use strict\";\n \n+function badgeFor(user) {\n+  if (user.role = \"admin\") {\n+    return \"Administrator\";\n+  }\n+  return \"Member\";\n+}\n+\n // Display data for a profile card. `profile` is a plain object copied from\n // the API response; it is only read here.\n function profileCard(profile) {\n   return {\n     name: profile.displayName,\n     joined: profile.joinedYear,\n+    badge: badgeFor(profile),\n   };\n }\n \n-module.exports = { profileCard };\n+module.exports = { badgeFor, profileCard };\n",
         "patch_redaction": "blob-context",
         "content": "\"use strict\";\n\nfunction badgeFor(user) {\n  if (user.role = \"admin\") {\n    return \"Administrator\";\n  }\n  return \"Member\";\n}\n\n// Display data for a profile card. `profile` is a plain object copied from\n// the API response; it is only read here.\nfunction profileCard(profile) {\n  return {\n    name: profile.displayName,\n    joined: profile.joinedYear,\n    badge: badgeFor(profile),\n  };\n}\n\nmodule.exports = { badgeFor, profileCard };\n",
@@ -46,6 +47,7 @@
     ],
     "dependency_delta": {
       "changes": [],
+      "removed": [],
       "new_global_sources": [],
       "failures": []
     },
@@ -67,8 +69,14 @@
       "complete": true
     },
     "size": {
-      "estimated_tokens": 784,
-      "limit_tokens": 150000
+      "estimated_tokens": 1882,
+      "limit_tokens": 200000,
+      "base_limit_tokens": 200000,
+      "multiplier": 1,
+      "mode": "full",
+      "commands_read": true,
+      "raise": null,
+      "rejected_commands": []
     }
   }
 }

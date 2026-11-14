@@ -56,7 +56,30 @@
       },
       "then": {
         "properties": {
-          "payload": { "propertyNames": { "enum": ["prefilter", "coverage", "dependency_delta", "size"] } }
+          "payload": {
+            "propertyNames": { "enum": ["prefilter", "coverage", "dependency_delta", "size"] },
+            "properties": {
+              "size": { "required": ["reason"], "properties": { "mode": { "const": "skipped" } } }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "bundle" }, "status": { "const": "ok" } },
+        "required": ["kind", "status"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "properties": {
+              "size": {
+                "not": { "required": ["reason"] },
+                "properties": { "mode": { "enum": ["full", "diff-only", "partial"] } }
+              }
+            }
+          }
         }
       }
     }
@@ -65,8 +88,10 @@
     "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "bundle_payload": {
       "type": "object",
-      "required": ["prefilter", "coverage", "dependency_delta"],
+      "required": ["prefilter", "coverage", "dependency_delta", "size"],
       "properties": {
+        "files": { "type": "array", "items": { "$ref": "#/$defs/bundle_file" } },
+        "size": { "$ref": "#/$defs/size" },
         "prefilter": {
           "type": "object",
           "required": ["signals", "hard_blocks"],
@@ -76,6 +101,64 @@
           }
         },
         "coverage": { "type": "object" }
+      }
+    },
+    "bundle_file": {
+      "type": "object",
+      "required": ["path", "model_view"],
+      "properties": {
+        "path": { "type": "string" },
+        "model_view": { "enum": ["full", "diff-only", "not-reviewed", "no-text"] },
+        "model_view_reason": { "enum": ["long-file", "size-limit", "lockfile", "no-head-text"] }
+      },
+      "if": { "properties": { "model_view": { "const": "diff-only" } } },
+      "then": { "required": ["model_view_reason"] },
+      "else": { "not": { "required": ["model_view_reason"] } }
+    },
+    "size": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "estimated_tokens", "limit_tokens", "base_limit_tokens", "multiplier", "mode",
+        "commands_read", "raise", "rejected_commands"
+      ],
+      "properties": {
+        "estimated_tokens": { "type": "integer", "minimum": 0 },
+        "limit_tokens": { "type": "integer", "minimum": 1 },
+        "base_limit_tokens": { "type": "integer", "minimum": 1 },
+        "multiplier": { "enum": [1, 2, 3, 4] },
+        "mode": { "enum": ["full", "diff-only", "partial", "skipped"] },
+        "reason": { "type": "string", "maxLength": 300 },
+        "commands_read": { "type": "boolean" },
+        "raise": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["comment_id", "login", "multiplier"],
+              "properties": {
+                "comment_id": { "type": "integer", "minimum": 1 },
+                "login": { "type": "string", "minLength": 1, "maxLength": 100 },
+                "multiplier": { "enum": [2, 3, 4] }
+              }
+            }
+          ]
+        },
+        "rejected_commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "comment_id", "login", "code"],
+            "properties": {
+              "kind": { "const": "size-limit" },
+              "comment_id": { "type": "integer", "minimum": 1 },
+              "login": { "type": "string", "minLength": 1, "maxLength": 100 },
+              "code": { "enum": ["malformed", "edited", "no-write-permission"] }
+            }
+          }
+        }
       }
     },
     "pass_meta": {

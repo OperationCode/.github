@@ -37,6 +37,7 @@
         "binary": false,
         "size": 560,
         "coverage": "full",
+        "model_view": "full",
         "patch": "@@ -1,17 +1,19 @@\n \"use strict\";\n \n-function orderLine(order) {\n-  const d = new Date(order.createdAt);\n+// YYYY-MM-DD of a timestamp, in UTC.\n+function isoDay(timestamp) {\n+  const d = new Date(timestamp);\n   const day = String(d.getUTCDate()).padStart(2, \"0\");\n   const month = String(d.getUTCMonth() + 1).padStart(2, \"0\");\n-  return `${order.id} ${d.getUTCFullYear()}-${month}-${day} ${order.total.toFixed(2)}`;\n+  return `${d.getUTCFullYear()}-${month}-${day}`;\n+}\n+\n+function orderLine(order) {\n+  return `${order.id} ${isoDay(order.createdAt)} ${order.total.toFixed(2)}`;\n }\n \n function refundLine(refund) {\n-  const d = new Date(refund.createdAt);\n-  const day = String(d.getUTCDate()).padStart(2, \"0\");\n-  const month = String(d.getUTCMonth() + 1).padStart(2, \"0\");\n-  return `${refund.id} ${d.getUTCFullYear()}-${month}-${day} -${refund.amount.toFixed(2)}`;\n+  return `${refund.id} ${isoDay(refund.createdAt)} -${refund.amount.toFixed(2)}`;\n }\n \n-module.exports = { orderLine, refundLine };\n+module.exports = { isoDay, orderLine, refundLine };\n",
         "patch_redaction": "blob-context",
         "content": "\"use strict\";\n\n// YYYY-MM-DD of a timestamp, in UTC.\nfunction isoDay(timestamp) {\n  const d = new Date(timestamp);\n  const day = String(d.getUTCDate()).padStart(2, \"0\");\n  const month = String(d.getUTCMonth() + 1).padStart(2, \"0\");\n  return `${d.getUTCFullYear()}-${month}-${day}`;\n}\n\nfunction orderLine(order) {\n  return `${order.id} ${isoDay(order.createdAt)} ${order.total.toFixed(2)}`;\n}\n\nfunction refundLine(refund) {\n  return `${refund.id} ${isoDay(refund.createdAt)} -${refund.amount.toFixed(2)}`;\n}\n\nmodule.exports = { isoDay, orderLine, refundLine };\n",
@@ -56,6 +57,7 @@
         "binary": false,
         "size": 420,
         "coverage": "full",
+        "model_view": "full",
         "patch": "@@ -1,7 +1,8 @@\n \"use strict\";\n \n const assert = require(\"node:assert\");\n-const { orderLine, refundLine } = require(\"../src/orders\");\n+const { isoDay, orderLine, refundLine } = require(\"../src/orders\");\n \n+assert.strictEqual(isoDay(\"2026-01-09T00:00:00Z\"), \"2026-01-09\");\n assert.strictEqual(orderLine({ id: \"o1\", createdAt: \"2026-03-04T10:00:00Z\", total: 12.5 }), \"o1 2026-03-04 12.50\");\n assert.strictEqual(refundLine({ id: \"r1\", createdAt: \"2026-03-05T23:59:00Z\", amount: 3 }), \"r1 2026-03-05 -3.00\");\n",
         "patch_redaction": "blob-context",
         "content": "\"use strict\";\n\nconst assert = require(\"node:assert\");\nconst { isoDay, orderLine, refundLine } = require(\"../src/orders\");\n\nassert.strictEqual(isoDay(\"2026-01-09T00:00:00Z\"), \"2026-01-09\");\nassert.strictEqual(orderLine({ id: \"o1\", createdAt: \"2026-03-04T10:00:00Z\", total: 12.5 }), \"o1 2026-03-04 12.50\");\nassert.strictEqual(refundLine({ id: \"r1\", createdAt: \"2026-03-05T23:59:00Z\", amount: 3 }), \"r1 2026-03-05 -3.00\");\n",
@@ -65,6 +67,7 @@
     ],
     "dependency_delta": {
       "changes": [],
+      "removed": [],
       "new_global_sources": [],
       "failures": []
     },
@@ -91,8 +94,14 @@
       "complete": true
     },
     "size": {
-      "estimated_tokens": 1409,
-      "limit_tokens": 150000
+      "estimated_tokens": 3360,
+      "limit_tokens": 200000,
+      "base_limit_tokens": 200000,
+      "multiplier": 1,
+      "mode": "full",
+      "commands_read": true,
+      "raise": null,
+      "rejected_commands": []
     }
   }
 }

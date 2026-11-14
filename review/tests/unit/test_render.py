@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import random
 import re
+import time
 import unicodedata
 
 import pytest
@@ -1600,3 +1601,369 @@ def test_content_and_raw_head_render_once():
     inner = inner_of(render(env))
     assert inner.count("|     1 | a = 2") == 1
     assert "head_content" not in inner
+
+
+# ---------------------------------------------------------------- lockfile hash mask (P6-6, M1 to M4)
+
+HEX40, HEX64, HEX96, HEX128 = "a1" * 20, "b2" * 32, "c3" * 48, "d4" * 64
+SRI1 = "Q" * 27 + "="
+SRI256 = "AbCd" * 10 + "XyZ="
+SRI384 = "Ab+/" * 16
+SRI512 = "Zz09" * 21 + "Ab=="
+GO_H1 = "K" * 43 + "="
+
+
+@pytest.mark.parametrize(
+    "line,masked",
+    [
+        # poetry and uv
+        (f'    {{file = "x.whl", hash = "sha256:{HEX64}"}},', '    {file = "x.whl", hash = "sha256:b2b2b2b2~"},'),
+        (f'hash = "sha256:{HEX64}"', 'hash = "sha256:b2b2b2b2~"'),
+        # npm, pnpm and bun
+        (f'      "integrity": "sha512-{SRI512}",', '      "integrity": "sha512-Zz09Zz09~",'),
+        (f"    resolution: {{integrity: sha512-{SRI512}}}", "    resolution: {integrity: sha512-Zz09Zz09~}"),
+        (f'    "pkg": ["pkg@1.0.0", "", {{}}, "sha512-{SRI512}"],', '    "pkg": ["pkg@1.0.0", "", {}, "sha512-Zz09Zz09~"],'),
+        (f'      "integrity": "sha1-{SRI1}",', '      "integrity": "sha1-QQQQQQQQ~",'),
+        (f"  integrity sha256-{SRI256}", "  integrity sha256-AbCdAbCd~"),
+        (f"  integrity sha384-{SRI384}", "  integrity sha384-Ab+/Ab+/~"),
+        # go.sum
+        (f"github.com/x/y v1.2.3 h1:{GO_H1}", "github.com/x/y v1.2.3 h1:KKKKKKKK~"),
+        (f"github.com/x/y v1.2.3/go.mod h1:{GO_H1}", "github.com/x/y v1.2.3/go.mod h1:KKKKKKKK~"),
+        # Cargo
+        (f'checksum = "{HEX64}"', 'checksum = "b2b2b2b2~"'),
+        # Gemfile.lock CHECKSUMS
+        (f"  rake (13.0.6) sha256={HEX64}", "  rake (13.0.6) sha256=b2b2b2b2~"),
+        # pip --hash
+        (f"    --hash=sha256:{HEX64} \\", "    --hash=sha256:b2b2b2b2~ \\"),
+        # poetry content-hash
+        (f'content-hash = "{HEX64}"', 'content-hash = "b2b2b2b2~"'),
+        # prefixed hex forms
+        (f"x sha1:{HEX40}", "x sha1:a1a1a1a1~"),
+        (f"x sha384:{HEX96}", "x sha384:c3c3c3c3~"),
+        (f"x sha512={HEX128}", "x sha512=d4d4d4d4~"),
+        # yarn berry cache key prefix and npm shasum
+        (f"  checksum: 10c0/{HEX128}", "  checksum: 10c0/d4d4d4d4~"),
+        (f'      "shasum": "{HEX40}",', '      "shasum": "a1a1a1a1~",'),
+        # CRLF line end (N2)
+        (f'hash = "sha256:{HEX64}"\r', 'hash = "sha256:b2b2b2b2~"\r'),
+        (f"x h1:{GO_H1}\r", "x h1:KKKKKKKK~\r"),
+    ],
+)
+def test_mask_hashes_masks_hash_values(line, masked):
+    assert r.mask_hashes(line) == masked
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # inside a URL or after `/` (left `/`, right `/`)
+        f"-r https://x.example/sha256-{SRI256}/evil/path",
+        f"node_modules/sha1-{SRI1}",
+        f"  resolved: https://r.example/pkg/-/sha512-{SRI512}.tgz",
+        # URL query values and fragments: data, not hashes (review T2, finding 1)
+        "-r https://example.org/?q=sha384-" + "A" * 64,
+        f"resolved: https://host/?ref=sha1:{HEX40}",
+        f'  "resolved": "https://host/x.tgz?h=sha512-{SRI512}",',
+        f"git+https://host/r.git#sha256={HEX64}",
+        f"  url: https://host/a,sha1:{HEX40}",
+        # JSON-escaped slashes, quotes inside a URL, file:, data: and `//` starts (fix round 2)
+        f'      "resolved": "https:\\/\\/h\\/?q=sha1:{HEX40}",',
+        f'      "resolved": "https:/\\/h/?q=sha1:{HEX40}",',
+        f"      \"resolved\": \"https://h/?a='&b=sha1:{HEX40}\",",
+        f'-r https://h/?a="&b=sha1:{HEX40}',
+        f'-r https://h/?a="&b=sha256-{SRI256}',
+        f"pkg @ //h/x?q=sha1:{HEX40}",
+        f"pkg @ file:../x?q=sha1:{HEX40}",
+        f"pkg @ FILE:///x?q=sha1:{HEX40}",
+        f"x data:text/plain,sha1:{HEX40}",
+        f'{{"resolved":"https://h/a.tgz","integrity":"sha512-{SRI512}"}}',
+        # an npm or PyPI name that looks like an SRI body: no upper-case, `+`, `/` or `=`
+        "sha384-" + "ab12" * 16,
+        '  "sha384-' + "ab12" * 16 + '": "1.0.0",',
+        # wrong lengths
+        "x sha1-" + "Q" * 29,
+        "x sha1-" + "Q" * 28 + "=",
+        f"x sha256:{HEX40}",
+        f"x sha1:{HEX64}",
+        f"x h1:{GO_H1[:-2]}=",
+        # upper-case hex is not a hex hash value
+        f"x sha256:{HEX64.upper()}",
+        # bare hex: git commit IDs, and any key not in MASK_HASH_KEYS
+        f'reference = "{HEX40}"',
+        f'    commit: {HEX40}',
+        f'rev = "{HEX64}"',
+        f'source = {{ git = "https://github.com/a/b?rev=x#{HEX40}" }}',
+        f'  resolved "https://codeload.github.com/a/b/tar.gz/{HEX40}"',
+        f"{HEX64}",
+        f"  digest {HEX64}",
+        # a keyed hex with text after it is not the whole value
+        f'checksum = "{HEX64}" # note',
+        # a bare `\r` inside the line is not a line end
+        f"x h1:{GO_H1}\rmore",
+    ],
+)
+def test_mask_hashes_never_masks_ambiguous_text(line):
+    assert r.mask_hashes(line) == line
+
+
+def test_mask_hashes_never_masks_a_bare_git_sha_in_any_form():
+    for sha in (HEX40, "0123456789abcdef0123456789abcdef01234567"):
+        for line in (sha, f" {sha} ", f'"{sha}"', f"version: {sha}", f"  {sha}  # pinned"):
+            assert r.mask_hashes(line) == line
+
+
+def test_url_ends_at_a_space_or_a_tab_and_a_hash_after_it_is_masked():
+    assert r.mask_hashes(f'{{url = "https://h/x.whl", hash = "sha256:{HEX64}"}}') == '{url = "https://h/x.whl", hash = "sha256:b2b2b2b2~"}'
+    assert r.mask_hashes(f"{{tarball: https://h/a.tgz, integrity: sha512-{SRI512}}}") == "{tarball: https://h/a.tgz, integrity: sha512-Zz09Zz09~}"
+    # uv.lock: the span ends at the space after the closing quote.
+    uv = f'sdist = {{ url = "https://files.pythonhosted.org/p/x-1.0.tar.gz", hash = "sha256:{HEX64}", size = 1 }}'
+    assert r.mask_hashes(uv) == uv.replace(HEX64, "b2b2b2b2~")
+    assert r.mask_hashes(f"pkg @ https://h/x.whl\t--hash=sha256:{HEX64}") == "pkg @ https://h/x.whl\t--hash=sha256:b2b2b2b2~"
+    # `//` inside a path is not a URL start.
+    assert r.mask_hashes(f"a/b//c sha1:{HEX40}") == "a/b//c sha1:a1a1a1a1~"
+
+
+def test_added_url_line_with_query_data_shows_in_full():
+    # No removed line to collide with (M3 does not apply): the URL itself must stay whole.
+    url = "-r https://example.org/?q=sha384-" + "AbCd" * 16
+    base = "requests==2.31.0\n"
+    head = url + "\n" + base
+    masked = r.redact_patch(_lock_patch(base, head), base, head, lockfile=True)
+    assert f"+{url}\n" in masked and "~" not in masked
+
+
+def _lock_patch(base: str, head: str) -> str:
+    """A hunks-only diff of two texts, as collect builds it (one hunk per change)."""
+    a, b = base.split("\n")[:-1], head.split("\n")[:-1]
+    out = []
+    for group in difflib.SequenceMatcher(None, a, b, autojunk=False).get_grouped_opcodes(3):
+        i1, i2, j1, j2 = group[0][1], group[-1][2], group[0][3], group[-1][4]
+        out.append(f"@@ -{i1 + 1},{i2 - i1} +{j1 + 1},{j2 - j1} @@")
+        for tag, x1, x2, y1, y2 in group:
+            if tag == "equal":
+                out += [" " + a[i] for i in range(x1, x2)]
+            else:
+                out += ["-" + a[i] for i in range(x1, x2)] + ["+" + b[j] for j in range(y1, y2)]
+    return "".join(line + "\n" for line in out)
+
+
+def _markers(patch: str) -> list[str]:
+    return [line[:1] for line in patch.split("\n")]
+
+
+def test_masked_patch_keeps_every_line_and_marker():
+    base = "".join(f'pkg{i}:\n  version "1.0.{i}"\n  integrity sha512-{SRI512}\n' for i in range(30))
+    head = base.replace('version "1.0.7"', 'version "1.0.8"').replace(f"sha512-{SRI512}", "sha512-" + "Yy18" * 21 + "Cd==", 2)
+    patch = _lock_patch(base, head)
+    masked = r.redact_patch(patch, base, head, lockfile=True)
+    assert masked != patch and r.redact_patch(patch, base, head) == patch
+    assert _markers(masked) == _markers(patch)
+    assert "sha512-Zz09Zz09~" in masked and "sha512-Yy18Yy18~" in masked
+    # Render accepts it: the hunk counts still match.
+    env = make_env(files=[{"path": "yarn.lock", "patch": masked, "patch_redaction": r.PATCH_REDACTION}])
+    assert "sha512-Yy18Yy18~" in render(env).text
+
+
+def test_masked_patch_of_each_deps_fixture_keeps_lines(tmp_path):
+    from pathlib import Path
+
+    fixtures = Path(__file__).parent / "fixtures" / "deps"
+    for f in sorted(fixtures.iterdir()):
+        text = f.read_text(encoding="utf-8")
+        if not text.endswith("\n"):
+            text += "\n"
+        patch = _lock_patch("", text)
+        masked = r.redact_patch(patch, None, text, lockfile=True)
+        assert masked.count("\n") == patch.count("\n"), f.name
+        assert _markers(masked) == _markers(patch), f.name
+
+
+def test_mask_never_applies_without_the_lockfile_flag():
+    # A workflow action pin and a Dockerfile image digest are evidence: kept whole.
+    for text in (f"      - uses: actions/checkout@{HEX40}\n", f"FROM node@sha256:{HEX64}\n", f'hash = "sha256:{HEX64}"\n'):
+        patch = _lock_patch("", text)
+        assert r.redact_patch(patch, None, text) == patch
+
+
+def test_m3_pair_equal_under_the_mask_stays_raw_in_one_hunk():
+    old_hash, new_hash = "Zz09Zz09" + "A" * 78 + "==", "Zz09Zz09" + "B" * 78 + "=="
+    base = f'"integrity": "sha512-{old_hash}",\n"other": "sha512-{SRI512}",\n'
+    head = f'"integrity": "sha512-{new_hash}",\n"other": "sha512-{SRI512}",\n'
+    masked = r.redact_patch(_lock_patch(base, head), base, head, lockfile=True)
+    assert f"-\"integrity\": \"sha512-{old_hash}\"," in masked
+    assert f"+\"integrity\": \"sha512-{new_hash}\"," in masked
+    assert ' "other": "sha512-Zz09Zz09~",' in masked  # context is masked
+
+
+def test_m3_pair_equal_under_the_mask_stays_raw_across_hunks():
+    old_hash, new_hash = "Zz09Zz09" + "A" * 78 + "==", "Zz09Zz09" + "B" * 78 + "=="
+    filler = "".join(f"line {i}\n" for i in range(40))
+    # The removed line is in the first hunk, the added line in the last.
+    base = f"integrity sha512-{old_hash}\n" + filler + "end\n"
+    head = "start\n" + filler + f"integrity sha512-{new_hash}\n"
+    patch = _lock_patch(base, head)
+    assert patch.count("@@ -") == 2
+    masked = r.redact_patch(patch, base, head, lockfile=True)
+    assert f"-integrity sha512-{old_hash}\n" in masked and f"+integrity sha512-{new_hash}\n" in masked
+
+
+def test_m3_does_not_unmask_a_pair_that_differs_under_the_mask():
+    base = f"integrity sha512-{SRI512}\n"
+    head = "integrity sha512-" + "Yy18" * 21 + "Cd==\n"
+    masked = r.redact_patch(_lock_patch(base, head), base, head, lockfile=True)
+    assert masked == "@@ -1,1 +1,1 @@\n-integrity sha512-Zz09Zz09~\n+integrity sha512-Yy18Yy18~\n"
+
+
+def test_redaction_runs_before_the_mask():
+    token = "npm_" + "A1b2C3d4E5" * 3 + "F6g7H8"
+    base = f"integrity sha512-{SRI512}\n"
+    head = base + f"//registry.npmjs.org/:_authToken={token}\n"
+    masked = r.redact_patch(_lock_patch(base, head), base, head, lockfile=True)
+    assert token not in masked and "[REDACTED:" in masked
+    assert " integrity sha512-Zz09Zz09~\n" in masked
+
+
+def test_lockfile_patch_needs_its_redaction_mark():
+    text = f"integrity sha512-{SRI512}\n"
+    masked = r.redact_patch(_lock_patch("", text), None, text, lockfile=True)
+    env = make_env(files=[{"path": "yarn.lock", "patch": masked}])
+    with pytest.raises(r.RenderError, match="redact_patch"):
+        render(env)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f'"integrity": "sha512-{SRI512}",',
+        f'hash = "sha256:{HEX64}"\r',
+        f"untrusted_pr sha512-{SRI512}",
+        f"untrusted_pr:sha256:{HEX64}",
+        f"sha512-{SRI512} untrusted-pr",
+        f"\u200bsha512-{SRI512}",
+        f"sha512-{SRI512}\u200b",
+        f"x\u202esha1:{HEX40}",
+        f"x h1:{GO_H1}\u2028y",
+        f"  checksum: 10c0/{HEX128}\r",
+        f"x h1:{GO_H1}\rmore",
+        f"https://h/\u200b=sha1:{HEX40}",
+        f"https://h/\x0b=sha1:{HEX40}",
+        f"https://h/\u2028 sha1:{HEX40}",
+        f"https://h/untrusted_pr?=sha1:{HEX40} sha1:{HEX40}",
+        f'"resolved": "https:\\/\\/h\\/?q=sha1:{HEX40}\u200b", sha1:{HEX40}',
+        f"https://h/?a='\u202e&b=sha1:{HEX40}\tsha1:{HEX40}",
+        f"\u200b//h/?q=sha1:{HEX40} //h/\x0b=sha1:{HEX40}",
+        f"file:\u2028=sha1:{HEX40} data:x\u200b,sha1:{HEX40}",
+        f"ht\u200btps://h/?q=sha1:{HEX40}",
+    ],
+)
+def test_mask_commutes_with_model_lines(line):
+    # M4: the citation check masks `model_text` lines, Claude saw
+    # `model_lines` of the masked text. They must be the same.
+    assert r.model_lines(r.mask_hashes(line)) == [r.mask_hashes(x) for x in r.model_lines(line)]
+
+
+# ---------------------------------------------------------------- model view and size record (P6-6)
+
+
+@pytest.mark.parametrize(
+    "view,reason,note",
+    [
+        ("diff-only", "long-file", "Patch only. Full content not shown: the file has 2,000 lines or more."),
+        ("diff-only", "size-limit", "Patch only. Full content not shown: the bundle was over its size limit."),
+        (
+            "diff-only",
+            "lockfile",
+            'Patch only. The full content of a lockfile is never shown. Hash values are cut to their first 8 characters, followed by "~".',
+        ),
+        (
+            "not-reviewed",
+            None,
+            "Not reviewed: no patch and no content, because the bundle was over its size limit. "
+            "Do not report findings about changes you cannot see.",
+        ),
+        ("full", None, None),
+        ("diff-only", "no-head-text", None),
+        ("no-text", None, None),
+    ],
+)
+def test_coverage_note_per_view(view, reason, note):
+    f = {"path": "src/x.py", "status": "modified", "model_view": view}
+    if reason is not None:
+        f["model_view_reason"] = reason
+    if view not in ("not-reviewed", "no-text"):
+        f["patch"], f["patch_redaction"] = "@@ -1,1 +1,1 @@\n-a\n+b\n", r.PATCH_REDACTION
+    lines = inner_of(render(make_env(files=[f]))).split("\n")
+    notes = [line for line in lines if line.startswith("coverage note:")]
+    if note is None:
+        assert notes == []
+        return
+    assert notes == [f"coverage note: {note}"]
+    at = lines.index(notes[0])
+    # After the file's keys, before its patch.
+    start = lines.index("--- file 1 of 1 ---")
+    keys = [line.split(":", 1)[0] for line in lines[start + 1 : at]]
+    assert set(keys) == {k for k in f if k != "patch"}
+    if "patch" in f:
+        assert lines[at + 1].startswith("patch:")
+    else:
+        assert not any(line.startswith("patch:") for line in lines)
+
+
+def test_size_shows_only_the_keys_claude_needs():
+    assert r.SIZE_KEYS_SHOWN == ("estimated_tokens", "limit_tokens", "multiplier", "mode")
+    size = {
+        "estimated_tokens": 123, "limit_tokens": 400000, "base_limit_tokens": 200000, "multiplier": 2,
+        "mode": "partial", "commands_read": True,
+        "raise": {"comment_id": 9, "login": "maintainer-login", "multiplier": 2},
+        "rejected_commands": [{"kind": "size-limit", "comment_id": 5, "login": "outsider-login", "code": "edited"}],
+    }
+    inner = inner_of(render(make_env(size=size)))
+    section = inner.split("=== size ===\n", 1)[1].split("\n===", 1)[0]
+    assert section.split("\n") == ["estimated_tokens: 123", "limit_tokens: 400000", "multiplier: 2", "mode: partial"]
+    assert "maintainer-login" not in inner and "outsider-login" not in inner
+
+
+# ---------------------------------------------------------------- mask cost stays linear (final review)
+
+# Loose for CI: the fixed code takes well under a second here; the old code
+# took minutes for the long line and tens of seconds for the collision group.
+MASK_TIME_LIMIT_SECONDS = 5.0
+
+
+def test_url_scan_of_a_long_letter_run_is_linear():
+    head = "# " + "a" * 1_000_000 + "\n"
+    start = time.perf_counter()
+    out = r.redact_patch("@@ -0,0 +1 @@\n+" + head, None, head, lockfile=True)
+    assert time.perf_counter() - start < MASK_TIME_LIMIT_SECONDS
+    assert out == "@@ -0,0 +1 @@\n+" + head
+    # A long scheme-character run before `://` is still a URL start.
+    for line in ("x" * 100_000 + f"://h/?q=sha1:{HEX40}", f"1abc://h/?q=sha1:{HEX40}", f"+git.x-y://h?sha1:{HEX40}"):
+        assert r.mask_hashes(line) == line
+
+
+def test_many_hashes_next_to_many_urls_cost_n_log_n():
+    # Each hash match checks the URL spans by a binary search, not a scan.
+    piece = f"//x sha1:{HEX40} "
+    line = piece * (1_900_000 // len(piece))
+    start = time.perf_counter()
+    out = r.mask_hashes(line)
+    assert time.perf_counter() - start < MASK_TIME_LIMIT_SECONDS
+    # `//x` ends at the space, so every hash after it is outside a URL: masked.
+    assert out == "//x sha1:a1a1a1a1~ " * (1_900_000 // len(piece))
+    # A hash inside a URL among many spans still stays whole.
+    mixed = "//a " * 1000 + f"//h?q=sha1:{HEX40} " + "//b " * 1000 + f"sha1:{HEX40}"
+    assert r.mask_hashes(mixed) == mixed[: -40] + "a1a1a1a1~"
+
+
+def test_m3_with_a_large_collision_group_is_linear():
+    n = 40_000
+    rows = [(i + 1, None, "-") for i in range(n)] + [(None, i + 1, "+") for i in range(n)]
+    shown = ["sha256:deadbeef" + format(i, "056x") for i in range(2 * n)]
+    start = time.perf_counter()
+    out = r._mask_rows(rows, shown)
+    assert time.perf_counter() - start < MASK_TIME_LIMIT_SECONDS
+    # Every row collides with a different row on the other side: all stay raw (M3).
+    assert out == shown
+    # One removed and one added row that are the same raw line stay masked.
+    same = "sha256:deadbeef" + "0" * 56
+    assert r._mask_rows([(1, None, "-"), (None, 1, "+")], [same, same]) == ["sha256:deadbeef~"] * 2

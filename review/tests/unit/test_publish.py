@@ -20,6 +20,8 @@ from oc_review import analyze, collect, envelope, linediff, publish, verdict
 from oc_review.collect import HttpRequest, HttpResponse
 from oc_review.publish import GitHubApi, PublishContext
 
+from .bundles import size_record
+
 REPO = "OperationCode/back-end"
 API = f"/repos/{REPO}"
 REPO_ID = 42
@@ -265,7 +267,7 @@ def env_doc(kind, status="ok", payload=None, pass_name=None, **over):
 
 
 def bundle_doc(status="ok", hard_blocks=(), signals=(), files=None, title="Fix login", body="Small fix.",
-               delta=None, **over):
+               delta=None, size=None, **over):
     if status not in ("ok", "skipped-size"):
         return env_doc("bundle", status, None, **over)
     payload = {
@@ -273,11 +275,12 @@ def bundle_doc(status="ok", hard_blocks=(), signals=(), files=None, title="Fix l
         "coverage": {"complete": True, "trees_complete": True, "files_in_comparison": 1, "files_collected": 1,
                      "files": [{"path": "src/app.py", "coverage": "full", "reason": None}]},
         "dependency_delta": delta or {"changes": [], "new_global_sources": [], "failures": []},
+        "size": size_record(status, **(size or {})),
     }
     if status == "ok":
         payload["pr"] = {"number": PR, "title": title, "body": body}
-        payload["files"] = files if files is not None else [
-            {"path": "src/app.py", "old_path": None, "status": "modified",
+        payload["files"] = [{"model_view": "full", **f} for f in files] if files is not None else [
+            {"path": "src/app.py", "old_path": None, "status": "modified", "model_view": "full",
              "base_content": BASE_TEXT, "head_content": HEAD_TEXT}
         ]
     return env_doc("bundle", status, payload, **over)
@@ -439,8 +442,8 @@ def test_ignored_override_lines_are_capped_in_the_summary(tmp_path):
     comments = [override(i, AUTHOR) for i in range(10, 16)]
     r = run(tmp_path, FakeGitHub(issue_comments=comments), passes=clean_passes(security=[finding("security", "high")]))
     s = plain(r.summary)
-    assert s.count("was ignored") == publish.IGNORED_OVERRIDE_SHOWN
-    assert "3 more ignored override comment(s) are not listed." in s
+    assert s.count("was ignored") == publish.IGNORED_COMMAND_SHOWN
+    assert "3 more ignored `/oc-review` comment(s) are not listed." in s
 
 
 def test_summary_has_every_required_field(tmp_path):
@@ -1780,3 +1783,154 @@ def test_context_rejects_bad_server_url():
     with pytest.raises(collect.CollectError):
         PublishContext.from_event({**event, "pull_request": {"number": PR, "head": {"sha": HEAD}}},
                                   run_id=1, run_attempt=1)
+
+
+# ---------------------------------------------------------------- model view and size limit (P6-6)
+
+
+def view_file(path, view, reason=None):
+    f = {"path": path, "status": "modified", "model_view": view}
+    if reason is not None:
+        f["model_view_reason"] = reason
+    return f
+
+
+# Given in reverse, so the tests also check path order.
+NOT_SEEN = [view_file(f"src/m{i:02d}.py", "not-reviewed") for i in range(12, 0, -1)]
+TEN_SHOWN = ", ".join(f"`src/m{i:02d}.py`" for i in range(1, 11))
+
+
+def partial_bundle(**size):
+    return bundle_doc(files=[view_file("src/app.py", "full"), *NOT_SEEN], size={"mode": "partial", **size})
+
+
+def test_partial_review_row_callout_lines_and_record(tmp_path, capsys):
+    r = run(tmp_path, bundle=partial_bundle())
+    assert r.code == 1
+    s = plain(r.summary)
+    assert (f"| ⚠️ **Not run** | Blocks, waivable | Model passes | Partial model review. The model did not see "
+            f"12 file(s): {TEN_SHOWN} and 2 more (listed in the record). |") in s
+    assert "> **Partial review. The model did not see 12 file(s).** A maintainer can waive this." in s
+    assert ("ask a maintainer to raise the limit (`/oc-review size-limit 2x`, `3x` or `4x`) "
+            'or to waive this (under "Waiver" below).') in s
+    assert f"> Not reviewed by the model: 12 file(s): {TEN_SHOWN} and 2 more (listed in the record)." in s
+    assert "Reviewed from the diff only" not in s
+    assert has_reason(s, "partial-review", True)
+    assert f"/oc-review override {HEAD} {MB} <reason>" in s
+    assert "| Model view | partial | estimate 1,000 tokens, limit 200,000 tokens, multiplier 1x |" in s
+    assert s.count("| Not reviewed | ⚠️ not seen | ") == 12
+    out = capsys.readouterr().out
+    assert "publish: diff-only files (0): []" in out
+    assert "publish: not reviewed by the model (12): ['src/m01.py', 'src/m02.py'," in out
+
+
+def test_partial_review_with_a_blocking_finding_says_it_also_blocks(tmp_path):
+    r = run(tmp_path, bundle=partial_bundle(), passes=clean_passes(security=[finding("security", "high")]))
+    s = plain(r.summary)
+    assert "A maintainer can waive this. One high-severity security finding also blocks." in s
+
+
+def test_partial_review_waived_by_a_valid_override(tmp_path):
+    r = run(tmp_path, FakeGitHub(issue_comments=[override(1)]), bundle=partial_bundle())
+    assert r.code == 0
+    assert "| Blocks, waived | Model passes | Partial model review." in plain(r.summary)
+
+
+def test_diff_only_line_lists_only_size_limit_and_long_files(tmp_path):
+    files = [view_file("src/app.py", "diff-only", "size-limit"), view_file("big.py", "diff-only", "long-file"),
+             view_file("poetry.lock", "diff-only", "lockfile"), view_file("gone.py", "diff-only", "no-head-text")]
+    r = run(tmp_path, bundle=bundle_doc(files=files, size={"mode": "diff-only"}))
+    assert r.code == 0
+    s = plain(r.summary)
+    assert "> Reviewed from the diff only (no full file): 2 file(s): `big.py`, `src/app.py`." in s
+    assert "poetry.lock" not in s and "gone.py" not in s
+    assert "Not reviewed by the model" not in s and "[!TIP]" in s
+
+
+def test_model_view_record_rows_are_capped(tmp_path, capsys):
+    files = [view_file(f"src/d{i:02d}.py", "diff-only", "size-limit") for i in range(51)]
+    r = run(tmp_path, bundle=bundle_doc(files=files, size={"mode": "diff-only"}))
+    s = plain(r.summary)
+    assert s.count("| Diff only | ℹ️ patch only | ") == publish.MODEL_VIEW_ROWS_SHOWN
+    assert "| Diff only |  | 1 more, listed in the run log |" in s
+    assert "51 file(s): `src/d00.py`," in s and "and 41 more (listed in the record)." in s
+    assert "publish: diff-only files (51): ['src/d00.py'," in capsys.readouterr().out
+
+
+def test_raise_and_unreadable_commands_lines(tmp_path):
+    raised = {"multiplier": 2, "limit_tokens": 400_000, "raise": {"comment_id": 55, "login": MAINT, "multiplier": 2}}
+    s = plain(run(tmp_path / "a", bundle=bundle_doc(size=raised)).summary)
+    assert "> Size limit raised to 2x (400,000 tokens) by maintainer (comment 55)." in s
+    assert "multiplier 2x" in s
+    s = plain(run(tmp_path / "b", bundle=bundle_doc(size={"commands_read": False})).summary)
+    assert "> Size-limit comments could not be read, so the base limit applied." in s
+    s = plain(run(tmp_path / "c").summary)
+    assert "Size limit raised" not in s and "could not be read" not in s
+
+
+def rejected_raise(cid, login, code):
+    return {"kind": "size-limit", "comment_id": cid, "login": login, "code": code}
+
+
+def test_rejected_raises_share_the_ignored_list_with_overrides(tmp_path, capsys):
+    size = {"rejected_commands": [rejected_raise(5, "x-user", "malformed"),
+                                  rejected_raise(9, "drive-by", "no-write-permission")]}
+    gh = FakeGitHub(issue_comments=[override(7, AUTHOR)])
+    r = run(tmp_path, gh, bundle=bundle_doc(size=size), passes=clean_passes(security=[finding("security", "high")]))
+    lines = [
+        "A `/oc-review size-limit` request by x-user (comment 5) was ignored: the comment is not in the form "
+        "`/oc-review size-limit Nx` with N 2, 3 or 4.",
+        "A `/oc-review` override by contributor (comment 7) was ignored: the PR author cannot waive their own PR.",
+        "A `/oc-review size-limit` request by drive-by (comment 9) was ignored: the author does not have write "
+        "or admin access.",
+    ]
+    s = plain(r.summary)
+    assert [s.index(x) for x in lines] == sorted(s.index(x) for x in lines)
+    out = plain(capsys.readouterr().out)
+    assert all(f"publish: {x}" in out for x in lines)
+
+
+def test_ignored_list_cap_counts_raises_and_overrides(tmp_path):
+    size = {"rejected_commands": [rejected_raise(i, "drive-by", "edited") for i in (2, 4)]}
+    gh = FakeGitHub(issue_comments=[override(i, AUTHOR) for i in (1, 3)])
+    r = run(tmp_path, gh, bundle=bundle_doc(size=size), passes=clean_passes(security=[finding("security", "high")]))
+    s = plain(r.summary)
+    assert s.count("was ignored") == publish.IGNORED_COMMAND_SHOWN
+    assert "(comment 4) was ignored" not in s
+    assert "1 more ignored `/oc-review` comment(s) are not listed." in s
+
+
+def test_size_limit_comment_is_not_an_ignored_override(tmp_path, capsys):
+    gh = FakeGitHub(issue_comments=[api_comment(12, MAINT, "/oc-review size-limit 9x")])
+    r = run(tmp_path, gh, passes=clean_passes(security=[finding("security", "high")]))
+    assert "was ignored" not in r.summary
+    assert "was ignored" not in capsys.readouterr().out
+
+
+def test_json_line_has_the_size_record_and_the_estimate_ratio(tmp_path):
+    rec = run(tmp_path).record
+    assert rec["size"] == {"estimated_tokens": 1000, "limit_tokens": 200_000, "multiplier": 1, "mode": "full"}
+    review = rec["passes"]["review"]
+    assert review["input_total"] == 23_000 and review["estimate_ratio"] == 23.0
+
+
+def test_json_line_size_is_null_without_a_bundle(tmp_path):
+    rec = run(tmp_path, bundle=None).record
+    assert rec["size"] == {"estimated_tokens": None, "limit_tokens": None, "multiplier": None, "mode": None}
+    assert all(p["estimate_ratio"] is None for p in rec["passes"].values())
+
+
+@pytest.mark.parametrize("usage, estimate, expected", [
+    ({**USAGE, "iterations": 2}, 1000, (23_000, None)),  # usage spans several attempts
+    ({k: v for k, v in USAGE.items() if k != "cache_read_input_tokens"}, 1000, (None, None)),
+    (USAGE, 0, (23_000, None)),
+    (USAGE, None, (23_000, None)),
+    ({**USAGE, "input_tokens": 1}, 3, (11_001, 3667.0)),
+    ({"input_tokens": 1000, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}, 3000, (1000, 0.333)),
+])
+def test_estimate_ratio_null_rules(usage, estimate, expected):
+    info = verdict.PassInfo("review", "ok", "s", {"usage": usage})
+    result = verdict.GateResult(verdict.PASS, RUN_ID, (), (), None, (), False, (info,))
+    payload = {"size": {"estimated_tokens": estimate, "limit_tokens": 200_000, "multiplier": 1, "mode": "full"}}
+    rec = json.loads(publish._step_summary_record(CTX, result, [], None, payload))
+    assert (rec["passes"]["review"]["input_total"], rec["passes"]["review"]["estimate_ratio"]) == expected

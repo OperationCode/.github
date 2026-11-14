@@ -261,7 +261,15 @@ def test_pass_ok_payload_must_match_findings(tmp_path, good_envelope):
         read(tmp_path, data, kind="pass")
 
 
-BUNDLE_PAYLOAD = {"prefilter": {"signals": [], "hard_blocks": []}, "coverage": {}, "dependency_delta": {}}
+def size_record(mode: str, **extra) -> dict:
+    return {
+        "estimated_tokens": 1, "limit_tokens": 200_000, "base_limit_tokens": 200_000, "multiplier": 1,
+        "mode": mode, "commands_read": True, "raise": None, "rejected_commands": [], **extra,
+    }
+
+
+BUNDLE_PAYLOAD = {"prefilter": {"signals": [], "hard_blocks": []}, "coverage": {}, "dependency_delta": {}, "size": size_record("full")}
+SKIPPED_PAYLOAD = {**BUNDLE_PAYLOAD, "size": size_record("skipped", reason="too large for automatic review: x")}
 FINDINGS_PAYLOAD = {"summary": "", "findings": []}
 
 
@@ -270,7 +278,7 @@ FINDINGS_PAYLOAD = {"summary": "", "findings": []}
     [
         ("bundle", "ok", BUNDLE_PAYLOAD),
         # K-7: the size gate skips only the Claude calls; the deterministic results stay.
-        ("bundle", "skipped-size", BUNDLE_PAYLOAD),
+        ("bundle", "skipped-size", SKIPPED_PAYLOAD),
         ("bundle", "failed", None),
         ("bundle", "stale", None),
         ("pass", "ok", FINDINGS_PAYLOAD),
@@ -291,8 +299,8 @@ def test_payload_by_kind_and_status(good_envelope, kind, status, payload):
 
 
 def test_skipped_size_bundle_payload_needs_the_deterministic_results(good_envelope):
-    for key in BUNDLE_PAYLOAD:
-        payload = {k: v for k, v in BUNDLE_PAYLOAD.items() if k != key}
+    for key in SKIPPED_PAYLOAD:
+        payload = {k: v for k, v in SKIPPED_PAYLOAD.items() if k != key}
         doc = {**good_envelope, "status": "skipped-size", "payload": payload}
         with pytest.raises(EnvelopeError, match=f"'payload': \\[required\\] '{key}'"):
             envelope.validate_envelope(doc)
@@ -302,16 +310,26 @@ def test_skipped_size_bundle_payload_needs_the_deterministic_results(good_envelo
 def test_skipped_size_bundle_has_no_content_for_claude(good_envelope, key):
     # The size gate skipped the Claude calls, so the payload holds only the
     # deterministic results (K-7). Content for Claude is rejected.
-    doc = {**good_envelope, "status": "skipped-size", "payload": {**BUNDLE_PAYLOAD, key: []}}
+    doc = {**good_envelope, "status": "skipped-size", "payload": {**SKIPPED_PAYLOAD, key: []}}
     with pytest.raises(EnvelopeError, match=f"'payload': \\[enum\\] '{key}'"):
         envelope.validate_envelope(doc)
     ok = {**good_envelope, "status": "ok", "payload": {**BUNDLE_PAYLOAD, key: []}}
     envelope.validate_envelope(ok)
 
 
-def test_skipped_size_bundle_may_carry_size(good_envelope):
-    doc = {**good_envelope, "status": "skipped-size", "payload": {**BUNDLE_PAYLOAD, "size": {"estimated_tokens": 1}}}
-    envelope.validate_envelope(doc)
+def test_size_record_mode_follows_the_status(good_envelope):
+    # skipped-size needs mode `skipped` and a reason; ok never has either.
+    skipped = {**good_envelope, "status": "skipped-size", "payload": SKIPPED_PAYLOAD}
+    envelope.validate_envelope(skipped)
+    for size in (size_record("full"), size_record("skipped")):
+        with pytest.raises(EnvelopeError, match="'size'"):
+            envelope.validate_envelope({**skipped, "payload": {**SKIPPED_PAYLOAD, "size": size}})
+    ok = {**good_envelope, "status": "ok", "payload": BUNDLE_PAYLOAD}
+    for mode in ("full", "diff-only", "partial"):
+        envelope.validate_envelope({**ok, "payload": {**BUNDLE_PAYLOAD, "size": size_record(mode)}})
+    for size in (size_record("skipped"), size_record("full", reason="x")):
+        with pytest.raises(EnvelopeError, match="'size'"):
+            envelope.validate_envelope({**ok, "payload": {**BUNDLE_PAYLOAD, "size": size}})
 
 
 def test_pass_file_names():

@@ -57,7 +57,7 @@ from typing import Any
 from oc_review import collect, envelope, linediff, snapshot, verdict
 from oc_review.render import redact_text
 
-ZWSP = "​"
+ZWSP = "\u200b"
 TRUNCATED = "… \\[truncated\\]"
 
 # Fixed limits in characters, per field. Claude fields match the findings
@@ -89,7 +89,7 @@ MULTILINE = frozenset({"summary", "explanation", "quote"})
 MAX_COMBINING = 4
 
 _PUNCT = frozenset(string.punctuation)
-_LINE_BREAKS = re.compile(r"\r\n|[\r\n\x0b\x0c\x1c-\x1e\x85  ]")
+_LINE_BREAKS = re.compile(r"\r\n|[\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
 _AT_SIGNS = ("@", "＠", "﹫")  # @, fullwidth @, small @
 _DEFANG = re.compile(r"(?<=:)(?=//)|(?<=\bwww)(?=\.)|(?<=#)(?=\d)|(?<=\bgh-)(?=\d)", re.IGNORECASE)
 # GitHub links a bare commit SHA, full or short (7+ hex characters), also in
@@ -210,7 +210,6 @@ def _esc(kind: str, value: Any) -> str:
 
 REVIEW_EVENT = "COMMENT"
 WRITE_MAX_BYTES = 1024 * 1024
-PERMISSION_MAX_BYTES = 64 * 1024
 
 # The only writes the gate job makes (spec "Publishing (code)", K-1).
 _WRITE_ROUTES = (
@@ -348,7 +347,6 @@ def _next_page(resp: collect.HttpResponse, path: str) -> str | None:
 
 DEFAULT_SERVER_URL = "https://github.com"
 _SERVER_URL_RE = re.compile(r"https://[A-Za-z0-9.-]+")
-_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 # Name of the dependency-review job output that holds the step outcome (1c).
 DEPENDENCY_REVIEW_OUTPUT = "outcome"
 DIGEST_ENV = {
@@ -588,20 +586,6 @@ def check_snapshot(api: GitHubApi, ctx: PublishContext, snap: snapshot.Snapshot 
         return SnapshotRead(None, error=str(exc)[:300])
 
 
-def _parse_comments(items: Sequence[Any]) -> tuple[verdict.Comment, ...]:
-    """A comment with a bad shape is skipped: it can be neither an override
-    nor the sticky summary."""
-    out = []
-    for item in items:
-        if not isinstance(item, Mapping):
-            continue
-        try:
-            out.append(verdict.Comment.from_api(item))
-        except ValueError:
-            continue
-    return tuple(out)
-
-
 def read_timeline(api: GitHubApi, ctx: PublishContext) -> verdict.Timeline:
     """Every page of the PR timeline. A page or parse error: `complete=False`."""
     try:
@@ -616,21 +600,6 @@ def read_timeline(api: GitHubApi, ctx: PublishContext) -> verdict.Timeline:
     return verdict.Timeline(tuple(events), True)
 
 
-def read_permission(api: GitHubApi, ctx: PublishContext, login: str) -> str | None:
-    """The legacy `permission` field now; None when it cannot be read."""
-    if not _LOGIN_RE.fullmatch(login):
-        return None
-    try:
-        doc = api.get_json(
-            f"{ctx.repo_path}/collaborators/{urllib.parse.quote(login, safe='')}/permission",
-            max_bytes=PERMISSION_MAX_BYTES,
-        )
-    except collect.CollectError:
-        return None
-    perm = doc.get("permission") if isinstance(doc, Mapping) else None
-    return perm if isinstance(perm, str) else None
-
-
 def read_override_inputs(
     api: GitHubApi, ctx: PublishContext, pair: verdict.SnapshotPair | None
 ) -> tuple[verdict.OverrideInputs, tuple[verdict.Comment, ...]]:
@@ -642,7 +611,7 @@ def read_override_inputs(
     cannot be read give no override.
     """
     try:
-        comments = _parse_comments(api.get_pages(f"{ctx.repo_path}/issues/{ctx.pr_number}/comments"))
+        comments = collect.parse_comments(api.get_pages(f"{ctx.repo_path}/issues/{ctx.pr_number}/comments"))
     except collect.CollectError:
         comments = ()
     timeline = read_timeline(api, ctx)
@@ -654,7 +623,7 @@ def read_override_inputs(
             if c.rejection == verdict.OV_NO_PERMISSION
         }.values()
     )
-    permissions = {login: read_permission(api, ctx, login) for login in candidates}
+    permissions = {login: collect.read_collaborator_permission(api, ctx.repo_path, login) for login in candidates}
     return verdict.OverrideInputs(comments, timeline, permissions, ctx.pr_author), comments
 
 
@@ -1128,6 +1097,7 @@ REASON_LABELS: Mapping[str, str] = {
     verdict.R_HARD_BLOCK: "Hard block from the file checks",
     verdict.R_DEPENDENCY_REVIEW: "Dependency review did not succeed",
     verdict.R_SIZE_GATE: "Change too large for the model review",
+    verdict.R_PARTIAL_REVIEW: "Partial model review",
     verdict.R_BLOCKING_FINDING: "Blocking finding",
 }
 REASON_FALLBACK = "A required check failed"
@@ -1289,6 +1259,49 @@ def _cell(text: str) -> str:
 
 def _row(*cells: str) -> str:
     return "| " + " | ".join(_cell(c) for c in cells) + " |"
+
+
+# ---------------------------------------------------------------------------
+# Model view (spec "Model view per file", P6-6)
+# ---------------------------------------------------------------------------
+
+# Paths shown in the partial row and in each model coverage line.
+COVERAGE_PATHS_SHOWN = 10
+# Rows per model view list in the collapsed record.
+MODEL_VIEW_ROWS_SHOWN = 50
+# `diff-only` reasons that the summary lists; `lockfile` and `no-head-text`
+# depend only on the path or the status, so they apply at every size.
+_LISTED_DIFF_ONLY = frozenset({"long-file", "size-limit"})
+
+
+def _size_of(payload: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    size = payload.get("size") if payload is not None else None
+    return size if isinstance(size, Mapping) else {}
+
+
+def _view_paths(payload: Mapping[str, Any] | None, view: str) -> list[str]:
+    """Paths in path order of the files the summary lists for `view`:
+    `diff-only` with a listed reason, or `not-reviewed`."""
+    files = payload.get("files") if payload is not None else None
+    return sorted(
+        f["path"]
+        for f in (files if isinstance(files, list) else ())
+        if isinstance(f, Mapping)
+        and isinstance(f.get("path"), str)
+        and f.get("model_view") == view
+        and (view != "diff-only" or f.get("model_view_reason") in _LISTED_DIFF_ONLY)
+    )
+
+
+def _path_list(paths: Sequence[str]) -> str:
+    """At most `COVERAGE_PATHS_SHOWN` paths, each in a code span, then the count of the rest."""
+    out = ", ".join(_path_span(p) for p in paths[:COVERAGE_PATHS_SHOWN])
+    rest = len(paths) - COVERAGE_PATHS_SHOWN
+    return out + (f" and {rest} more (listed in the record)" if rest > 0 else "")
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 # ---------------------------------------------------------------------------
@@ -1481,7 +1494,9 @@ def _hard_rows(result: verdict.GateResult, payload: Mapping[str, Any] | None) ->
     return out
 
 
-def _not_run_rows(result: verdict.GateResult, facts: SummaryFacts) -> list[_Row]:
+def _not_run_rows(
+    result: verdict.GateResult, facts: SummaryFacts, payload: Mapping[str, Any] | None
+) -> list[_Row]:
     """Rows for every pass or job that did not complete, and for every other
     reason that is not a finding or a hard block. Rows with one cause show
     once: passes that failed for the same reason share a row, and the
@@ -1532,6 +1547,15 @@ def _not_run_rows(result: verdict.GateResult, facts: SummaryFacts) -> list[_Row]
             out.append(
                 _Row((1, 100 + n), NOT_RUN_CELL, effect, "Model passes",
                      "Too large for automatic review. File checks ran, model checks did not.", CODE_ROW)
+            )
+            continue
+        if r.code == verdict.R_PARTIAL_REVIEW:
+            effect = EFFECT_WAIVED if result.override_applied else EFFECT_WAIVABLE
+            paths = _view_paths(payload, "not-reviewed")
+            claim = f"Partial model review. The model did not see {len(paths)} file(s)"
+            out.append(
+                _Row((1, 100 + n), NOT_RUN_CELL, effect, "Model passes",
+                     claim + (f": {_path_list(paths)}." if paths else "."), CODE_ROW)
             )
             continue
         cell = BLOCKED_CELL if r.code in (verdict.R_STALE, verdict.R_SUPERSEDED, verdict.R_BASE_NOT_DEFAULT) else NOT_RUN_CELL
@@ -1618,7 +1642,11 @@ def _blocking_phrase(model_rows: list[_Row]) -> str:
 
 
 def _callout(
-    result: verdict.GateResult, rows: list[_Row], hard: list[_Row], has_payload: bool, facts: SummaryFacts
+    result: verdict.GateResult,
+    rows: list[_Row],
+    hard: list[_Row],
+    payload: Mapping[str, Any] | None,
+    facts: SummaryFacts,
 ) -> str:
     """The colored callout. Kind: TIP for a pass with no findings, NOTE for a
     pass with findings, CAUTION for every fail, waivable or not (ruling 1).
@@ -1653,7 +1681,7 @@ def _callout(
         if not any(p.name == name and p.status == "ok" for p in result.passes)
         and not (any(p.name == name and p.status == "skipped-size" for p in result.passes) and verdict.R_SIZE_GATE in codes)
     ]
-    if hard and has_payload:  # with no bundle the hard rows are synthetic: the author cannot fix a missing artifact
+    if hard and payload is not None:  # with no bundle the hard rows are synthetic: the author cannot fix a missing artifact
         label = hard[0].label
         if len(hard) == 1:
             first = f"**{label} blocks this PR. No waiver can clear it.**{also}"
@@ -1702,6 +1730,13 @@ def _callout(
     elif verdict.R_SIZE_GATE in codes:
         first = "**Out of range.** This change is too large for the model review. File checks ran, but model checks did not. A maintainer can waive this."
         nxt = '**Next step for the author:** split the change, or ask a maintainer for a waiver (under "Waiver" below).'
+    elif verdict.R_PARTIAL_REVIEW in codes:
+        n = len(_view_paths(payload, "not-reviewed"))
+        first = f"**Partial review. The model did not see {n} file(s).** A maintainer can waive this.{also}"
+        nxt = (
+            "**Next step for the author:** split the change, or ask a maintainer to raise the limit "
+            '(`/oc-review size-limit 2x`, `3x` or `4x`) or to waive this (under "Waiver" below).'
+        )
     else:
         phrase = _blocking_phrase(model)
         verb = "blocks" if phrase.startswith("One") else "block"
@@ -1797,30 +1832,68 @@ def _waiver_blocks(result: verdict.GateResult) -> list[_Block]:
     return _details("🔑 Waiver: how a maintainer clears this", [_Block(text)])
 
 
-IGNORED_OVERRIDE_SHOWN = 3
+IGNORED_COMMAND_SHOWN = 3
 
 
-def ignored_override_lines(result: verdict.GateResult) -> list[str]:
-    """One plain line per ignored `/oc-review` comment: the author, a link-free
-    comment id and why (`verdict.OV_REJECTION_TEXT`). Display only: the gate
+def ignored_command_lines(result: verdict.GateResult, payload: Mapping[str, Any] | None) -> list[str]:
+    """One plain line per ignored `/oc-review` comment, overrides and
+    size-limit raises (`size.rejected_commands`) in one list in comment id
+    order: the author, a link-free comment id and why. Display only: the gate
     never reads it. The author login is untrusted text, so it is escaped."""
-    return [
-        f"A `/oc-review` override by {_esc('login', c.author_login)} (comment {c.comment_id}) was ignored: "
-        f"{verdict.OV_REJECTION_TEXT[c.rejection or '']}."
+    found = [
+        (c.comment_id, f"A `/oc-review` override by {_esc('login', c.author_login)} (comment {c.comment_id}) "
+                       f"was ignored: {verdict.OV_REJECTION_TEXT[c.rejection or '']}.")
         for c in result.rejected_overrides
     ]
+    rejected = _size_of(payload).get("rejected_commands")
+    for item in rejected if isinstance(rejected, list) else ():
+        if not isinstance(item, Mapping):
+            continue
+        cid, code = _int_or_none(item.get("comment_id")), item.get("code")
+        if cid is None or code not in collect.RAISE_REJECTION_TEXT:
+            continue
+        found.append((cid, f"A `/oc-review size-limit` request by {_esc('login', item.get('login'))} "
+                           f"(comment {cid}) was ignored: {collect.RAISE_REJECTION_TEXT[code]}."))
+    return [line for _, line in sorted(found, key=lambda x: x[0])]
 
 
-def _ignored_override_blocks(result: verdict.GateResult) -> list[_Block]:
-    """Right under the callout, so a rejected override is not silent. At most
-    `IGNORED_OVERRIDE_SHOWN` lines, so comment spam cannot grow the summary."""
-    lines = ignored_override_lines(result)
+def model_coverage_lines(payload: Mapping[str, Any] | None) -> list[str]:
+    """What the model saw, under the callout, each line only when it applies
+    (spec "Model coverage lines"). Never cut; bounded by the path cap."""
+    size = _size_of(payload)
+    out = []
+    raised = size.get("raise")
+    if isinstance(raised, Mapping):
+        m, cid, limit = (_int_or_none(v) for v in (raised.get("multiplier"), raised.get("comment_id"),
+                                                    size.get("limit_tokens")))
+        tokens = f"{limit:,} tokens" if limit is not None else "limit not recorded"
+        out.append(f"Size limit raised to {m}x ({tokens}) by {_esc('login', raised.get('login'))} (comment {cid}).")
+    if size.get("commands_read") is False:
+        out.append("Size-limit comments could not be read, so the base limit applied.")
+    diff_only = _view_paths(payload, "diff-only")
+    if diff_only:
+        out.append(f"Reviewed from the diff only (no full file): {len(diff_only)} file(s): {_path_list(diff_only)}.")
+    not_seen = _view_paths(payload, "not-reviewed")
+    if not_seen:
+        out.append(f"Not reviewed by the model: {len(not_seen)} file(s): {_path_list(not_seen)}.")
+    return out
+
+
+def _quote_blocks(lines: Sequence[str]) -> list[_Block]:
+    """Lines as one never-cut block quote of separate paragraphs."""
     if not lines:
         return []
-    shown = lines[:IGNORED_OVERRIDE_SHOWN]
+    return [_Block("\n" + "\n\n".join(f"> {x}" for x in lines).replace("\n\n> ", "\n>\n> "))]
+
+
+def _ignored_command_blocks(result: verdict.GateResult, payload: Mapping[str, Any] | None) -> list[_Block]:
+    """Right under the callout, so a rejected command is not silent. At most
+    `IGNORED_COMMAND_SHOWN` lines, so comment spam cannot grow the summary."""
+    lines = ignored_command_lines(result, payload)
+    shown = lines[:IGNORED_COMMAND_SHOWN]
     if len(lines) > len(shown):
-        shown.append(f"{len(lines) - len(shown)} more ignored override comment(s) are not listed.")
-    return [_Block("\n" + "\n\n".join(f"> {x}" for x in shown).replace("\n\n> ", "\n>\n> "))]
+        shown.append(f"{len(lines) - len(shown)} more ignored `/oc-review` comment(s) are not listed.")
+    return _quote_blocks(shown)
 
 
 def _title(text: str) -> _Block:
@@ -1981,6 +2054,7 @@ def _check_table_blocks(
                 out.append(
                     _Block(_row("Unavailable file", "⚠️ unavailable", f"{_path_span(f.get('path'))}: {_esc('reason', f.get('reason'))}"))
                 )
+    out += _model_view_blocks(payload)
     has_delta = bool(_delta_blocks(payload.get("dependency_delta")))
     out.append(_Block(_row("Dependency changes", "ℹ️ listed below" if has_delta else "✅ none", "")))
     setting = facts.dependency_graph_off and _dependency_failed(result)
@@ -1993,6 +2067,27 @@ def _check_table_blocks(
             )
         )
     )
+    return out
+
+
+def _model_view_blocks(payload: Mapping[str, Any]) -> list[_Block]:
+    """The "Model view" row (size mode, estimate, limit, multiplier), then one
+    row per listed `diff-only` file and per `not-reviewed` file, at most
+    `MODEL_VIEW_ROWS_SHOWN` each and a count of the rest. Never cut."""
+    size = _size_of(payload)
+    if not size:
+        return []
+    nums = []
+    for k, label in (("estimated_tokens", "estimate"), ("limit_tokens", "limit")):
+        v = _int_or_none(size.get(k))
+        nums.append(f"{label} {v:,} tokens" if v is not None else f"{label} not recorded")
+    nums.append(f"multiplier {_esc('label', size.get('multiplier'))}x")
+    out = [_Block(_row("Model view", _esc("label", size.get("mode")), ", ".join(nums)))]
+    for view, label, mark in (("diff-only", "Diff only", "ℹ️ patch only"), ("not-reviewed", "Not reviewed", "⚠️ not seen")):
+        paths = _view_paths(payload, view)
+        out += [_Block(_row(label, mark, _path_span(p))) for p in paths[:MODEL_VIEW_ROWS_SHOWN]]
+        if len(paths) > MODEL_VIEW_ROWS_SHOWN:
+            out.append(_Block(_row(label, "", f"{len(paths) - MODEL_VIEW_ROWS_SHOWN} more, listed in the run log")))
     return out
 
 
@@ -2247,15 +2342,16 @@ def _summary_blocks(
 ) -> list[_Block]:
     hard = _hard_rows(result, payload)
     rows = sorted(
-        [*hard, *_not_run_rows(result, facts), *_merge_findings(result, inline)],
+        [*hard, *_not_run_rows(result, facts, payload), *_merge_findings(result, inline)],
         key=lambda r: r.sort,
     )
     model = _model_rows(rows)
     b = [
         _Block(verdict.STICKY_MARKER),
         _Block(_status_heading(result, model, rows) + "\n" + MISSION_LINE),
-        _Block("\n" + _callout(result, rows, hard, payload is not None, facts)),
-        *_ignored_override_blocks(result),
+        _Block("\n" + _callout(result, rows, hard, payload, facts)),
+        *_quote_blocks(model_coverage_lines(payload)),
+        *_ignored_command_blocks(result, payload),
     ]
     # The signing row is informational: it is not in the heading count or the callout.
     b += _findings_table([*rows, *_signing_row(facts)])
@@ -2330,27 +2426,64 @@ def _render_fit(
     return RenderedSummary(body, cut)
 
 
+SIZE_MODES = frozenset({"full", "diff-only", "partial", "skipped"})
+_INPUT_FIELDS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def _size_log(size: Mapping[str, Any]) -> dict[str, Any]:
+    """The bundle's size record for the JSON line; each key null when not recorded."""
+    mode = size.get("mode")
+    return {
+        "estimated_tokens": _int_or_none(size.get("estimated_tokens")),
+        "limit_tokens": _int_or_none(size.get("limit_tokens")),
+        "multiplier": _int_or_none(size.get("multiplier")),
+        "mode": mode if isinstance(mode, str) and mode in SIZE_MODES else None,
+    }
+
+
+def _input_ratio(usage: Mapping[str, int], estimated: int | None) -> tuple[int | None, float | None]:
+    """(input_total, estimate_ratio) of one pass. The ratio is null when
+    either is missing, the estimate is 0, or the usage spans several attempts."""
+    if any(k not in usage for k in _INPUT_FIELDS):
+        return None, None
+    total = sum(usage[k] for k in _INPUT_FIELDS)
+    if not estimated or usage.get("iterations", 1) > 1:
+        return total, None
+    return total, round(total / estimated, 3)
+
+
 def _step_summary_record(
-    ctx: PublishContext, result: verdict.GateResult | None, codes: Sequence[str], publish_error: str | None = None
+    ctx: PublishContext,
+    result: verdict.GateResult | None,
+    codes: Sequence[str],
+    publish_error: str | None = None,
+    payload: Mapping[str, Any] | None = None,
 ) -> str:
-    """One JSON line: run, result, reason codes and token counts per pass (D6).
-    Only integers and fixed names, so no fence escape is needed. A failed
+    """One JSON line: run, result, reason codes, the size record and token
+    counts per pass, with the estimate next to the real input (D6, P6-6).
+    Only numbers and fixed names, so no fence escape is needed. A failed
     publication makes the result `fail` and adds `publish_error`. A stale
     run (`stale` in the codes) is `fail` too: stale is never waivable, and an
     early stale exit can hold a gate result computed before the run went stale."""
+    size = _size_log(_size_of(payload))
     passes: dict[str, Any] = {}
     for info in result.passes if result is not None else ():
         model = info.meta.get("model")
+        usage = _usage_numbers(info.meta)
+        input_total, ratio = _input_ratio(usage, size["estimated_tokens"])
         passes[info.name] = {
             "status": info.status,
             "model": re.sub(r"[^A-Za-z0-9._:-]", "", model)[:100] if isinstance(model, str) else None,
-            "usage": _usage_numbers(info.meta),
+            "usage": usage,
+            "input_total": input_total,
+            "estimate_ratio": ratio,
         }
     record: dict[str, Any] = {
         "run_id": ctx.run_id,
         "run_attempt": ctx.run_attempt,
         "result": verdict.FAIL if result is None or publish_error is not None or verdict.R_STALE in codes else result.status,
         "reasons": sorted(set(codes)),
+        "size": size,
         "passes": passes,
     }
     if publish_error is not None:
@@ -2450,13 +2583,15 @@ def append_step_summary(
     codes: Sequence[str] = (),
     full: str | None = None,
     publish_error: str | None = None,
+    payload: Mapping[str, Any] | None = None,
 ) -> None:
     """Append the JSON line (spec "Cost reporting": token counts, no currency),
-    and the full record when the summary was cut and it fits under the cap."""
+    and the full record when the summary was cut and it fits under the cap.
+    `payload` is the valid bundle payload, for the size record."""
     if not path:
         return
     codes = list(codes) or ([r.code for r in result.reasons] if result is not None else [])
-    parts = ["oc-claude-review record:", _fence(_step_summary_record(ctx, result, codes, publish_error))]
+    parts = ["oc-claude-review record:", _fence(_step_summary_record(ctx, result, codes, publish_error, payload))]
     if full is not None and len(full) <= STEP_SUMMARY_FULL_MAX:
         parts += ["Full record (the summary comment was cut):", _fence(full)]
     elif full is not None:
@@ -2560,6 +2695,11 @@ def publish(
 ) -> int:
     """The gate job. Returns the exit code: 0 only for `pass`."""
     bundle_read, pass_reads = load_artifacts(data_dir, digests)
+    payload = _payload(bundle_read)
+    # The job log always has both full model view lists (repr: one line each).
+    diff_only, not_seen = _view_paths(payload, "diff-only"), _view_paths(payload, "not-reviewed")
+    print(f"publish: diff-only files ({len(diff_only)}): {diff_only!r}")
+    print(f"publish: not reviewed by the model ({len(not_seen)}): {not_seen!r}")
     snap = bundle_snapshot(bundle_read)
     pair = verdict.SnapshotPair(snap.head_sha, snap.merge_base_sha, snap.base_ref) if snap else None
     head_sha = snap.head_sha if snap else ctx.head_sha
@@ -2567,7 +2707,7 @@ def publish(
     check = check_snapshot(api, ctx, snap)
     if check.blocks_writes:
         print(f"publish: {check.describe()}; nothing written", file=sys.stderr)
-        append_step_summary(step_summary, ctx, None, codes=[verdict.R_STALE])
+        append_step_summary(step_summary, ctx, None, codes=[verdict.R_STALE], payload=payload)
         return 1
     overrides, comments = read_override_inputs(api, ctx, pair)
     files = bundle_files(bundle_read)
@@ -2586,13 +2726,13 @@ def publish(
     )
     if _artifact_stale(result):
         print("publish: the run is stale; nothing written", file=sys.stderr)
-        append_step_summary(step_summary, ctx, result)
+        append_step_summary(step_summary, ctx, result, payload=payload)
         return 1
 
     # a) inline review
     inline = post_inline_review(api, ctx, result, files, head_sha, snap)
     if inline is None:
-        append_step_summary(step_summary, ctx, result, codes=[*result.codes, verdict.R_STALE])
+        append_step_summary(step_summary, ctx, result, codes=[*result.codes, verdict.R_STALE], payload=payload)
         return 1
 
     # b) sticky summary. The display-only reads come first, so the snapshot
@@ -2601,7 +2741,7 @@ def publish(
     check = check_snapshot(api, ctx, snap)
     if check.blocks_writes:
         print(f"publish: {check.describe()} before the summary; no more writes", file=sys.stderr)
-        append_step_summary(step_summary, ctx, result, codes=[*result.codes, verdict.R_STALE])
+        append_step_summary(step_summary, ctx, result, codes=[*result.codes, verdict.R_STALE], payload=payload)
         return 1
     bundle_doc = bundle_read.envelope if bundle_read.error is None else None
     summary = render_summary(ctx, result, bundle=bundle_doc, inline=inline, facts=facts)
@@ -2626,7 +2766,8 @@ def publish(
     if check.blocks_writes:
         print(f"publish: {check.describe()} at the final check; no sticky update", file=sys.stderr)
         append_step_summary(
-            step_summary, ctx, final, codes=[*final.codes, verdict.R_STALE], full=full, publish_error=publish_error
+            step_summary, ctx, final, codes=[*final.codes, verdict.R_STALE], full=full, publish_error=publish_error,
+            payload=payload,
         )
         return 1
     if result.passed and not final.passed:
@@ -2637,7 +2778,8 @@ def publish(
         if check.blocks_writes:
             print(f"publish: {check.describe()} before the summary update; no more writes", file=sys.stderr)
             append_step_summary(
-                step_summary, ctx, final, codes=[*final.codes, verdict.R_STALE], full=full, publish_error=publish_error
+                step_summary, ctx, final, codes=[*final.codes, verdict.R_STALE], full=full, publish_error=publish_error,
+                payload=payload,
             )
             return 1
         if summary.cut:
@@ -2651,9 +2793,9 @@ def publish(
             full = None
 
     # d) exit code
-    append_step_summary(step_summary, ctx, final, full=full, publish_error=publish_error)
+    append_step_summary(step_summary, ctx, final, full=full, publish_error=publish_error, payload=payload)
     print(f"publish: result {final.status}, reasons {', '.join(sorted(final.codes)) or 'none'}")
-    for line in ignored_override_lines(final):
+    for line in ignored_command_lines(final, payload):
         print(f"publish: {line}")
     if publish_error is not None:
         print(f"publish: {publish_error}; the run fails", file=sys.stderr)

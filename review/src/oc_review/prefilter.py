@@ -113,13 +113,13 @@ FIRST_TIME_AUTHOR = "first-time-contributor"
 # --- character classes ------------------------------------------------------
 
 # Spec: U+202A to U+202E and U+2066 to U+2069 (Trojan Source).
-_BIDI_RE = re.compile("[‪-‮⁦-⁩]")
+_BIDI_RE = re.compile("[\u202a-\u202e\u2066-\u2069]")
 # Spec: U+200B to U+200D, U+2060, U+FEFF (FEFF allowed at file start only).
-_ZERO_WIDTH_RE = re.compile("[​-‍⁠﻿]")
+_ZERO_WIDTH_RE = re.compile("[\u200b-\u200d\u2060\ufeff]")
 # Coordinator-approved addition (see report "Spec follow-up"): invisible
 # characters the zero-width row misses. FE00-FE0F are left out: emoji use them.
 _INVISIBLE_RE = re.compile(
-    "[­͏؜ᅟᅠ᠎‎‏⁡-⁤ㅤﾠ"
+    "[\u00ad͏\u061cᅟᅠ\u180e\u200e\u200f\u2061-\u2064ㅤﾠ"
     "\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
 )
 
@@ -294,6 +294,7 @@ class DependencyFacts:
     - `base_failures`: changed supported files whose merge-base side does not
       parse or has an unknown version. That side counts as empty, so every
       head entry is in `changes`. A signal only (ruling R-BASEDEPS).
+    - `removed`: names the parsed base has and the head does not (P6-6).
     """
 
     parsed_paths: frozenset[str] = frozenset()
@@ -302,6 +303,8 @@ class DependencyFacts:
     registry: Mapping[tuple[str, str, str], deps.RegistryInfo] = field(default_factory=dict)
     failures: Sequence[DepFailure] = ()
     base_failures: Sequence[DepFailure] = ()
+    # deps.compute_removed rows: context for Claude only, no check reads them.
+    removed: Sequence[deps.RemovedPackage] = ()
 
 
 @dataclass(frozen=True)
@@ -650,7 +653,7 @@ def _check_text(out: _Results, path: str, head: _Lines, added: list[int]) -> Non
         )
 
     # Zero-width characters in changed lines (U+FEFF at file start is a BOM).
-    zw = [m for m in _ZERO_WIDTH_RE.finditer(text) if not (m.start() == 0 and m.group() == "﻿")]
+    zw = [m for m in _ZERO_WIDTH_RE.finditer(text) if not (m.start() == 0 and m.group() == "\ufeff")]
     zw_lines = [n for m in zw if (n := head.line_of(m.start())) in added_set]
     if zw_lines:
         chars = [m.group() for m in zw if head.line_of(m.start()) in added_set]

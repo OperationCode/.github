@@ -37,9 +37,10 @@
         "binary": false,
         "size": 540,
         "coverage": "full",
+        "model_view": "diff-only",
+        "model_view_reason": "lockfile",
         "patch": "@@ -14,6 +14,10 @@\n     \"node_modules/left-pad\": {\n       \"version\": \"1.3.0\",\n       \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"\n+    },\n+    \"node_modules/is-odd\": {\n+      \"version\": \"3.0.1\",\n+      \"resolved\": \"git+https://github.com/attacker/is-odd.git#0123456789abcdef0123456789abcdef01234567\"\n     }\n   }\n }\n",
         "patch_redaction": "blob-context",
-        "content": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"lockfileVersion\": 3,\n  \"requires\": true,\n  \"packages\": {\n    \"\": {\n      \"name\": \"demo\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": {\n        \"left-pad\": \"^1.3.0\"\n      }\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"\n    },\n    \"node_modules/is-odd\": {\n      \"version\": \"3.0.1\",\n      \"resolved\": \"git+https://github.com/attacker/is-odd.git#0123456789abcdef0123456789abcdef01234567\"\n    }\n  }\n}\n",
         "head_content": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"lockfileVersion\": 3,\n  \"requires\": true,\n  \"packages\": {\n    \"\": {\n      \"name\": \"demo\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": {\n        \"left-pad\": \"^1.3.0\"\n      }\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"\n    },\n    \"node_modules/is-odd\": {\n      \"version\": \"3.0.1\",\n      \"resolved\": \"git+https://github.com/attacker/is-odd.git#0123456789abcdef0123456789abcdef01234567\"\n    }\n  }\n}\n",
         "base_content": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\",\n  \"lockfileVersion\": 3,\n  \"requires\": true,\n  \"packages\": {\n    \"\": {\n      \"name\": \"demo\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": {\n        \"left-pad\": \"^1.3.0\"\n      }\n    },\n    \"node_modules/left-pad\": {\n      \"version\": \"1.3.0\",\n      \"resolved\": \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"\n    }\n  }\n}\n"
       }
@@ -63,6 +64,7 @@
           "registry": null
         }
       ],
+      "removed": [],
       "new_global_sources": [],
       "failures": []
     },
@@ -94,8 +96,14 @@
       "complete": true
     },
     "size": {
-      "estimated_tokens": 868,
-      "limit_tokens": 150000
+      "estimated_tokens": 1688,
+      "limit_tokens": 200000,
+      "base_limit_tokens": 200000,
+      "multiplier": 1,
+      "mode": "full",
+      "commands_read": true,
+      "raise": null,
+      "rejected_commands": []
     }
   }
 }

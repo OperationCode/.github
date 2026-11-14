@@ -37,6 +37,7 @@
         "binary": false,
         "size": 469,
         "coverage": "full",
+        "model_view": "full",
         "patch": "@@ -11,11 +11,8 @@\n   if (!invoice) {\n     return res.status(404).json({ error: \"not found\" });\n   }\n-  if (invoice.ownerId !== req.user.id && !req.user.isAdmin) {\n-    return res.status(403).json({ error: \"forbidden\" });\n-  }\n   await db.invoices.remove(invoice.id);\n-  return res.status(200).json({ deleted: invoice.id });\n+  return res.status(204).end();\n });\n \n module.exports = router;\n",
         "patch_redaction": "blob-context",
         "content": "\"use strict\";\n\nconst express = require(\"express\");\nconst db = require(\"../db\");\nconst { requireLogin } = require(\"../auth\");\n\nconst router = express.Router();\n\nrouter.delete(\"/invoices/:id\", requireLogin, async (req, res) => {\n  const invoice = await db.invoices.findById(req.params.id);\n  if (!invoice) {\n    return res.status(404).json({ error: \"not found\" });\n  }\n  await db.invoices.remove(invoice.id);\n  return res.status(204).end();\n});\n\nmodule.exports = router;\n",
@@ -46,6 +47,7 @@
     ],
     "dependency_delta": {
       "changes": [],
+      "removed": [],
       "new_global_sources": [],
       "failures": []
     },
@@ -67,8 +69,14 @@
       "complete": true
     },
     "size": {
-      "estimated_tokens": 709,
-      "limit_tokens": 150000
+      "estimated_tokens": 1703,
+      "limit_tokens": 200000,
+      "base_limit_tokens": 200000,
+      "multiplier": 1,
+      "mode": "full",
+      "commands_read": true,
+      "raise": null,
+      "rejected_commands": []
     }
   }
 }

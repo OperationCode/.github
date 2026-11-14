@@ -9,7 +9,8 @@ repo's git API, which also serves fork head objects (V18):
     -> merge base from compare `base_tip...head`, once
     -> recursive trees of merge base and head -> changed files in code
     -> blobs by SHA -> deps.py delta and registry lookups
-    -> prefilter.py -> patches (render.redact_patch) -> size gate -> envelope
+    -> prefilter.py -> patches (render.redact_patch) -> size-limit commands
+    -> size limit (full, diff-only, partial or skipped) -> envelope
 
 Rules this module keeps:
 
@@ -21,7 +22,12 @@ Rules this module keeps:
 - The bundle carries `head_content` and `base_content` (raw blob text of each
   text side) for the citation check in verdict.py only; render never sends
   them to Claude. Claude gets the head text in `content`, for text files under
-  2,000 lines, and every changed line in the patch.
+  2,000 lines that are not lockfiles, and every changed line in the patch.
+  `files[].model_view` says what Claude sees of each file.
+- Over the size limit, collect first drops `content` (order (a)), then
+  chooses whole patches (order (b)); it never cuts inside a patch (spec
+  "Size limit"). A maintainer can raise the limit with a PR comment
+  (`/oc-review size-limit Nx`, spec "Size-limit raise command").
 - A `skipped-size` bundle keeps the prefilter result, the coverage record and
   the dependency delta (K-7). The producer digest is the SHA-256 of the exact
   envelope file bytes (K-5).
@@ -30,9 +36,9 @@ Rules this module keeps:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import http.client
 import json
-import math
 import os
 import re
 import sys
@@ -47,7 +53,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from oc_review import deps, envelope, linediff, prefilter, render
+from oc_review import deps, envelope, linediff, prefilter, render, verdict
 from oc_review.snapshot import (
     MODE_SUBMODULE,
     MODE_SYMLINK,
@@ -117,10 +123,44 @@ _LOOKUP_REASON_ORDER = (
     LOOKUP_FAILED,
 )
 
-SIZE_GATE_TOKENS = 150_000
-CHARS_PER_TOKEN = 4
+# Size limit (spec "Size limit", P6-6). The estimate is in real tokens:
+# ceil(chars x 10 / 17), chars / 1.7, the top of the measured range.
+ESTIMATE_CHARS_PER_TOKEN_X10 = 17
+SIZE_LIMIT_BASE_TOKENS = 200_000
 SIZE_ESTIMATE_ROUNDS = 10
 SIZE_GATE_REASON = "too large for automatic review"
+
+# Path tiers of the size-limit orders. Matching ignores case. A file that runs
+# on import, build or test is never in the tests or docs tier.
+RUNS_ON_LOAD_NAMES = frozenset({
+    "conftest.py", "__init__.py", "setup.py", "setup.cfg", "noxfile.py", "tasks.py", "fabfile.py",
+    "pytest.ini", "tox.ini", "package.json", "pyproject.toml",
+})
+RUNS_ON_LOAD_PATTERNS = (
+    "*.config.js", "*.config.cjs", "*.config.mjs", "*.config.ts",
+    "*.conf.js", "*.conf.cjs", "*.conf.mjs", "*.conf.ts",
+    ".babelrc*", ".mocharc*", "jest.setup.*", "vitest.setup.*", "setuptests.*",
+)
+TEST_DIRS = frozenset({
+    "test", "tests", "__tests__", "spec", "specs", "fixtures", "__fixtures__", "testdata",
+    "__snapshots__", "__mocks__",
+})
+TEST_NAME_PATTERNS = ("test_*.py", "*_test.py", "*_test.go", "*.test.*", "*.spec.*")
+# `.mdx` is not docs: it compiles to code.
+DOC_SUFFIXES = (".md", ".markdown", ".rst", ".adoc", ".txt")
+
+# Size-limit raise command (spec "Size-limit raise command").
+RAISE_MALFORMED = "malformed"
+RAISE_EDITED = "edited"
+RAISE_NO_WRITE_PERMISSION = "no-write-permission"
+RAISE_REJECTION_TEXT = {
+    RAISE_MALFORMED: "the comment is not in the form `/oc-review size-limit Nx` with N 2, 3 or 4",
+    RAISE_EDITED: "the comment was edited after it was posted",
+    RAISE_NO_WRITE_PERMISSION: "the author does not have write or admin access",
+}
+_RAISE_RE = re.compile(r"/oc-review size-limit ([234])x")
+PERMISSION_MAX_BYTES = 64 * 1024
+_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 
 SCHEMA_VERSION = 1
 BUNDLE_FILE_NAME = "bundle.json"
@@ -858,9 +898,12 @@ def dependency_facts(
     A rename to another dependency family ignores the base, so the base is
     not parsed. A key with no registry data (`lookup_registry`: failed, over
     the count cap or past the time budget) is a `DepFailure` for its file.
+    A file with a parsed head and a parsed base of its family also gets
+    `removed` rows (deps.compute_removed); an empty base gets none.
     """
     parsed: set[str] = set()
     changes: list[deps.PackageChange] = []
+    removed: list[deps.RemovedPackage] = []
     new_sources: list[deps.SourceIssue] = []
     failures: list[prefilter.DepFailure] = []
     base_failures: list[prefilter.DepFailure] = []
@@ -899,6 +942,8 @@ def dependency_facts(
         if new is None:
             continue
         changes.extend(deps.compute_delta(old, new))
+        if old is not None:
+            removed.extend(deps.compute_removed(old, new))
         old_sources = {s.normalized for s in old.global_sources} if old is not None else set()
         new_sources.extend(
             deps.SourceIssue(c.path, None, None, s) for s in new.global_sources if s.normalized not in old_sources
@@ -931,6 +976,7 @@ def dependency_facts(
         registry=registry,
         failures=tuple(failures),
         base_failures=tuple(base_failures),
+        removed=tuple(removed),
     )
 
 
@@ -961,6 +1007,7 @@ def _delta_payload(facts: prefilter.DependencyFacts) -> dict[str, Any]:
             }
             for ch in facts.changes
         ],
+        "removed": [asdict(r) | {"old_versions": list(r.old_versions)} for r in facts.removed],
         "new_global_sources": [{"path": s.path, "source": asdict(s.source)} for s in facts.new_global_sources],
         "failures": [asdict(f) for f in facts.failures],
     }
@@ -1027,6 +1074,7 @@ def _file_entry(
         entry["submodule"] = True
     if change.is_symlink:
         entry["symlink"] = True
+    entry["model_view"] = "no-text"
     if cov.coverage == "unavailable":
         return entry
     base_text = base.text if base is not None and base.kind == "full" else None
@@ -1035,6 +1083,19 @@ def _file_entry(
         # Binary blobs or gitlinks only: listed with size and SHA.
         entry["binary"] = cov.coverage == "binary"
         return entry
+    lockfile = deps.is_lockfile_path(change.path) or (
+        change.old_path is not None and deps.is_lockfile_path(change.old_path)
+    )
+    # A lockfile never sends `content`, at any length (spec "Lockfiles in the
+    # bundle"): its hash-masked patch and the dependency delta stand in.
+    if lockfile:
+        entry["model_view"], entry["model_view_reason"] = "diff-only", "lockfile"
+    elif head_text is None:
+        entry["model_view"], entry["model_view_reason"] = "diff-only", "no-head-text"
+    elif len(_git_lines(head_text)[0]) >= render.MAX_HEAD_CONTENT_LINES:
+        entry["model_view"], entry["model_view_reason"] = "diff-only", "long-file"
+    else:
+        entry["model_view"] = "full"
     # Each text side counts on its own. Opposite a gitlink or a binary blob,
     # the patch adds every head line or removes every base line, so a type
     # change never hides text from Claude or from the citation check.
@@ -1044,14 +1105,14 @@ def _file_entry(
         shape = "parts past a limit are one hunk" if coarse.startswith(linediff.ANCHORED) else "the patch is one hunk for the changed middle"
         print(f"collect: {change.path!r}: {coarse}; {shape}", file=sys.stderr)
     try:
-        entry["patch"] = render.redact_patch(patch, base_text, head_text)
+        entry["patch"] = render.redact_patch(patch, base_text, head_text, lockfile=lockfile)
     except render.RenderError as exc:
         raise CollectError(f"patch redaction failed: {exc}") from exc
     entry["patch_redaction"] = render.PATCH_REDACTION
     entry["additions"], entry["deletions"] = adds, dels
+    if entry["model_view"] == "full":
+        entry["content"] = head_text
     if head_text is not None:
-        if len(_git_lines(head_text)[0]) < render.MAX_HEAD_CONTENT_LINES:
-            entry["content"] = head_text
         entry["head_content"] = head_text
     if base_text is not None:
         entry["base_content"] = base_text
@@ -1070,13 +1131,233 @@ def _changed_files_signal(pr: Mapping[str, Any], diff: TreeDiff) -> dict[str, An
     return {**asdict(check), "lines": list(check.lines)}
 
 
-def estimate_tokens(bundle_envelope: Mapping[str, Any]) -> int:
-    """Estimated input tokens of what Claude sees: rendered characters / 4."""
+def tokens_for_chars(chars: int) -> int:
+    """Estimated real tokens of `chars` rendered characters: ceil(chars x 10 / 17)."""
+    return -(-chars * 10 // ESTIMATE_CHARS_PER_TOKEN_X10)
+
+
+def _rendered_chars(bundle_envelope: Mapping[str, Any]) -> int:
     try:
-        text = render.render_bundle(bundle_envelope).text
+        return len(render.render_bundle(bundle_envelope).text)
     except render.RenderError as exc:
         raise CollectError(f"bundle does not render: {exc}") from exc
-    return math.ceil(len(text) / CHARS_PER_TOKEN)
+
+
+def estimate_tokens(bundle_envelope: Mapping[str, Any]) -> int:
+    """Estimated input tokens of what Claude sees, from the rendered text."""
+    return tokens_for_chars(_rendered_chars(bundle_envelope))
+
+
+# ---------------------------------------------------------------------------
+# Size-limit raise command
+# ---------------------------------------------------------------------------
+
+
+def parse_comments(items: Sequence[Any]) -> tuple[verdict.Comment, ...]:
+    """Issue comments of the REST API. A comment with a bad shape is skipped:
+    it can be neither a command nor the sticky summary."""
+    out = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            out.append(verdict.Comment.from_api(item))
+        except ValueError:
+            continue
+    return tuple(out)
+
+
+def read_collaborator_permission(client: GitHubClient, repo_path: str, login: str) -> str | None:
+    """The legacy `permission` field of the collaborator permission endpoint,
+    read now; None when it cannot be read."""
+    if not _LOGIN_RE.fullmatch(login):
+        return None
+    try:
+        doc = client.get_json(
+            f"{repo_path}/collaborators/{urllib.parse.quote(login, safe='')}/permission",
+            max_bytes=PERMISSION_MAX_BYTES,
+        )
+    except CollectError:
+        return None
+    perm = doc.get("permission") if isinstance(doc, Mapping) else None
+    return perm if isinstance(perm, str) else None
+
+
+@dataclass(frozen=True)
+class SizeCommands:
+    """What collect read of the `/oc-review size-limit Nx` comments."""
+
+    multiplier: int
+    raise_: dict[str, Any] | None  # {comment_id, login, multiplier} of the raise in use
+    rejected: list[dict[str, Any]]  # {kind, comment_id, login, code}, in comment id order
+    commands_read: bool
+
+
+def evaluate_size_commands(
+    comments: Sequence[verdict.Comment], permission: Callable[[str], str | None]
+) -> SizeCommands:
+    """Checks in order: a bot comment is skipped; `malformed`; `edited`;
+    `no-write-permission` (read once per login, only for comments that pass
+    the others). The newest valid raise by (created_at, id) sets the
+    multiplier; a rejected raise never cancels a valid one."""
+    perms: dict[str, str | None] = {}
+    valid: list[tuple[verdict.Comment, int]] = []
+    rejected: list[dict[str, Any]] = []
+    for cm in sorted(comments, key=lambda x: x.id):
+        if cm.author_login.lower() == verdict.BOT_LOGIN.lower() or cm.author_type == "Bot":
+            continue
+        if not verdict.is_size_limit_command(cm.body):
+            continue
+        m = _RAISE_RE.fullmatch(cm.body.strip())
+        if m is None:
+            code = RAISE_MALFORMED
+        elif cm.updated_at != cm.created_at:
+            code = RAISE_EDITED
+        else:
+            key = cm.author_login.lower()
+            if key not in perms:
+                perms[key] = permission(cm.author_login)
+            if perms[key] in verdict.OVERRIDE_PERMISSIONS:
+                valid.append((cm, int(m.group(1))))
+                continue
+            code = RAISE_NO_WRITE_PERMISSION
+        # The schema bounds a login; a comment id below 1 cannot be listed either.
+        if 1 <= len(cm.author_login) <= 100 and cm.id >= 1:
+            rejected.append({"kind": "size-limit", "comment_id": cm.id, "login": cm.author_login, "code": code})
+    if not valid:
+        return SizeCommands(1, None, rejected, True)
+    newest, n = max(valid, key=lambda v: (v[0].created_at, v[0].id))
+    return SizeCommands(n, {"comment_id": newest.id, "login": newest.author_login, "multiplier": n}, rejected, True)
+
+
+def read_size_commands(client: GitHubClient, repo_path: str, pr_number: int) -> SizeCommands:
+    """Every page of the PR's issue comments, then `evaluate_size_commands`.
+    Comments that cannot be read completely give the base limit and
+    `commands_read: false`; the run does not fail for it."""
+    try:
+        comments = parse_comments(client.get_pages(f"{repo_path}/issues/{pr_number}/comments"))
+    except CollectError:
+        return SizeCommands(1, None, [], False)
+    return evaluate_size_commands(comments, lambda login: read_collaborator_permission(client, repo_path, login))
+
+
+# ---------------------------------------------------------------------------
+# Size limit: path tiers and the two orders
+# ---------------------------------------------------------------------------
+
+
+def _lower_parts(path: str) -> tuple[list[str], str]:
+    parts = path.lower().split("/")
+    return parts[:-1], parts[-1]
+
+
+def is_runs_on_load(path: str) -> bool:
+    _, name = _lower_parts(path)
+    return name in RUNS_ON_LOAD_NAMES or any(fnmatch.fnmatchcase(name, p) for p in RUNS_ON_LOAD_PATTERNS)
+
+
+def is_sensitive_path(path: str) -> bool:
+    """Order (b) tier 1: prefilter's sensitive paths, or runs on load."""
+    return prefilter._sensitive_path(path) is not None or is_runs_on_load(path)
+
+
+def is_dependency_path(path: str) -> bool:
+    low = path.lower()
+    return deps.family_for_path(low) is not None or deps.is_unsupported_dep_file(low)
+
+
+def _never_tests_or_docs(path: str) -> bool:
+    return is_runs_on_load(path) or is_dependency_path(path) or prefilter._sensitive_path(path) is not None
+
+
+def is_test_path(path: str) -> bool:
+    if _never_tests_or_docs(path):
+        return False
+    dirs, name = _lower_parts(path)
+    return any(d in TEST_DIRS for d in dirs) or any(fnmatch.fnmatchcase(name, p) for p in TEST_NAME_PATTERNS)
+
+
+def is_doc_path(path: str) -> bool:
+    if _never_tests_or_docs(path) or is_test_path(path):
+        return False
+    return _lower_parts(path)[1].endswith(DOC_SUFFIXES)
+
+
+def content_drop_tier(f: Mapping[str, Any]) -> int:
+    """Order (a): 1 added, 2 docs, 3 tests and fixtures, 4 every other file."""
+    if f.get("status") == "added":
+        return 1
+    if is_doc_path(f["path"]):
+        return 2
+    if is_test_path(f["path"]):
+        return 3
+    return 4
+
+
+def patch_priority_tier(f: Mapping[str, Any]) -> int:
+    """Order (b): 1 sensitive, 2 dependency files, 3 source, 4 tests, 5 docs.
+    Tiers 1 and 2 match the head path or the old path; tiers 4 and 5 need
+    both, so a rename from a doc to code keeps the source tier."""
+    paths = [p for p in (f["path"], f.get("old_path")) if isinstance(p, str)]
+    if any(is_sensitive_path(p) for p in paths):
+        return 1
+    if any(is_dependency_path(p) for p in paths):
+        return 2
+    if all(is_test_path(p) for p in paths):
+        return 4
+    if all(is_doc_path(p) for p in paths):
+        return 5
+    return 3
+
+
+def drop_contents(
+    chars: int, deltas: Sequence[int], limit: int, confirm: Callable[[int], int | None]
+) -> int | None:
+    """Order (a). `deltas[i]` is the change in rendered characters when the
+    i-th candidate (in drop order) loses its `content`. Drops one at a time
+    and stops as soon as the bundle fits by block lengths and `confirm(k)`
+    (the full estimate with the first k dropped) agrees; `confirm` returns
+    None when it fits, else the real character count. Returns how many were
+    dropped, or None when even all of them do not fit."""
+    for k, delta in enumerate(deltas, 1):
+        chars += delta
+        if tokens_for_chars(chars) <= limit:
+            real = confirm(k)
+            if real is None:
+                return k
+            chars = real
+    return None
+
+
+def fill_patches(
+    base_chars: int, deltas: Sequence[int], limit: int, confirm: Callable[[frozenset[int]], bool]
+) -> frozenset[int] | None:
+    """Order (b) state machine. `deltas[i]` is the rendered characters that
+    the i-th candidate (in priority order) adds when its patch is in.
+
+    Fill admits each pending candidate whose block still fits next to the
+    admitted ones, else marks it skipped, and goes on. `confirm(admitted)` is
+    the full estimate. When it is over, the last admitted candidate is
+    evicted for good and every skipped one is pending again. Returns the
+    admitted set, or None when none is left ("no file patch fits")."""
+    state = ["pending"] * len(deltas)
+    while True:
+        chars = base_chars + sum(d for d, st in zip(deltas, state) if st == "admitted")
+        for i, delta in enumerate(deltas):
+            if state[i] != "pending":
+                continue
+            if tokens_for_chars(chars + delta) <= limit:
+                state[i] = "admitted"
+                chars += delta
+            else:
+                state[i] = "skipped"
+        admitted = frozenset(i for i, st in enumerate(state) if st == "admitted")
+        if not admitted:
+            return None
+        if confirm(admitted):
+            return admitted
+        state[max(admitted)] = "evicted"
+        state = ["pending" if st == "skipped" else st for st in state]
 
 
 def encode_envelope(doc: Mapping[str, Any]) -> bytes:
@@ -1086,6 +1367,104 @@ def encode_envelope(doc: Mapping[str, Any]) -> bytes:
         return json.dumps(doc, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
     except UnicodeEncodeError:
         return json.dumps(doc, ensure_ascii=True, separators=(",", ":"), allow_nan=False).encode("ascii")
+
+
+def _settle(doc: Mapping[str, Any], size: dict[str, Any]) -> int:
+    """Set `size.estimated_tokens` to the estimate of the final rendered
+    document, its own size field included, and return its characters. The
+    count can only grow with its digits, so this reaches its fixed point in a
+    few renders."""
+    for _ in range(SIZE_ESTIMATE_ROUNDS):
+        chars = _rendered_chars(doc)
+        tokens = tokens_for_chars(chars)
+        if tokens == size["estimated_tokens"]:
+            return chars
+        size["estimated_tokens"] = tokens
+    raise CollectError("size estimate does not settle")
+
+
+def _with_view(f: Mapping[str, Any], view: str, reason: str | None, drop: tuple[str, ...]) -> dict[str, Any]:
+    """`f` without the `drop` keys, with this model view (keys keep their order)."""
+    out: dict[str, Any] = {}
+    for k, v in f.items():
+        if k in drop or k == "model_view_reason":
+            continue
+        if k == "model_view":
+            out[k] = view
+            if reason is not None:
+                out["model_view_reason"] = reason
+            continue
+        out[k] = v
+    return out
+
+
+def _block_chars(index: int, total: int, f: Mapping[str, Any]) -> int:
+    try:
+        return len(render.render_file_block(index, total, f))
+    except render.RenderError as exc:
+        raise CollectError(f"bundle does not render: {exc}") from exc
+
+
+def apply_size_limit(doc: dict[str, Any], size: dict[str, Any], limit: int) -> str | None:
+    """Fit an `ok` bundle to `limit` estimated tokens, in place (spec "Size
+    limit"). Sets `size.mode` and `size.estimated_tokens`. Returns None when
+    the bundle fits, else the `size.reason` of a `skipped-size` bundle.
+
+    Order (a) removes `content` one file at a time; every patch stays. Only
+    when no `content` at all is still over the limit, order (b) chooses whole
+    patches in priority order (`fill_patches`). Both choose by file block
+    lengths and confirm with the full estimate.
+    """
+    files: list[dict[str, Any]] = doc["payload"]["files"]
+    total = len(files)
+    size["mode"] = "full"
+    chars = _settle(doc, size)
+    if tokens_for_chars(chars) <= limit:
+        return None
+
+    # (a) content drop: added, docs, tests, others; largest first in a tier.
+    size["mode"] = "diff-only"
+    order = sorted(
+        (i for i, f in enumerate(files) if "content" in f),
+        key=lambda i: (content_drop_tier(files[i]), -len(files[i]["content"]), files[i]["path"]),
+    )
+    full = {i: files[i] for i in order}
+    lean = {i: _with_view(full[i], "diff-only", "size-limit", ("content",)) for i in order}
+    deltas = [_block_chars(i + 1, total, lean[i]) - _block_chars(i + 1, total, full[i]) for i in order]
+
+    def confirm_drop(k: int) -> int | None:
+        for pos, i in enumerate(order):
+            files[i] = lean[i] if pos < k else full[i]
+        real = _settle(doc, size)
+        return None if tokens_for_chars(real) <= limit else real
+
+    if drop_contents(chars, deltas, limit, confirm_drop) is not None:
+        return None
+    for i in order:
+        files[i] = lean[i]
+
+    # (b) patch priority: sensitive, dependency files, source, tests, docs.
+    size["mode"] = "partial"
+    cands = sorted((i for i, f in enumerate(files) if "patch" in f), key=lambda i: (patch_priority_tier(files[i]), files[i]["path"]))
+    seen = {i: files[i] for i in cands}
+    unseen = {i: _with_view(seen[i], "not-reviewed", None, ("patch", "patch_redaction", "content")) for i in cands}
+    for i in cands:
+        files[i] = unseen[i]
+    base_chars = _settle(doc, size)
+    if tokens_for_chars(base_chars) > limit:
+        return f"{SIZE_GATE_REASON}: estimated {size['estimated_tokens']} tokens with no patches, limit {limit}"
+    deltas = [_block_chars(i + 1, total, seen[i]) - _block_chars(i + 1, total, unseen[i]) for i in cands]
+
+    def confirm_fill(admitted: frozenset[int]) -> bool:
+        for pos, i in enumerate(cands):
+            files[i] = seen[i] if pos in admitted else unseen[i]
+        # Every patch in is the order (a) bundle, which is over the limit.
+        size["mode"] = "partial" if len(admitted) < len(cands) else "diff-only"
+        return tokens_for_chars(_settle(doc, size)) <= limit
+
+    if fill_patches(base_chars, deltas, limit, confirm_fill) is None:
+        return f"{SIZE_GATE_REASON}: no file patch fits, limit {limit}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1118,14 +1497,15 @@ def collect(
     registry_clock: Callable[[], float] = time.monotonic,
     max_blob_bytes: int = prefilter.MAX_BLOB_BYTES,
     max_blob_reads: int = MAX_BLOB_READS,
-    size_gate_tokens: int = SIZE_GATE_TOKENS,
+    size_limit_base_tokens: int = SIZE_LIMIT_BASE_TOKENS,
     max_envelope_bytes: int = envelope.MAX_BYTES_BY_KIND["bundle"],
 ) -> Collected:
     """Read one PR through the API and build its bundle envelope.
 
     Returns status `stale` when the PR head is not the event head, `ok` when
-    the bundle fits the size gate, else `skipped-size`. Raises CollectError
-    when a read fails or a response has an unexpected shape.
+    the bundle fits the size limit (in full, diff-only or partial mode), else
+    `skipped-size`. Raises CollectError when a read fails or a response has
+    an unexpected shape; a failed read of the size-limit comments does not.
     """
     repo = _repo_path(event)
     pr = client.get_json(f"{repo}/pulls/{event.pr_number}", max_bytes=PR_MAX_BYTES)
@@ -1224,26 +1604,26 @@ def collect(
 
     payload = {"pr": pr_meta, "files": files, "dependency_delta": delta, **checks}
     doc = {**context, "status": "ok", "payload": payload}
-    size: dict[str, Any] = {"estimated_tokens": 0, "limit_tokens": size_gate_tokens}
+    commands = read_size_commands(client, repo, event.pr_number)
+    limit = size_limit_base_tokens * commands.multiplier
+    size: dict[str, Any] = {
+        "estimated_tokens": 0,
+        "limit_tokens": limit,
+        "base_limit_tokens": size_limit_base_tokens,
+        "multiplier": commands.multiplier,
+        "mode": "full",
+        "commands_read": commands.commands_read,
+        "raise": commands.raise_,
+        "rejected_commands": commands.rejected,
+    }
     payload["size"] = size
-    # The estimate is of the final rendered document, its own size field
-    # included. The count can only grow with its digits, so this reaches its
-    # fixed point in a few renders.
-    for _ in range(SIZE_ESTIMATE_ROUNDS):
-        tokens = estimate_tokens(doc)
-        if tokens == size["estimated_tokens"]:
-            break
-        size["estimated_tokens"] = tokens
-    else:
-        raise CollectError("size estimate does not settle")
-    reason = None
-    if tokens > size_gate_tokens:
-        reason = f"{SIZE_GATE_REASON}: estimated {tokens} tokens, limit {size_gate_tokens}"
-    else:
+    reason = apply_size_limit(doc, size, limit)
+    if reason is None:
         ok = _finish(doc)
         if len(ok.data) <= max_envelope_bytes:
             return ok
         reason = f"{SIZE_GATE_REASON}: bundle is {len(ok.data)} bytes, cap {max_envelope_bytes}"
+    size["mode"] = "skipped"
     size["reason"] = reason
     skipped = _finish({
         **context,

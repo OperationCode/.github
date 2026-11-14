@@ -19,6 +19,17 @@
       ]
     },
     "coverage": {},
-    "dependency_delta": {}
+    "dependency_delta": {},
+    "size": {
+      "estimated_tokens": 250000,
+      "limit_tokens": 200000,
+      "base_limit_tokens": 200000,
+      "multiplier": 1,
+      "mode": "skipped",
+      "commands_read": true,
+      "raise": null,
+      "rejected_commands": [],
+      "reason": "too large for automatic review: estimated 250000 tokens with no patches, limit 200000"
+    }
   }
 }

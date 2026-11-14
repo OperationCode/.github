@@ -847,6 +847,58 @@ def test_eval_environment_names_match_the_runner(tmp_path):
         eval_environment_for("refs/heads/main", tmp_path), eval_environment_for("refs/heads/other", tmp_path))
 
 
+# The `set` input of eval.yml maps, in a fixed shell `case`, to one fixture
+# directory (spec "Testing"). The input reaches the step through env only.
+EVAL_SETS = {"standard": "review/tests/fixtures", "long-context": "review/tests/fixtures-long-context"}
+
+
+def eval_run_step() -> dict:
+    job = jobs(load_workflow(WORKFLOWS / EVAL).doc)["fixture-evals"]
+    [st] = [st for st in steps(job) if "oc_review.evals" in str(st.get("run", ""))]
+    return st
+
+
+def eval_fixtures_dir_for(value: str, tmp_path: Path) -> str | None:
+    """Run the eval step's script with EVAL_SET = `value` and a stub `uv`;
+    the `--fixtures-dir` it passed, or None when the script failed first."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    args_file = tmp_path / "args"
+    args_file.unlink(missing_ok=True)
+    stub = bin_dir / "uv"
+    stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{args_file}"\n', encoding="utf-8")
+    stub.chmod(0o755)
+    script = tmp_path / "evals.sh"
+    script.write_text(eval_run_step()["run"], encoding="utf-8")
+    proc = subprocess.run([*DEFAULT_SHELL, str(script)],
+                          env={"PATH": f"{bin_dir}:/usr/bin:/bin", "EVAL_SET": value, "RUNNER_TEMP": str(tmp_path)},
+                          capture_output=True, text=True, timeout=30, check=False)
+    if proc.returncode != 0:
+        assert not args_file.exists()
+        return None
+    args = args_file.read_text(encoding="utf-8").splitlines()
+    return args[args.index("--fixtures-dir") + 1]
+
+
+def test_eval_set_input_is_a_choice_passed_through_env():
+    on = raw_on(load_workflow(WORKFLOWS / EVAL).doc)
+    assert on == {"workflow_dispatch": {"inputs": {"set": {
+        "description": "Fixture set to run", "type": "choice", "options": list(EVAL_SETS), "default": "standard"}}}}
+    st = eval_run_step()
+    assert env(st)["EVAL_SET"] == "${{ inputs.set }}" and "${{" not in st["run"]
+
+
+@pytest.mark.parametrize(("value", "fixtures_dir"), [
+    *EVAL_SETS.items(),
+    ("", None), ("Standard", None), ("long-context ", None), ("review/tests/fixtures", None),
+    ("../../etc", None), ("standard; true", None), ("*", None),
+])
+def test_eval_set_maps_to_a_fixed_fixtures_dir(value, fixtures_dir, tmp_path):
+    assert eval_fixtures_dir_for(value, tmp_path) == fixtures_dir
+    if fixtures_dir is not None:
+        assert (REPO / fixtures_dir).is_dir()
+
+
 def test_eval_upload_step_always_runs_and_keeps_data_out():
     [step] = [s for j in jobs(load_workflow(WORKFLOWS / EVAL).doc).values() for s in steps(j)
               if UPLOAD in str(s.get("uses", ""))]

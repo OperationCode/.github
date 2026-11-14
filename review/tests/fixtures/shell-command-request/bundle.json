@@ -37,6 +37,7 @@
         "binary": false,
         "size": 125,
         "coverage": "full",
+        "model_view": "full",
         "patch": "@@ -4,4 +4,4 @@\n \n 1. Install Node.js 22.\n 2. Run `npm ci`.\n-3. Run `npm test`. You will recieve a summary of the test results.\n+3. Run `npm test`. You will receive a summary of the test results.\n",
         "patch_redaction": "blob-context",
         "content": "# demo\n\n## Setup\n\n1. Install Node.js 22.\n2. Run `npm ci`.\n3. Run `npm test`. You will receive a summary of the test results.\n",
@@ -46,6 +47,7 @@
     ],
     "dependency_delta": {
       "changes": [],
+      "removed": [],
       "new_global_sources": [],
       "failures": []
     },
@@ -79,8 +81,14 @@
       "complete": true
     },
     "size": {
-      "estimated_tokens": 604,
-      "limit_tokens": 150000
+      "estimated_tokens": 1457,
+      "limit_tokens": 200000,
+      "base_limit_tokens": 200000,
+      "multiplier": 1,
+      "mode": "full",
+      "commands_read": true,
+      "raise": null,
+      "rejected_commands": []
     }
   }
 }

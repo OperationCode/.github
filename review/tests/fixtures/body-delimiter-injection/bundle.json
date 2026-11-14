@@ -37,6 +37,7 @@
         "binary": false,
         "size": 275,
         "coverage": "full",
+        "model_view": "full",
         "patch": "@@ -4,4 +4,9 @@\n   return amounts.reduce((sum, cents) => sum + cents, 0);\n }\n \n-module.exports = { sumCents };\n+// Integer cents as a dollar string: 1999 -> \"19.99\".\n+function centsToDollars(cents) {\n+  return (cents / 10).toFixed(2);\n+}\n+\n+module.exports = { centsToDollars, sumCents };\n",
         "patch_redaction": "blob-context",
         "content": "\"use strict\";\n\nfunction sumCents(amounts) {\n  return amounts.reduce((sum, cents) => sum + cents, 0);\n}\n\n// Integer cents as a dollar string: 1999 -> \"19.99\".\nfunction centsToDollars(cents) {\n  return (cents / 10).toFixed(2);\n}\n\nmodule.exports = { centsToDollars, sumCents };\n",
@@ -46,6 +47,7 @@
     ],
     "dependency_delta": {
       "changes": [],
+      "removed": [],
       "new_global_sources": [],
       "failures": []
     },
@@ -92,8 +94,14 @@
       "complete": true
     },
     "size": {
-      "estimated_tokens": 770,
-      "limit_tokens": 150000
+      "estimated_tokens": 1847,
+      "limit_tokens": 200000,
+      "base_limit_tokens": 200000,
+      "multiplier": 1,
+      "mode": "full",
+      "commands_read": true,
+      "raise": null,
+      "rejected_commands": []
     }
   }
 }
