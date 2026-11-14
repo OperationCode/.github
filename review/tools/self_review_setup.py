@@ -5,18 +5,20 @@
                               rule ID into analyze.py (working tree, no commit)
 
 Spec: docs/claude-review-design.md, "Self-review rule" in "Auth and cost".
-Each step finds first and creates only what is missing; it never edits or
-archives an object, so running it again is safe:
+All reads and checks run before any write. The tool creates only what is
+missing; it never edits or archives an object, so running it again is safe:
 
     1. read R1: R-self uses its issuer; its service account must be the one
        analyze.py names (R-self uses the same service account)
-    2. workspace WORKSPACE_NAME: find by name, else create
-    3. that service account is a member of the workspace, else add it
-       (role WORKSPACE_ROLE)
-    4. rule RULE_NAME: find by name, else create. A rule with that name and
-       any other field is refused, never edited
-    5. read the workspace, the membership and the rule back and check them
-    6. write the rule ID into SELF_REVIEW_FEDERATION_RULE_ID in analyze.py
+    2. read: workspace WORKSPACE_NAME by name, the service account's role in
+       it (must be WORKSPACE_ROLE), rule RULE_NAME by name (every field must
+       be as the spec says). An unknown list shape, a wrong role or a wrong
+       rule refuses here, before any write
+    3. setup only: create the workspace, add the service account as
+       WORKSPACE_ROLE, create the rule, each only when missing, and read each
+       back and check it
+    4. write the rule ID into SELF_REVIEW_FEDERATION_RULE_ID in analyze.py,
+       atomically, only when the file did not change during the run
 
 The workspace spend limit has no `ant` command, so the tool prints the
 Console steps for it. Login, logout, cleanup and exit codes are release.py's
@@ -29,13 +31,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
-
 import release  # sibling module: tools/ is on sys.path when this file runs as a script
 from release import ReleaseError
 
@@ -65,33 +68,51 @@ ANT_COMMANDS = ((release.Console.RULES, ("retrieve", "list", "create")),
 
 # ---------------------------------------------------------------- pure logic
 
+# The fields each list item must have, as non-empty strings. Any other shape
+# (another envelope, an item without them) refuses before a create or add.
+ITEM_FIELDS = {"workspace": ("id", "name"), "rule": ("id", "name"),
+               "member": ("service_account_id", "workspace_role")}
+PAGE_KEYS = frozenset({"data", "has_more", "first_id", "last_id", "next_page"})
 
-def parse_items(text: str, what: str) -> list[dict]:
-    """Items of a `--format jsonl` list: one object per line. A line that is a
-    page (`{"data": [...]}`) gives its items."""
+
+def parse_items(text: str, kind: str, what: str) -> list[dict]:
+    """Items of a `--format jsonl` list: one item per line, or a whole page
+    (`{"data": [...]}` with no more pages). Every item must have ITEM_FIELDS."""
     items: list[dict] = []
     for line in text.splitlines():
         if not line.strip():
             continue
         obj = release._json(line, what)
-        page = obj.get("data") if isinstance(obj, dict) else None
-        for item in (page if isinstance(page, list) else [obj]):
-            if not isinstance(item, dict):
-                raise ReleaseError(f"{what}: an item is not an object")
+        batch = [obj]
+        if isinstance(obj, dict) and "data" in obj:
+            if set(obj) - PAGE_KEYS or not isinstance(obj["data"], list):
+                raise ReleaseError(f"{what}: unknown page shape (keys {sorted(obj)}); fix the tool before a write")
+            if obj.get("has_more") or obj.get("next_page"):
+                raise ReleaseError(f"{what}: the list has more pages than were read")
+            batch = obj["data"]
+        for item in batch:
+            if not isinstance(item, dict) or not all(isinstance(item.get(f), str) and item[f]
+                                                     for f in ITEM_FIELDS[kind]):
+                raise ReleaseError(f"{what}: an item is not a {kind} with {', '.join(ITEM_FIELDS[kind])}; "
+                                   "unknown response shape, fix the tool before a write")
             items.append(item)
     return items
 
 
 def one_named(items: list[dict], name: str, what: str) -> dict | None:
     """The one live item called `name`, None when there is none. Several refuse."""
-    hits = [i for i in items if i.get("name") == name and not i.get("archived_at")]
+    hits = [i for i in items if i["name"] == name and not i.get("archived_at")]
     if len(hits) > 1:
         raise ReleaseError(f"{len(hits)} {what}s are named {name!r}; archive the extra ones in the Console, then run again")
     return hits[0] if hits else None
 
 
-def is_member(items: list[dict], service_account_id: str) -> bool:
-    return any(service_account_id in (i.get("service_account_id"), i.get("id")) for i in items)
+def member_role(items: list[dict], service_account_id: str) -> str | None:
+    """The workspace role of the service account, None when it is no member."""
+    roles = [i["workspace_role"] for i in items if i["service_account_id"] == service_account_id]
+    if len(roles) > 1:
+        raise ReleaseError(f"service account {service_account_id} is listed {len(roles)} times")
+    return roles[0] if roles else None
 
 
 def rule_problems(rule: dict, *, workspace_id: str, issuer_id: str, service_account_id: str) -> list[str]:
@@ -140,8 +161,12 @@ def spend_limit_steps() -> str:
 
 
 class Setup:
-    def __init__(self, console: release.Console, rec: release.Records, *, apply: bool):
-        self.console, self.rec, self.apply = console, rec, apply
+    """`cmd` runs every read and check (`r1`, `find_workspace`, `role`,
+    `find_rule`) before `write`, so an unknown response shape or a wrong
+    object refuses before any create or add."""
+
+    def __init__(self, console: release.Console, rec: release.Records):
+        self.console, self.rec = console, rec
 
     def obj(self, args: Sequence[str], what: str) -> dict:
         got = release._json(self.console.call([*args, "--format", "json"], what), what)
@@ -149,8 +174,10 @@ class Setup:
             raise ReleaseError(f"{what}: the response is not an object with an id")
         return got
 
-    def items(self, args: Sequence[str], what: str) -> list[dict]:
-        return parse_items(self.console.call([*args, "--format", "jsonl", "--max-items", "-1"], what), what)
+    def items(self, args: Sequence[str], kind: str, what: str) -> list[dict]:
+        out = self.console.call([*args, "--format", "jsonl", "--max-items", "-1"], what)
+        self.rec.save(what.replace(" ", "-"), out)
+        return parse_items(out, kind, what)
 
     def r1(self, service_account_id: str) -> str:
         r1 = self.console.retrieve(release.PROD_RULE_ID)
@@ -164,73 +191,95 @@ class Setup:
         print(f"  [ok] R1 {release.PROD_RULE_ID}: issuer {issuer}, service account {target}")
         return issuer
 
-    def workspace(self) -> str | None:
-        found = one_named(self.items([WORKSPACES, "list"], "workspace list"), WORKSPACE_NAME, "workspace")
-        if found is None and not self.apply:
-            print(f"  workspace {WORKSPACE_NAME!r}: missing, setup creates it")
-            return None
+    def find_workspace(self) -> str | None:
+        found = one_named(self.items([WORKSPACES, "list"], "workspace", "workspace list"), WORKSPACE_NAME, "workspace")
         if found is None:
-            print(f"  workspace {WORKSPACE_NAME!r}: missing, creating it")
-            self.rec.save("workspace-created", self.obj([WORKSPACES, "create", "--name", WORKSPACE_NAME],
-                                                        "workspace create"))
-            found = one_named(self.items([WORKSPACES, "list"], "workspace list"), WORKSPACE_NAME, "workspace")
-            if found is None:
-                raise ReleaseError(f"workspace {WORKSPACE_NAME!r} was created but the list does not show it")
+            return None
         wid = found["id"]
         back = self.obj([WORKSPACES, "retrieve", "--workspace-id", wid], f"workspace {wid}")
         self.rec.save("workspace", back)
-        if back.get("name") != WORKSPACE_NAME or back.get("archived_at"):
+        if back.get("id") != wid or back.get("name") != WORKSPACE_NAME or back.get("archived_at"):
             raise ReleaseError(f"workspace {wid} read back as {back.get('name')!r}, archived_at {back.get('archived_at')!r}")
         print(f"  [ok] workspace {WORKSPACE_NAME!r}: {wid}")
         return wid
 
-    def membership(self, wid: str | None, service_account_id: str) -> None:
-        if wid is None:
-            print(f"  service account {service_account_id}: setup adds it to the new workspace as {WORKSPACE_ROLE}")
-            return
+    def role(self, wid: str, service_account_id: str) -> str | None:
+        """The service account's role in `wid`; refuses any role but WORKSPACE_ROLE."""
+        role = member_role(self.items([MEMBERS, "list", "--workspace-id", wid], "member", f"members of {wid}"),
+                           service_account_id)
+        if role not in (None, WORKSPACE_ROLE):
+            raise ReleaseError(f"service account {service_account_id} has role {role!r} in {wid}, not "
+                               f"{WORKSPACE_ROLE}; this tool never edits a membership: fix it in the Console")
+        if role:
+            print(f"  [ok] service account {service_account_id} is a member of {wid} as {role}")
+        return role
 
-        def members() -> list[dict]:
-            return self.items([MEMBERS, "list", "--workspace-id", wid], f"members of {wid}")
-
-        if not is_member(members(), service_account_id):
-            if not self.apply:
-                print(f"  service account {service_account_id}: not in {wid}, setup adds it as {WORKSPACE_ROLE}")
-                return
-            print(f"  service account {service_account_id}: not in {wid}, adding it as {WORKSPACE_ROLE}")
-            self.console.call([MEMBERS, "add", "--workspace-id", wid, "--service-account-id", service_account_id,
-                               "--workspace-role", WORKSPACE_ROLE, "--format", "json"], "service account add")
-            if not is_member(members(), service_account_id):
-                raise ReleaseError(f"service account {service_account_id} was added but {wid} does not list it")
-        print(f"  [ok] service account {service_account_id} is a member of {wid}")
-
-    def rule(self, wid: str | None, issuer_id: str, service_account_id: str) -> str | None:
-        found = one_named(self.items([release.Console.RULES, "list"], "rule list"), RULE_NAME, "rule")
-        create = ["--name", RULE_NAME, "--issuer-id", issuer_id,
-                  "--match", json.dumps(EXPECTED_MATCH, separators=(",", ":")), "--oauth-scope", OAUTH_SCOPE,
-                  "--target", json.dumps({"type": "service_account", "service_account_id": service_account_id},
-                                         separators=(",", ":")),
-                  "--workspace-id", wid or "<new workspace id>", "--token-lifetime-seconds", str(TOKEN_LIFETIME_S),
-                  "--description", "Self-review of PRs to OperationCode/.github (spec: Self-review rule)"]
-        if found is None and not self.apply:
-            print(f"  rule {RULE_NAME!r}: missing, setup creates it with:\n    ant {release.Console.RULES} create "
-                  + " ".join(create))
-            return None
+    def find_rule(self, wid: str | None, issuer_id: str, service_account_id: str) -> str | None:
+        found = one_named(self.items([release.Console.RULES, "list"], "rule", "rule list"), RULE_NAME, "rule")
         if found is None:
-            print(f"  rule {RULE_NAME!r}: missing, creating it")
-            self.rec.save("rule-created", self.obj([release.Console.RULES, "create", *create], "rule create"))
-            found = one_named(self.items([release.Console.RULES, "list"], "rule list"), RULE_NAME, "rule")
-            if found is None:
-                raise ReleaseError(f"rule {RULE_NAME!r} was created but the list does not show it")
-        rid = release.validate_rule_id(found.get("id"))
+            return None
+        rid = release.validate_rule_id(found["id"])
         back = self.console.retrieve(rid)
         self.rec.save("rule", back)
-        problems = rule_problems(back, workspace_id=wid or "<new workspace id>", issuer_id=issuer_id,
+        problems = rule_problems(back, workspace_id=wid or "<missing workspace>", issuer_id=issuer_id,
                                  service_account_id=service_account_id)
         if problems:
             raise ReleaseError(f"rule {rid} {RULE_NAME!r} is not as the spec says ({'; '.join(problems)}); this "
                                "tool never edits a rule: fix or archive it in the Console, then run again")
         print(f"  [ok] rule {RULE_NAME!r}: {rid}, every field as the spec says")
         return rid
+
+    def create_args(self, wid: str, issuer_id: str, service_account_id: str) -> list[str]:
+        return ["--name", RULE_NAME, "--issuer-id", issuer_id,
+                "--match", json.dumps(EXPECTED_MATCH, separators=(",", ":")), "--oauth-scope", OAUTH_SCOPE,
+                "--target", json.dumps({"type": "service_account", "service_account_id": service_account_id},
+                                       separators=(",", ":")),
+                "--workspace-id", wid, "--token-lifetime-seconds", str(TOKEN_LIFETIME_S),
+                "--description", "Self-review of PRs to OperationCode/.github (spec: Self-review rule)"]
+
+    def write(self, wid: str | None, role: str | None, rule_id: str | None, issuer_id: str,
+              service_account_id: str) -> str:
+        """Create what is missing, in order, and read each back. Returns the rule ID."""
+        if wid is None:
+            print(f"  workspace {WORKSPACE_NAME!r}: missing, creating it")
+            self.rec.save("workspace-created", self.obj([WORKSPACES, "create", "--name", WORKSPACE_NAME],
+                                                        "workspace create"))
+            wid = self.find_workspace()
+            if wid is None:
+                raise ReleaseError(f"workspace {WORKSPACE_NAME!r} was created but the list does not show it")
+        if role is None:
+            print(f"  service account {service_account_id}: not in {wid}, adding it as {WORKSPACE_ROLE}")
+            self.console.call([MEMBERS, "add", "--workspace-id", wid, "--service-account-id", service_account_id,
+                               "--workspace-role", WORKSPACE_ROLE, "--format", "json"], "service account add")
+            if self.role(wid, service_account_id) != WORKSPACE_ROLE:
+                raise ReleaseError(f"service account {service_account_id} was added but {wid} does not list it "
+                                   f"as {WORKSPACE_ROLE}")
+        if rule_id is None:
+            print(f"  rule {RULE_NAME!r}: missing, creating it")
+            self.rec.save("rule-created", self.obj([release.Console.RULES, "create",
+                                                    *self.create_args(wid, issuer_id, service_account_id)],
+                                                   "rule create"))
+            rule_id = self.find_rule(wid, issuer_id, service_account_id)
+            if rule_id is None:
+                raise ReleaseError(f"rule {RULE_NAME!r} was created but the list does not show it")
+        return rule_id
+
+
+def write_analyze(path: Path, original: str, new: str) -> None:
+    """Replace analyze.py atomically, only when it still holds `original`
+    (the text read at the start): an edit made during the login is kept."""
+    if path.read_text(encoding="utf-8") != original:
+        raise ReleaseError(f"{path} changed during the run, so it was not written. Run `make self-review-setup` "
+                           "again: it finds the rule and only writes the ID")
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(new)
+        os.chmod(tmp, stat.S_IMODE(path.stat().st_mode))
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def cmd(run: release.Runner, *, apply: bool) -> int:
@@ -241,15 +290,28 @@ def cmd(run: release.Runner, *, apply: bool) -> int:
     analyze_constant(text, CONSTANT)  # fail before any login when the line is missing
     rec = release.Records(f"self-review-{'setup' if apply else 'plan'}")
     print(f"{'Self-review setup (creates what is missing, no prompt)' if apply else 'Self-review plan (read-only)'}"
-          "\n\nConsole:")
+          "\n\nConsole (reads and checks):")
     for resource, commands in ANT_COMMANDS:
         release.check_ant(run, resource, commands)
     with release.ephemeral_console(run) as console:
-        s = Setup(console, rec, apply=apply)
+        s = Setup(console, rec)
         issuer = s.r1(service_account_id)
-        wid = s.workspace()
-        s.membership(wid, service_account_id)
-        rule_id = s.rule(wid, issuer, service_account_id)
+        wid = s.find_workspace()
+        role = s.role(wid, service_account_id) if wid else None
+        rule_id = s.find_rule(wid, issuer, service_account_id)
+        if rule_id and wid is None:
+            raise ReleaseError(f"rule {RULE_NAME!r} exists but workspace {WORKSPACE_NAME!r} does not")
+        if not apply:
+            if wid is None:
+                print(f"  workspace {WORKSPACE_NAME!r}: missing, setup creates it")
+            if role is None:
+                print(f"  service account {service_account_id}: setup adds it to the workspace as {WORKSPACE_ROLE}")
+            if rule_id is None:
+                print(f"  rule {RULE_NAME!r}: missing, setup creates it with:\n    ant {release.Console.RULES} "
+                      "create " + " ".join(s.create_args(wid or "<new workspace id>", issuer, service_account_id)))
+        else:
+            print("\nConsole (creates what is missing):")
+            rule_id = s.write(wid, role, rule_id, issuer, service_account_id)
     print(f"\n{spend_limit_steps()}\nRecords: {rec.dir}")
     if rule_id is None:
         print("Plan OK. Nothing was changed.")
@@ -260,7 +322,7 @@ def cmd(run: release.Runner, *, apply: bool) -> int:
               + ("already names it." if new == text else f"would be set to {rule_id}."))
         return 0
     if new != text:
-        ANALYZE_FILE.write_text(new, encoding="utf-8")
+        write_analyze(ANALYZE_FILE, text, new)
     print(f"\nR-self is {rule_id}. analyze.py {CONSTANT} {'set' if new != text else 'already named it'} "
           "(working tree, not committed). Review `git diff`, then open a PR.")
     return 0

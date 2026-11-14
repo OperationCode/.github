@@ -1480,6 +1480,37 @@ def test_configured_r_self_reaches_the_client(tmp_path, configured, monkeypatch)
         SELF_RULE, CONFIGURED_IDS["ANTHROPIC_ORGANIZATION_ID"], CONFIGURED_IDS["ANTHROPIC_SERVICE_ACCOUNT_ID"])}]
 
 
+V3_DIRECT = json.loads((Path(__file__).parent / "fixtures" / "oidc" / "v3-direct-dispatch-claims.json").read_text())
+
+
+def dotgithub_direct_claims():
+    """The recorded direct-run claim set (V3 run 40259047420), moved to a
+    `pull_request_target` run of claude-review.yml in .github on main."""
+    ref = "OperationCode/.github/.github/workflows/claude-review.yml@refs/heads/main"
+    claims = {**V3_DIRECT["claims"], "event_name": "pull_request_target", "repository": "OperationCode/.github",
+              "repository_id": analyze.SELF_REVIEW_REPOSITORY_ID, "job_workflow_ref": ref, "workflow_ref": ref,
+              "job_workflow_sha": JOB_SHA, "workflow_sha": JOB_SHA,
+              "sub": f"repo:OperationCode@10479364/.github@{analyze.SELF_REVIEW_REPOSITORY_ID}:pull_request"}
+    return claims
+
+
+def test_a_recorded_direct_run_token_has_the_job_workflow_claims():
+    """A direct run (not reusable, not ruleset-required) carries job_workflow_ref
+    in branch form and job_workflow_sha, equal to workflow_ref / workflow_sha.
+    So the local check and R-self's job_workflow_ref claim hold for it."""
+    c = V3_DIRECT["claims"]
+    assert c["job_workflow_ref"] == c["workflow_ref"] and c["job_workflow_ref"].endswith("@refs/heads/main")
+    assert c["job_workflow_sha"] == c["workflow_sha"]
+    assert analyze.claims_match(c, c["workflow_sha"])
+
+
+def test_configured_r_self_accepts_a_direct_run_claim_set(tmp_path, configured, monkeypatch):
+    monkeypatch.setattr(analyze, "SELF_REVIEW_FEDERATION_RULE_ID", SELF_RULE)
+    run = run_main(tmp_path, env=SELF_ENV, oidc=FakeOidc(make_jwt(**dotgithub_direct_claims())))
+    assert set(statuses(run).values()) == {"ok"}
+    assert run.factory_kwargs[0]["federation"].rule_id == SELF_RULE
+
+
 @pytest.mark.parametrize("env", [{}, {**SELF_ENV, "GITHUB_EVENT_NAME": "workflow_dispatch"},
                                  {**SELF_ENV, "GITHUB_REPOSITORY_ID": "107068150"}])
 def test_every_other_run_keeps_r1(tmp_path, configured, monkeypatch, env):

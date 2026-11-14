@@ -23,6 +23,7 @@ ANALYZE_TEXT = (f'ANTHROPIC_FEDERATION_RULE_ID = "{R1}"\n'
                 f'ANTHROPIC_SERVICE_ACCOUNT_ID = "{SA}"\n'
                 f'SELF_REVIEW_FEDERATION_RULE_ID = "{setup.PLACEHOLDER}"\n')
 HELP = "retrieve  update  list  create  add"
+MEMBER = {"service_account_id": SA, "workspace_role": "workspace_developer"}
 
 
 def r_self(rule_id=NEW_RULE, **over):
@@ -38,8 +39,11 @@ def r_self(rule_id=NEW_RULE, **over):
 class FakeAnt:
     """ant stand-in. Records each call; keeps workspace, member and rule state."""
 
-    def __init__(self, *, workspaces=None, members=None, rules=None, help_text=HELP):
+    def __init__(self, *, workspaces=None, members=None, rules=None, help_text=HELP, raw=None, add_role=None,
+                 on_login=None):
         self.calls: list[list[str]] = []
+        self.raw = raw or {}  # resource -> list output text, to test unknown shapes
+        self.add_role, self.on_login = add_role, on_login
         self.workspaces = workspaces if workspaces is not None else []
         self.members = members if members is not None else {}
         self.rules = {R1: {"id": R1, "name": "claude-review-prod-r1", "issuer_id": ISSUER,
@@ -59,6 +63,8 @@ class FakeAnt:
         if args[-1] == "--help":
             return self.out(text=self.help_text)
         if args[0] == "auth":
+            if args[1] == "login" and self.on_login:
+                self.on_login()
             return self.out(text="")
         res, verb = args[0], args[1]
 
@@ -68,6 +74,8 @@ class FakeAnt:
         def jsonl(items):
             return self.out(text="".join(json.dumps(i) + "\n" for i in items))
 
+        if verb == "list" and res in self.raw:
+            return self.out(text=self.raw[res])
         if res == setup.WORKSPACES:
             if verb == "list":
                 return jsonl(self.workspaces)
@@ -83,7 +91,7 @@ class FakeAnt:
                 return jsonl(self.members.get(wid, []))
             if verb == "add":
                 self.members.setdefault(wid, []).append({"service_account_id": opt("--service-account-id"),
-                                                         "workspace_role": opt("--workspace-role")})
+                                                         "workspace_role": self.add_role or opt("--workspace-role")})
                 return self.out({})
         if res == release.Console.RULES:
             if verb == "list":
@@ -156,7 +164,7 @@ def test_setup_creates_the_rule_with_the_exact_claims():
 
 def test_setup_again_is_idempotent_and_writes_nothing():
     fake = FakeAnt(workspaces=[{"id": WID, "name": setup.WORKSPACE_NAME}],
-                   members={WID: [{"service_account_id": SA}]}, rules={NEW_RULE: r_self()})
+                   members={WID: [MEMBER]}, rules={NEW_RULE: r_self()})
     assert setup.main(["setup"], run=fake) == 0
     assert fake.writes() == []
     assert f'"{NEW_RULE}"' in analyze_text()
@@ -174,7 +182,7 @@ def test_plan_is_read_only(capsys):
 
 def test_plan_with_everything_in_place_says_what_analyze_would_get(capsys):
     fake = FakeAnt(workspaces=[{"id": WID, "name": setup.WORKSPACE_NAME}],
-                   members={WID: [{"id": SA}]}, rules={NEW_RULE: r_self()})
+                   members={WID: [MEMBER]}, rules={NEW_RULE: r_self()})
     assert setup.main(["plan"], run=fake) == 0
     assert fake.writes() == [] and analyze_text() == ANALYZE_TEXT
     assert f"would be set to {NEW_RULE}" in capsys.readouterr().out
@@ -191,7 +199,7 @@ def test_plan_with_everything_in_place_says_what_analyze_would_get(capsys):
 ])
 def test_an_existing_rule_that_differs_is_refused_never_edited(over, capsys):
     fake = FakeAnt(workspaces=[{"id": WID, "name": setup.WORKSPACE_NAME}],
-                   members={WID: [{"service_account_id": SA}]}, rules={NEW_RULE: r_self(**over)})
+                   members={WID: [MEMBER]}, rules={NEW_RULE: r_self(**over)})
     assert setup.main(["setup"], run=fake) == 2
     assert fake.writes() == [] and analyze_text() == ANALYZE_TEXT and logged_out(fake)
     assert "never edits a rule" in capsys.readouterr().err
@@ -221,7 +229,7 @@ def test_analyze_with_another_real_r_self_is_not_overwritten(capsys):
     setup.ANALYZE_FILE.write_text(ANALYZE_TEXT.replace(setup.PLACEHOLDER, "fdrl_01OtherRuleAbcdefghijklm"))
     before = analyze_text()
     fake = FakeAnt(workspaces=[{"id": WID, "name": setup.WORKSPACE_NAME}],
-                   members={WID: [{"service_account_id": SA}]}, rules={NEW_RULE: r_self()})
+                   members={WID: [MEMBER]}, rules={NEW_RULE: r_self()})
     assert setup.main(["setup"], run=fake) == 2
     assert analyze_text() == before
     assert "edit analyze.py by hand" in capsys.readouterr().err
@@ -245,14 +253,86 @@ def test_interrupt_logs_out_and_says_how_to_recover(monkeypatch, capsys):
 
     def interrupt(*a, **k):
         raise KeyboardInterrupt
-    monkeypatch.setattr(setup.Setup, "membership", interrupt)
+    monkeypatch.setattr(setup.Setup, "write", interrupt)
     assert setup.main(["setup"], run=fake) == 130
     assert logged_out(fake)
     assert "make self-review-plan" in capsys.readouterr().err
 
 
 def test_parse_items_reads_jsonl_items_and_pages():
-    text = '{"id": "a"}\n\n{"data": [{"id": "b"}, {"id": "c"}]}\n'
-    assert [i["id"] for i in setup.parse_items(text, "x")] == ["a", "b", "c"]
+    text = '{"id": "a", "name": "n"}\n\n{"data": [{"id": "b", "name": "n"}], "has_more": false}\n'
+    assert [i["id"] for i in setup.parse_items(text, "workspace", "x")] == ["a", "b"]
+
+
+@pytest.mark.parametrize("text", [
+    "not json\n",
+    '{"items": [{"id": "w", "name": "claude-review-self-review"}]}\n',  # unknown envelope
+    '{"data": [{"id": "w", "name": "n"}], "has_more": true}\n',         # incomplete
+    '{"data": {"id": "w"}}\n',
+    '{"data": [], "cursor": "x"}\n',
+    '{"id": "w"}\n',                                                     # no name
+    '{"id": "", "name": "n"}\n',
+    '["w"]\n',
+])
+def test_parse_items_refuses_an_unknown_shape(text):
     with pytest.raises(release.ReleaseError):
-        setup.parse_items("not json\n", "x")
+        setup.parse_items(text, "workspace", "x")
+
+
+ENVELOPE = '{"items": [{"id": "existing", "name": "claude-review-self-review"}]}\n'
+
+
+@pytest.mark.parametrize("raw", [
+    {setup.WORKSPACES: ENVELOPE},
+    {release.Console.RULES: ENVELOPE},
+    {setup.MEMBERS: '{"items": [{"service_account_id": "%s"}]}\n' % SA},
+    {setup.MEMBERS: '{"service_account_id": "%s"}\n' % SA},  # no role
+])
+def test_an_unknown_list_shape_refuses_before_any_create_or_add(raw, capsys):
+    fake = FakeAnt(workspaces=[{"id": WID, "name": setup.WORKSPACE_NAME}], raw=raw)
+    assert setup.main(["setup"], run=fake) == 2
+    assert fake.writes() == [] and analyze_text() == ANALYZE_TEXT and logged_out(fake)
+    assert "REFUSED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("role", ["workspace_user", "workspace_admin", "workspace_restricted_developer"])
+def test_an_existing_member_with_another_role_is_refused_before_any_write(role):
+    fake = FakeAnt(workspaces=[{"id": WID, "name": setup.WORKSPACE_NAME}],
+                   members={WID: [{"service_account_id": SA, "workspace_role": role}]})
+    assert setup.main(["setup"], run=fake) == 2
+    assert fake.writes() == [] and analyze_text() == ANALYZE_TEXT
+
+
+def test_a_member_added_with_another_role_fails_the_read_back():
+    fake = FakeAnt(add_role="workspace_user")
+    assert setup.main(["setup"], run=fake) == 2
+    assert [c[:2] for c in fake.writes()] == [[setup.WORKSPACES, "create"], [setup.MEMBERS, "add"]]
+    assert analyze_text() == ANALYZE_TEXT and logged_out(fake)
+
+
+def test_an_edit_to_analyze_during_login_is_kept_and_the_id_not_written(capsys):
+    edited = ANALYZE_TEXT + "# local edit\n"
+    fake = FakeAnt(on_login=lambda: setup.ANALYZE_FILE.write_text(edited))
+    assert setup.main(["setup"], run=fake) == 2
+    assert analyze_text() == edited
+    assert "changed during the run" in capsys.readouterr().err
+    assert [p.name for p in setup.ANALYZE_FILE.parent.iterdir() if p.name.startswith(".analyze")] == []
+    fake.on_login = None
+    assert setup.main(["setup"], run=fake) == 0  # a re-run finds everything and writes only the ID
+    assert analyze_text() == edited.replace(setup.PLACEHOLDER, NEW_RULE)
+
+
+def test_the_analyze_write_keeps_the_file_mode_and_leaves_no_temp_file():
+    setup.ANALYZE_FILE.chmod(0o640)
+    assert setup.main(["setup"], run=FakeAnt()) == 0
+    assert setup.ANALYZE_FILE.stat().st_mode & 0o777 == 0o640
+    assert sorted(p.name for p in setup.ANALYZE_FILE.parent.iterdir()) == ["analyze.py", "records", "tmp"]
+
+
+def test_every_r_self_claim_is_in_a_recorded_direct_run_token():
+    """The rule's claims exist in a direct run's token (V3 run 40259047420),
+    and its subject prefix matches that token's `sub`."""
+    claims = json.loads((ROOT / "review" / "tests" / "unit" / "fixtures" / "oidc" /
+                         "v3-direct-dispatch-claims.json").read_text())["claims"]
+    assert set(setup.EXPECTED_MATCH["claims"]) <= set(claims)
+    assert claims["sub"].startswith(setup.EXPECTED_MATCH["subject_prefix"].rstrip("*"))
