@@ -1193,11 +1193,6 @@ class SizeCommands:
     commands_read: bool
 
 
-def _is_raise_command(body: str) -> bool:
-    words = body.split(None, 2)
-    return len(words) >= 2 and words[0] == "/oc-review" and words[1] == "size-limit"
-
-
 def evaluate_size_commands(
     comments: Sequence[verdict.Comment], permission: Callable[[str], str | None]
 ) -> SizeCommands:
@@ -1211,7 +1206,7 @@ def evaluate_size_commands(
     for cm in sorted(comments, key=lambda x: x.id):
         if cm.author_login.lower() == verdict.BOT_LOGIN.lower() or cm.author_type == "Bot":
             continue
-        if not _is_raise_command(cm.body):
+        if not verdict.is_size_limit_command(cm.body):
             continue
         m = _RAISE_RE.fullmatch(cm.body.strip())
         if m is None:

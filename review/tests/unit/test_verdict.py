@@ -589,3 +589,121 @@ def test_incomplete_coverage_record_fails_without_hard_block_entry(status, cover
 
 def test_complete_coverage_record_adds_nothing():
     assert gate().status == PASS
+
+
+# ---------------------------------------------------------------- partial review (P6-6)
+
+
+def partial_gate(files, mode="partial", **over):
+    doc = bundle()
+    doc.envelope["payload"]["size"]["mode"] = mode
+    doc.envelope["payload"]["files"] = files
+    return gate(bundle=doc, **over)
+
+
+def not_seen(path):
+    return {"path": path, "model_view": "not-reviewed"}
+
+
+def test_partial_review_from_the_size_mode_alone():
+    r = partial_gate([{"path": "src/app.py", "model_view": "diff-only", "model_view_reason": "size-limit"}])
+    assert r.codes == {verdict.R_PARTIAL_REVIEW} and r.status == FAIL
+    assert r.reasons[0].detail == "partial model review: 0 file(s) not seen"
+    assert r.waivable_only and r.override_command is not None
+
+
+def test_partial_review_from_a_not_reviewed_file_alone():
+    r = partial_gate([not_seen("docs/a.md")], mode="full")
+    assert r.codes == {verdict.R_PARTIAL_REVIEW}
+    assert r.reasons[0].detail == "partial model review: 1 file(s) not seen: docs/a.md"
+
+
+def test_partial_review_detail_names_ten_paths_in_path_order():
+    files = [not_seen(f"src/m{i:02d}.py") for i in range(12, 0, -1)]
+    (reason,) = partial_gate(files).reasons
+    shown = ", ".join(f"src/m{i:02d}.py" for i in range(1, 11))
+    assert reason.detail == f"partial model review: 12 file(s) not seen: {shown} and 2 more"
+
+
+def test_no_partial_review_for_a_full_or_diff_only_bundle():
+    assert partial_gate([{"path": "a.py", "model_view": "full"}], mode="full").status == PASS
+    diff_only = [{"path": "a.py", "model_view": "diff-only", "model_view_reason": "long-file"}]
+    assert partial_gate(diff_only, mode="diff-only").status == PASS
+
+
+def test_partial_review_is_waivable_but_never_clears_a_hard_block():
+    waived = partial_gate([not_seen("a.py")], overrides=ov_inputs([override_comment()]))
+    assert waived.status == PASS and waived.override_applied
+    doc = bundle(hard_blocks=("bidi-control-characters",))
+    doc.envelope["payload"]["size"]["mode"] = "partial"
+    r = gate(bundle=doc, overrides=ov_inputs([override_comment()]))
+    assert r.codes == {verdict.R_PARTIAL_REVIEW, verdict.R_HARD_BLOCK} and r.status == FAIL
+
+
+# ---------------------------------------------------------------- override parser skips raises
+
+
+@pytest.mark.parametrize("body", [
+    "/oc-review size-limit 2x",
+    "/oc-review size-limit 9x",  # a malformed raise: collect lists it, not the override parser
+    "  /oc-review   size-limit\n4x and more ",
+])
+def test_override_parser_skips_size_limit_comments(body):
+    assert evaluate_overrides(ov_inputs([comment(1, MAINT, body)]), SnapshotPair(HEAD, MB, "main")) == ()
+
+
+@pytest.mark.parametrize("body", ["/oc-review sizelimit 2x", "/oc-review Size-Limit 2x", "/oc-review"])
+def test_other_oc_review_comments_stay_override_candidates(body):
+    (x,) = evaluate_overrides(ov_inputs([comment(1, MAINT, body)]), SnapshotPair(HEAD, MB, "main"))
+    assert x.rejection == verdict.OV_MALFORMED
+
+
+# ---------------------------------------------------------------- M4: lockfile citations
+
+HEX_OLD, HEX_NEW = "1" * 64, "2" * 64
+LOCK_PAD = "".join(f'[[package]]\nname = "p{i}"\n' for i in range(4))  # 8 lines before the hash
+
+
+def lock_text(hex64):
+    return LOCK_PAD + f'name = "a"\nversion = "1.0"\nhash = "sha256:{hex64}"\n'
+
+
+def lock_cite(quote, line=11, path="poetry.lock", old_path=None, side="head"):
+    f = verdict.changed_file(path, old_path=old_path, base_raw=lock_text(HEX_OLD), head_raw=lock_text(HEX_NEW))
+    return cite_finding("supply-chain", finding(file=path, side=side, line=line, quote=quote), [f])
+
+
+def test_m4_quote_from_a_masked_line_verifies():
+    assert lock_cite('hash = "sha256:22222222~"').verified
+    assert lock_cite('"sha256:11111111~"', side="base").verified
+
+
+def test_m4_quote_of_the_raw_line_verifies():
+    assert lock_cite(f'hash = "sha256:{HEX_NEW}"').verified
+
+
+def test_m4_hash_prefix_on_a_wrong_line_does_not_verify():
+    c = lock_cite("sha256:22222222~", line=2)
+    assert not c.verified and "quote not found" in c.unverified_reason
+
+
+def test_m4_masked_quote_does_not_verify_in_a_file_that_is_not_a_lockfile():
+    assert not lock_cite('hash = "sha256:22222222~"', path="src/hashes.toml").verified
+
+
+def test_m4_old_path_lockfile_gets_the_masked_text():
+    assert lock_cite('hash = "sha256:22222222~"', path="deps/locked.toml", old_path="poetry.lock").verified
+
+
+def test_m4_compares_with_model_text_of_the_masked_redacted_text():
+    """N1: the quote is what Claude saw, `model_lines(mask_hashes(redacted))`,
+    on a line where a delimiter name and an invisible character sit next to
+    a hash."""
+    from oc_review import render
+
+    raw_line = f'untrusted_pr​ = {{hash = "sha256:{HEX_NEW}"}}'
+    head = LOCK_PAD + raw_line + "\n"
+    (seen,) = render.model_lines(render.mask_hashes(render.redact_text(raw_line)))
+    assert "~" in seen and render.NEUTRALIZED in seen and "​" not in seen
+    f = verdict.changed_file("poetry.lock", base_raw=LOCK_PAD, head_raw=head)
+    assert cite_finding("supply-chain", finding(file="poetry.lock", line=9, quote=seen), [f]).verified

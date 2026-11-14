@@ -18,6 +18,8 @@ import pytest
 from oc_review import analyze, collect, envelope, publish, render, verdict
 from oc_review.envelope import sha256_hex
 
+from .bundles import size_record
+
 FIX = Path(__file__).parent / "fixtures" / "analyze"
 REVIEW_DIR = Path(__file__).resolve().parents[2]
 JOB_SHA = "d" * 40
@@ -1147,7 +1149,8 @@ def test_bundle_status_gives_three_records_without_calls(tmp_path, configured, s
     bundle["status"] = status
     if status == "skipped-size":
         p = bundle["payload"]
-        bundle["payload"] = {k: p[k] for k in ("prefilter", "coverage", "dependency_delta", "size")}
+        bundle["payload"] = {k: p[k] for k in ("prefilter", "coverage", "dependency_delta")}
+        bundle["payload"]["size"] = size_record("skipped-size")
     else:
         bundle["payload"] = None
     run = run_main(tmp_path, bundle=bundle)
@@ -1307,8 +1310,8 @@ def test_no_call_bundle_needs_no_call_prerequisite(tmp_path, configured, status)
     bundle = load("bundle-ok")
     bundle["status"] = status
     p = bundle["payload"]
-    bundle["payload"] = {k: p[k] for k in ("prefilter", "coverage", "dependency_delta", "size")} \
-        if status == "skipped-size" else None
+    bundle["payload"] = {**{k: p[k] for k in ("prefilter", "coverage", "dependency_delta")},
+                         "size": size_record("skipped-size")} if status == "skipped-size" else None
     run = run_main(tmp_path, bundle=bundle, env={"GITHUB_TOKEN": None, "RUNNER_TEMP": None})
     assert_three_records(run, bundle)
     assert set(statuses(run).values()) == {status}

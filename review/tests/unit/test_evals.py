@@ -484,7 +484,7 @@ def test_stdout_is_one_line_per_case_for_a_hostile_case_name(tmp_path, capsys):
 # ------------------------------------------------------- expectation format v2
 
 APP_FILE = {
-    "path": "src/app.py", "status": "modified",
+    "path": "src/app.py", "status": "modified", "model_view": "full",
     "base_content": "a\nif not is_admin(user): raise Denied\nb\n",
     "head_content": "a\nb\neval(user_input)\n",
 }

@@ -21,7 +21,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
 
-from oc_review import envelope, linediff, render
+from oc_review import deps, envelope, linediff, render
 
 PASS = "pass"
 FAIL = "fail"
@@ -40,6 +40,7 @@ R_BASE_NOT_DEFAULT = "base-not-default-branch"
 R_HARD_BLOCK = "prefilter-hard-block"
 R_DEPENDENCY_REVIEW = "dependency-review"
 R_SIZE_GATE = "size-gate"
+R_PARTIAL_REVIEW = "partial-review"
 R_BLOCKING_FINDING = "blocking-finding"
 
 # Code decides what an override can waive, never the caller.
@@ -54,6 +55,7 @@ WAIVABLE: Mapping[str, bool] = MappingProxyType(
         R_HARD_BLOCK: False,
         R_DEPENDENCY_REVIEW: False,
         R_SIZE_GATE: True,
+        R_PARTIAL_REVIEW: True,
         R_BLOCKING_FINDING: True,
     }
 )
@@ -77,6 +79,9 @@ BLOCKING_SEVERITIES = frozenset({"high", "critical"})
 
 # A quote must sit within this many lines of the cited line.
 QUOTE_WINDOW = 3
+
+# Paths named in the `partial-review` detail (spec "Reasons").
+PARTIAL_PATHS_SHOWN = 10
 
 # PR title and body are cited as pseudo-files on side `head` (ruling R-META).
 # A leading `/` is never a git tree path, so no repo file can collide. They are
@@ -105,6 +110,9 @@ PUSH_EPOCH_EVENTS = frozenset(
 )
 
 OVERRIDE_PREFIX = "/oc-review"
+# The second word of a size-limit raise. Collect checks a raise; the override
+# parser skips it (spec "Override").
+SIZE_LIMIT_WORD = "size-limit"
 _OVERRIDE_RE = re.compile(r"/oc-review override (\S+) (\S+)(?: (.*))?")
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 # Legacy `permission` field of the collaborator permission API: maintain reads as write.
@@ -201,7 +209,8 @@ class FileSides:
     redacted text the model saw, or None when that side has no blob or its
     content is not available. Hunks are inclusive 1-based line ranges inside a
     diff hunk on that side. `no_hunks_reason` says why a file has no hunks
-    because its line diff went past a budget (`linediff`).
+    because its line diff went past a budget (`linediff`). The masked texts
+    are set for a lockfile only: the same text with hash values cut (M4).
     """
 
     path: str
@@ -211,6 +220,8 @@ class FileSides:
     base_hunks: tuple[tuple[int, int], ...] = ()
     head_hunks: tuple[tuple[int, int], ...] = ()
     no_hunks_reason: str | None = None
+    base_masked: str | None = None
+    head_masked: str | None = None
 
 
 def metadata_files(title_text: str | None, body_text: str | None) -> tuple[FileSides, ...]:
@@ -225,6 +236,14 @@ def _model(text: str | None) -> str | None:
     return None if text is None else render.model_text(text)
 
 
+def _masked_model(text: str | None) -> str | None:
+    """`model_text` of the masked redacted text, in render's order: redact,
+    mask each line, then the model-text steps (M2, M4)."""
+    if text is None:
+        return None
+    return render.model_text("\n".join(render.mask_hashes(x) for x in render.redact_text(text).split("\n")))
+
+
 def changed_file(
     path: str,
     *,
@@ -237,10 +256,13 @@ def changed_file(
 
     Each side is the text the model saw (`render.model_text`). Hunks come from
     the raw texts; redaction keeps the line count (ruling R-LINES). `work` is
-    the run's diff work budget.
+    the run's diff work budget. A lockfile (head path or old path) also gets
+    its masked texts (M4).
     """
     base_hunks, head_hunks, reason = _hunks(base_raw, head_raw, HUNK_CONTEXT, work)
-    return FileSides(path, old_path, _model(base_raw), _model(head_raw), base_hunks, head_hunks, reason)
+    lockfile = deps.is_lockfile_path(path) or (old_path is not None and deps.is_lockfile_path(old_path))
+    masked = (_masked_model(base_raw), _masked_model(head_raw)) if lockfile else (None, None)
+    return FileSides(path, old_path, _model(base_raw), _model(head_raw), base_hunks, head_hunks, reason, *masked)
 
 
 def metadata_files_from_raw(title: str | None, body: str | None) -> tuple[FileSides, ...]:
@@ -637,10 +659,13 @@ def _verify(f: FileSides | None, side: str, line: int, quote: str) -> str | None
         if _normalize(lines[line - 1]) != q:
             return "cited line is not only that redaction marker"
         return None
-    window = lines[max(0, line - 1 - QUOTE_WINDOW) : line + QUOTE_WINDOW]
-    if q not in _normalize("\n".join(window)):
-        return f"quote not found within {QUOTE_WINDOW} lines of the cited line"
-    return None
+    masked = f.head_masked if side == "head" else f.base_masked
+    texts = (lines,) if masked is None else (lines, _lines(masked))
+    for t in texts:
+        window = t[max(0, line - 1 - QUOTE_WINDOW) : line + QUOTE_WINDOW]
+        if q in _normalize("\n".join(window)):
+            return None
+    return f"quote not found within {QUOTE_WINDOW} lines of the cited line"
 
 
 def is_blocking(category: str, severity: str) -> bool:
@@ -745,10 +770,17 @@ def _override_rejection(
     return None
 
 
+def is_size_limit_command(body: str) -> bool:
+    """The first two words are `/oc-review size-limit`: a raise, not an override."""
+    words = body.split(None, 2)
+    return len(words) >= 2 and words[0] == OVERRIDE_PREFIX and words[1] == SIZE_LIMIT_WORD
+
+
 def evaluate_overrides(
     inputs: OverrideInputs, snapshot: SnapshotPair | None
 ) -> tuple[OverrideCandidate, ...]:
-    """Every comment that starts with `/oc-review`, valid or with its rejection code.
+    """Every comment that starts with `/oc-review`, valid or with its rejection
+    code, except a size-limit raise (collect checks those).
 
     The whole comment body (trimmed) must be the one command line.
     """
@@ -757,7 +789,7 @@ def evaluate_overrides(
     out = []
     for c in sorted(inputs.comments, key=lambda c: c.id):
         text = c.body.strip()
-        if not text.startswith(OVERRIDE_PREFIX):
+        if not text.startswith(OVERRIDE_PREFIX) or is_size_limit_command(text):
             continue
         m = _OVERRIDE_RE.fullmatch(text)
         reason = (m.group(3) or "").strip() if m else ""
@@ -902,6 +934,27 @@ def _prefilter_reasons(
     return out
 
 
+def partial_review_reason(payload: Mapping[str, Any]) -> Reason | None:
+    """`partial-review` for an `ok` payload whose size mode is `partial` or
+    that has a `not-reviewed` file (either is enough). Waivable; it never
+    clears another reason."""
+    files = payload.get("files")
+    paths = sorted(
+        f["path"]
+        for f in (files if isinstance(files, list) else ())
+        if isinstance(f, Mapping) and f.get("model_view") == "not-reviewed" and isinstance(f.get("path"), str)
+    )
+    size = payload.get("size")
+    if not paths and not (isinstance(size, Mapping) and size.get("mode") == "partial"):
+        return None
+    detail = f"partial model review: {len(paths)} file(s) not seen"
+    if paths:
+        detail += ": " + ", ".join(paths[:PARTIAL_PATHS_SHOWN])
+    if len(paths) > PARTIAL_PATHS_SHOWN:
+        detail += f" and {len(paths) - PARTIAL_PATHS_SHOWN} more"
+    return Reason(R_PARTIAL_REVIEW, detail)
+
+
 def _decide(reasons: Sequence[Reason], overrides: Sequence[OverrideCandidate]) -> tuple[str, bool]:
     """(status, override_applied). Pass only with no reason, or with waivable
     reasons only and a valid override."""
@@ -938,6 +991,10 @@ def compute_gate(inputs: GateInputs) -> GateResult:
             reasons.append(Reason(R_SIZE_GATE, "too large for automatic review"))
         elif status == "failed":
             reasons.append(Reason(R_ARTIFACT, "bundle status failed"))
+        elif status == "ok":
+            partial = partial_review_reason(bundle["payload"])
+            if partial is not None:
+                reasons.append(partial)
 
     # Exactly three pass records, one per pass.
     if len(inputs.passes) != len(PASS_NAMES):

@@ -18,6 +18,8 @@ from oc_review import deps
 from oc_review import prefilter as pf
 from oc_review.snapshot import ChangedFile, TreeDiff
 
+from .bundles import size_record
+
 FIXTURES = Path(__file__).parent / "fixtures" / "prefilter"
 NOW = datetime(2026, 10, 25, 12, 0, tzinfo=UTC)
 PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe\x00\x80"
@@ -322,7 +324,8 @@ class TestCoverage:
             "schema_version": 1, "kind": "bundle", "run_id": 1, "run_attempt": 1,
             "repository_id": 1, "pr_number": 1, "head_sha": "a" * 40, "base_repository_id": 1,
             "base_ref": "main", "base_tip_sha": "b" * 40, "merge_base_sha": "c" * 40, "status": status,
-            "payload": {**json.loads(json.dumps(r.to_dict())), "dependency_delta": {"packages": []}},
+            "payload": {**json.loads(json.dumps(r.to_dict())), "dependency_delta": {"packages": []},
+                        "size": size_record(status)},
         }
         envelope.validate_envelope(doc)
 
