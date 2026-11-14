@@ -350,6 +350,10 @@ class Console:
             return False
         return cp.returncode == 0
 
+    def call(self, args: Sequence[str], what: str) -> str:
+        """Any other `ant` call in this session (self_review_setup.py); returns stdout."""
+        return self._ant(args, what)
+
     def retrieve(self, rule_id: str) -> dict:
         out = self._ant([self.RULES, "retrieve", "--federation-rule-id", rule_id, "--format", "json"],
                         f"ant {self.RULES} retrieve {rule_id}")
@@ -365,12 +369,12 @@ class Console:
         return _json(out, f"update of rule {rule_id}")
 
 
-def check_ant(run: Runner) -> None:
-    """`ant` is installed and has the rule commands this tool calls. The
+def check_ant(run: Runner, resource: str = Console.RULES, commands: Sequence[str] = ("retrieve", "update")) -> None:
+    """`ant` is installed and `resource` has the commands this tool calls. The
     getter name `retrieve` is not confirmed by the docs, so check it here."""
     empty = tempfile.mkdtemp(prefix="oc-release-ant-help-")  # no profile in it
     try:
-        cp = run(["ant", Console.RULES, "--help"], env=ant_env(empty), capture_output=True, text=True)
+        cp = run(["ant", resource, "--help"], env=ant_env(empty), capture_output=True, text=True)
     except FileNotFoundError:
         raise ReleaseError("ant is not installed, so the Console cannot be read. Install it with "
                            "`brew install anthropics/tap/ant`, or run the plan with NO_CONSOLE=1 "
@@ -378,9 +382,9 @@ def check_ant(run: Runner) -> None:
     finally:
         remove_dir(empty)
     text = (cp.stdout or "") + (cp.stderr or "")
-    missing = [c for c in ("retrieve", "update") if not re.search(rf"\b{c}\b", text)]
+    missing = [c for c in commands if not re.search(rf"\b{c}\b", text)]
     if cp.returncode != 0 or missing:
-        raise ReleaseError(f"`ant {Console.RULES} --help` does not list {missing or 'its commands'}; "
+        raise ReleaseError(f"`ant {resource} --help` does not list {missing or 'its commands'}; "
                            "this ant build does not match the tool; read the help and fix the Console class")
 
 
@@ -855,6 +859,20 @@ def main(argv: Sequence[str] | None = None, run: Runner | None = None) -> int:
     s.add_argument("--rule", required=True)
     s.add_argument("--sha", required=True)
     args = p.parse_args(argv)
+
+    def interrupted() -> str:
+        if REPORTS_PRINTED:
+            return "Interrupted after a write was sent. Follow the RELEASE INCOMPLETE report above."
+        return "Interrupted before any write was sent. Nothing was changed."
+
+    if args.cmd == "rule-test":
+        return run_guarded(lambda: cmd_rule_test(args, run), interrupted)
+    return run_guarded(lambda: cmd_plan(args, run, apply=args.cmd == "release"), interrupted)
+
+
+def run_guarded(fn: Callable[[], int], interrupted: Callable[[], str]) -> int:
+    """Run one command with the exit rules of every owner tool: a refusal
+    exits 2, an interrupt 130 with `interrupted()`, a failed cleanup at least 3."""
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with ant's output
     for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -862,19 +880,12 @@ def main(argv: Sequence[str] | None = None, run: Runner | None = None) -> int:
     CLEANUP_FAILURES.clear()
     REPORTS_PRINTED.clear()
     try:
-        if args.cmd == "rule-test":
-            rc = cmd_rule_test(args, run)
-        else:
-            rc = cmd_plan(args, run, apply=args.cmd == "release")
+        rc = fn()
     except ReleaseError as e:
         print(f"\nREFUSED: {e}", file=sys.stderr)
         rc = 2
     except KeyboardInterrupt:
-        if REPORTS_PRINTED:
-            print("\nInterrupted after a write was sent. Follow the RELEASE INCOMPLETE report above.",
-                  file=sys.stderr)
-        else:
-            print("\nInterrupted before any write was sent. Nothing was changed.", file=sys.stderr)
+        print(f"\n{interrupted()}", file=sys.stderr)
         rc = 130
     if CLEANUP_FAILURES:
         print(f"\nCLEANUP FAILED ({len(CLEANUP_FAILURES)}): see the ERROR lines above.", file=sys.stderr)

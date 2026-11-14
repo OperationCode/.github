@@ -82,6 +82,15 @@ ANTHROPIC_FEDERATION_RULE_ID = "fdrl_01N2ZktTiVKqUvvXwywBFfys"
 ANTHROPIC_ORGANIZATION_ID = "2bc920f9-977b-43b2-870a-f840e4ce809c"
 ANTHROPIC_SERVICE_ACCOUNT_ID = "svac_01PiMgfb6qJgNpLZUV8hprCC"
 
+# Self-review rule R-self (spec "Auth and cost", "Self-review rule"): only for a
+# `pull_request_target` run in OperationCode/.github, which runs this file from
+# `main`, so R1 (bound to the release SHA) refuses its token. Own workspace,
+# same service account. The release tool never edits it. All zeros until the
+# owner creates it: such a run fails with "federation not configured".
+SELF_REVIEW_FEDERATION_RULE_ID = "fdrl_000000000000000000000000"
+SELF_REVIEW_REPOSITORY_ID = "1432342572"  # OperationCode/.github
+SELF_REVIEW_EVENT_NAME = "pull_request_target"
+
 FEDERATION_RULE_ID_RE = re.compile(r"^fdrl_[A-Za-z0-9]{24}$")
 ORGANIZATION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 SERVICE_ACCOUNT_ID_RE = re.compile(r"^svac_[A-Za-z0-9]{24}$")
@@ -453,6 +462,15 @@ def federation_ids() -> FederationIds:
     return FederationIds(ANTHROPIC_FEDERATION_RULE_ID, ANTHROPIC_ORGANIZATION_ID, ANTHROPIC_SERVICE_ACCOUNT_ID)
 
 
+def self_review_federation(env: Mapping[str, str]) -> FederationIds | None:
+    """R-self for a `pull_request_target` run in `.github`, else None (R1).
+    Only runner-set variables decide; a workflow cannot override `GITHUB_*`."""
+    if (env.get("GITHUB_REPOSITORY_ID") == SELF_REVIEW_REPOSITORY_ID
+            and env.get("GITHUB_EVENT_NAME") == SELF_REVIEW_EVENT_NAME):
+        return FederationIds(SELF_REVIEW_FEDERATION_RULE_ID, ANTHROPIC_ORGANIZATION_ID, ANTHROPIC_SERVICE_ACCOUNT_ID)
+    return None
+
+
 def _all_zero(s: str) -> bool:
     return set(s) <= {"0", "-"}
 
@@ -796,7 +814,8 @@ def analyze(
     pass problem; every path gives three results.
 
     `federation` is the Anthropic federation IDs. None (the review path) means
-    the production constants of this module. The eval runner passes its own.
+    the production constants of this module (R1). `main` passes R-self for a
+    `.github` self-review run; the eval runner passes its own.
 
     `github` is None without `GITHUB_TOKEN`, and `runner_temp` is None without
     `RUNNER_TEMP`. Only a bundle with status `ok` needs them; without them its
@@ -1016,6 +1035,7 @@ def main(
             client_factory=client_factory,
             clock=clock,
             deadline_seconds=deadline_seconds,
+            federation=self_review_federation(env),
         )
     except Exception as exc:  # noqa: BLE001 - fail closed with three records
         print(f"analyze: internal error: {type(exc).__name__}", file=sys.stderr)

@@ -7,10 +7,12 @@
 #   make release SHA=<sha>                       plan, then apply at once (no prompt), read back
 #   make release-rule-test RULE=<id> SHA=<sha>   Console-only edit of a scratch rule
 #   rollback: make release SHA=<previous release sha>
+#   make self-review-plan                        read-only: what the R-self setup would create
+#   make self-review-setup                       create the R-self workspace and rule, write its ID into analyze.py
 
 TOOL = cd review && uv run --frozen python tools/release.py
 
-.PHONY: release-plan release release-rule-test
+.PHONY: release-plan release release-rule-test self-review-plan self-review-setup
 
 release-plan:
 	$(TOOL) plan --sha "$(SHA)" $(if $(NO_CONSOLE),--no-console)
@@ -20,3 +22,9 @@ release:
 
 release-rule-test:
 	$(TOOL) rule-test --rule "$(RULE)" --sha "$(SHA)"
+
+self-review-plan:
+	cd review && uv run --frozen python tools/self_review_setup.py plan
+
+self-review-setup:
+	cd review && uv run --frozen python tools/self_review_setup.py setup
