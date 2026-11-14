@@ -87,7 +87,7 @@ ANTHROPIC_SERVICE_ACCOUNT_ID = "svac_01PiMgfb6qJgNpLZUV8hprCC"
 # `main`, so R1 (bound to the release SHA) refuses its token. Own workspace,
 # same service account. The release tool never edits it. All zeros until the
 # owner creates it: such a run fails with "federation not configured".
-SELF_REVIEW_FEDERATION_RULE_ID = "fdrl_000000000000000000000000"
+SELF_REVIEW_FEDERATION_RULE_ID = "fdrl_01H55hazuL13miWZeFux8NMK"
 SELF_REVIEW_REPOSITORY_ID = "1432342572"  # OperationCode/.github
 SELF_REVIEW_EVENT_NAME = "pull_request_target"
 
