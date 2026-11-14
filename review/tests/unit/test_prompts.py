@@ -116,6 +116,11 @@ SYSTEM_RULES = [
     ("What the bundle holds", "`/.pr/title`"),
     ("What the bundle holds", "`/.pr/body`"),
     ("What the bundle holds", "Never guess or rebuild a redacted value"),
+    # P6-6: what the model can see of each file.
+    ("What the bundle holds", "A file's coverage note says when the full content or the patch is not shown"),
+    ("What the bundle holds", 'cut to their first 8 characters followed by "~"'),
+    ("What the bundle holds", "a file marked not reviewed shows neither content nor patch"),
+    ("What the bundle holds", "Do not guess what you cannot see"),
     ("What counts as a finding", "a line in the PR title or body"),
     ("Citation rules", 'file: "/.pr/title"'),
     ("Citation rules", 'file: "/.pr/body"'),

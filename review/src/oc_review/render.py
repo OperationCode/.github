@@ -31,9 +31,16 @@ any other key with the same generic rules, so it drops nothing:
                         author_login, author_association, labels}
     files:             [{path, old_path, status, additions, deletions,
                          head_blob_sha, base_blob_sha, binary, size, coverage,
-                         patch, patch_redaction, content, head_content,
+                         model_view, model_view_reason, patch,
+                         patch_redaction, content, head_content,
                          base_content}]
     dependency_delta, prefilter: {signals, hard_blocks}, coverage, size
+
+- Each file shows a fixed `coverage note:` line for its `model_view`
+  (`COVERAGE_NOTES`). A `not-reviewed` file has no patch and no content.
+- `size` shows only `SIZE_KEYS_SHOWN`.
+- A lockfile patch has its hash values cut (`mask_hashes`, inside
+  `redact_patch(..., lockfile=True)`).
 
 - `pr.title` and `pr.body` are shown like files, with line numbers, at the
   reserved paths `/.pr/title` and `/.pr/body` (ruling R-META).
@@ -950,6 +957,92 @@ def _parse_patch(patch: str) -> tuple[list[_Row], list[str]]:
     return rows, texts
 
 
+# ---------------------------------------------------------------------------
+# Lockfile hash mask (spec "Lockfiles in the bundle", M1 to M3)
+# ---------------------------------------------------------------------------
+
+# Keys whose whole value may be a bare lower-case hex hash (M1 rule 2).
+MASK_HASH_KEYS = ("checksum", "content-hash", "shasum")
+MASK_KEEP_CHARS = 8
+MASK_MARK = "~"
+# Only an unambiguous hash value is masked: exact body lengths, and a
+# boundary on each side, so text inside a URL or after `/` stays whole. A
+# trailing CR only at the line end, so the mask commutes with `model_lines`,
+# which drops it (N2).
+_MASK_LEFT = r"(?<![^ \t\"'=,(\[{])"
+_MASK_RIGHT = r"(?=[ \t\"',)\]};]|\r?\Z)"
+_PREFIXED_HASH = re.compile(
+    _MASK_LEFT
+    + r"(?P<head>sha1-|sha256-|sha384-|sha512-|sha1[:=]|sha256[:=]|sha384[:=]|sha512[:=]|h1:)"
+    + r"(?P<body>[A-Za-z0-9+/]{27}=|[A-Za-z0-9+/]{43}=|[A-Za-z0-9+/]{64}|[A-Za-z0-9+/]{86}==|[0-9a-f]{40,128})"
+    + _MASK_RIGHT
+)
+# Exact body per prefix: SRI base64 with its padding, lower-case hex, Go h1.
+_HASH_BODY = {
+    "sha1-": re.compile(r"[A-Za-z0-9+/]{27}="),
+    "sha256-": re.compile(r"[A-Za-z0-9+/]{43}="),
+    "sha384-": re.compile(r"[A-Za-z0-9+/]{64}"),
+    "sha512-": re.compile(r"[A-Za-z0-9+/]{86}=="),
+    "sha1": re.compile(r"[0-9a-f]{40}"),
+    "sha256": re.compile(r"[0-9a-f]{64}"),
+    "sha384": re.compile(r"[0-9a-f]{96}"),
+    "sha512": re.compile(r"[0-9a-f]{128}"),
+    "h1:": re.compile(r"[A-Za-z0-9+/]{43}="),
+}
+# An SRI body must hold a character no package name holds.
+_NOT_A_NAME = re.compile(r"[A-Z+/=]")
+# `key = "<hex>"`, `key: <hex>` or `"key": "<hex>"` as the whole line, with an
+# optional yarn berry cache-key prefix such as `10c0/` (N4: the prefix is part
+# of the value, so no left boundary applies to the hex).
+_KEYED_HEX = re.compile(
+    r"(?P<pre>[ \t]*(?P<kq>\"?)(?:" + "|".join(re.escape(k) for k in MASK_HASH_KEYS) + r")(?P=kq)"
+    r"[ \t]*[:=][ \t]*(?P<vq>\"?)(?:\d+c\d+/)?)"
+    r"(?P<hex>[0-9a-f]{128}|[0-9a-f]{96}|[0-9a-f]{64}|[0-9a-f]{40})"
+    r"(?P<post>(?P=vq)[ \t]*,?[ \t]*\r?)"
+)
+
+
+def _cut(value: str) -> str:
+    return value[:MASK_KEEP_CHARS] + MASK_MARK
+
+
+def _mask_prefixed(m: re.Match[str]) -> str:
+    head, body = m.group("head"), m.group("body")
+    rule = _HASH_BODY[head if head in _HASH_BODY else head[:-1]]
+    if not rule.fullmatch(body) or (head.endswith("-") and not _NOT_A_NAME.search(body)):
+        return m.group()
+    return head + _cut(body)
+
+
+def mask_hashes(line: str) -> str:
+    """One lockfile line with each hash value cut to its first 8 characters
+    and `~` (M1). The algorithm name, the separator and the key stay. Mask
+    only an unambiguous hash: when in doubt, do not mask. A bare hex token
+    is masked only as the whole value of a `MASK_HASH_KEYS` key, so a git
+    commit ID (under `reference`, `commit`, `rev`, or in a URL) stays whole.
+    """
+    keyed = _KEYED_HEX.fullmatch(line)
+    if keyed is not None:
+        return keyed.group("pre") + _cut(keyed.group("hex")) + keyed.group("post")
+    return _PREFIXED_HASH.sub(_mask_prefixed, line)
+
+
+def _mask_rows(rows: list[_Row], shown: list[str]) -> list[str]:
+    """`shown` (redacted line texts) with every changed and context line
+    masked, except removed and added lines that the mask would make equal
+    to a different line on the other side, anywhere in the patch (M3)."""
+    masked = [mask_hashes(t) if m in ("-", "+", " ") else t for (_, _, m), t in zip(rows, shown)]
+    by_side: dict[str, dict[str, set[str]]] = {"-": {}, "+": {}}
+    for (_, _, m), raw, mk in zip(rows, shown, masked):
+        if m in by_side:
+            by_side[m].setdefault(mk, set()).add(raw)
+    out = []
+    for (_, _, m), raw, mk in zip(rows, shown, masked):
+        other = by_side["+" if m == "-" else "-"] if m in by_side else {}
+        out.append(raw if other.get(mk, set()) - {raw} else mk)
+    return out
+
+
 # File keys kept in the bundle for the citation check only, never sent to
 # Claude, at any length. Claude sees head text in `content` and the patch, and
 # base lines only inside the numbered patch hunks.
@@ -991,7 +1084,7 @@ def _more_redacted(from_base: str, from_head: str) -> str:
     return from_base if rank(from_base) < rank(from_head) else from_head
 
 
-def redact_patch(patch: str, base_text: str | None, head_text: str | None) -> str:
+def redact_patch(patch: str, base_text: str | None, head_text: str | None, *, lockfile: bool = False) -> str:
     """Redact a unified diff with the context of its two full blobs.
 
     collect.py must call this for every patch it puts in the bundle and set
@@ -1007,21 +1100,33 @@ def redact_patch(patch: str, base_text: str | None, head_text: str | None) -> st
     patch line must equal its blob line, else RenderError (fail closed).
     Hunk section text (after the second `@@`) is dropped: it is a line of the
     file with no line number, so it cannot be redacted with its context.
+
+    `lockfile=True` masks hash values after redaction (M2, `mask_hashes`),
+    within each line, so the line count and every changed line stay; a
+    removed and an added line that the mask would make equal stay raw (M3).
     """
     rows, texts = _parse_patch(patch)
     base, head = _blob_lines(base_text, "base"), _blob_lines(head_text, "head")
-    out = []
+    shown = []
     for (b, h, marker), text in zip(rows, texts):
+        if marker.startswith("@") or marker == "\\":
+            shown.append("")
+        elif marker == "-":
+            shown.append(_side_line(base, b, text, "base"))
+        elif marker == "+":
+            shown.append(_side_line(head, h, text, "head"))
+        else:
+            shown.append(_more_redacted(_side_line(base, b, text, "base"), _side_line(head, h, text, "head")))
+    if lockfile:
+        shown = _mask_rows(rows, shown)
+    out = []
+    for (_, _, marker), text in zip(rows, shown):
         if marker.startswith("@"):
             out.append(marker[1:].rstrip())
         elif marker == "\\":
             out.append(_NO_NEWLINE)
-        elif marker == "-":
-            out.append("-" + _side_line(base, b, text, "base"))
-        elif marker == "+":
-            out.append("+" + _side_line(head, h, text, "head"))
         else:
-            out.append(" " + _more_redacted(_side_line(base, b, text, "base"), _side_line(head, h, text, "head")))
+            out.append(marker + text)
     return "".join(line + "\n" for line in out)
 
 
@@ -1057,6 +1162,33 @@ def _emit_patch(out: list[str], patch: Any, redaction: Any) -> None:
     out.extend(f"  | {line}" for line in lines)
 
 
+# One fixed note line per model view (spec "Model view per file"), after the
+# file's keys and before its patch. `full`, `diff-only` / `no-head-text` and
+# `no-text` have none.
+COVERAGE_NOTES = {
+    ("diff-only", "long-file"): "Patch only. Full content not shown: the file has 2,000 lines or more.",
+    ("diff-only", "size-limit"): "Patch only. Full content not shown: the bundle was over its size limit.",
+    ("diff-only", "lockfile"): (
+        "Patch only. The full content of a lockfile is never shown. "
+        'Hash values are cut to their first 8 characters, followed by "~".'
+    ),
+    ("not-reviewed", None): (
+        "Not reviewed: no patch and no content, because the bundle was over its size limit. "
+        "Do not report findings about changes you cannot see."
+    ),
+}
+# The size record keys Claude sees; the others are for the publisher only.
+SIZE_KEYS_SHOWN = ("estimated_tokens", "limit_tokens", "multiplier", "mode")
+
+
+def render_file_block(index: int, total: int, f: Any) -> str:
+    """One file's block of the rendered bundle, alone. Collect sums block
+    lengths to choose size-limit drops, then confirms with a full render."""
+    out: list[str] = []
+    _emit_file(out, index, total, f)
+    return "\n".join(out)
+
+
 def _emit_file(out: list[str], index: int, total: int, f: Any) -> None:
     out.append(f"--- file {index} of {total} ---")
     if not isinstance(f, Mapping):
@@ -1066,6 +1198,9 @@ def _emit_file(out: list[str], index: int, total: int, f: Any) -> None:
     for k, v in f.items():
         if k not in ("patch", "content") and k not in VERIFY_ONLY_FILE_KEYS:
             _emit(out, 0, _key(k), v, 1)
+    note = COVERAGE_NOTES.get((f.get("model_view"), f.get("model_view_reason")))
+    if note is not None:
+        out.append(f"coverage note: {note}")
     if binary:
         return
     if "patch" in f:
@@ -1107,6 +1242,10 @@ def _render_inner(envelope: Mapping[str, Any]) -> str:
         out.append(f"=== {_key(key)} ===")
         if key == "pr" and isinstance(value, Mapping):
             _emit_pr(out, value)
+        elif key == "size" and isinstance(value, Mapping):
+            for k in SIZE_KEYS_SHOWN:
+                if k in value:
+                    _emit(out, 0, k, value[k], 1)
         elif isinstance(value, Mapping):
             for k, v in value.items():
                 _emit(out, 0, _key(k), v, 1)

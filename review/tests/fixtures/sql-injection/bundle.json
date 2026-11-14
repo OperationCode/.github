@@ -37,6 +37,7 @@
         "binary": false,
         "size": 699,
         "coverage": "full",
+        "model_view": "full",
         "patch": "@@ -5,6 +5,13 @@\n \n const router = express.Router();\n \n+router.get(\"/members/search\", async (req, res) => {\n+  const name = req.query.name || \"\";\n+  const sql = \"SELECT id, display_name, email FROM members WHERE display_name LIKE '%\" + name + \"%' ORDER BY display_name\";\n+  const { rows } = await db.query(sql);\n+  return res.json(rows);\n+});\n+\n router.get(\"/members/:id\", async (req, res) => {\n   const { rows } = await db.query(\"SELECT id, display_name FROM members WHERE id = $1\", [req.params.id]);\n   if (rows.length === 0) {\n",
         "patch_redaction": "blob-context",
         "content": "\"use strict\";\n\nconst express = require(\"express\");\nconst db = require(\"../db\");\n\nconst router = express.Router();\n\nrouter.get(\"/members/search\", async (req, res) => {\n  const name = req.query.name || \"\";\n  const sql = \"SELECT id, display_name, email FROM members WHERE display_name LIKE '%\" + name + \"%' ORDER BY display_name\";\n  const { rows } = await db.query(sql);\n  return res.json(rows);\n});\n\nrouter.get(\"/members/:id\", async (req, res) => {\n  const { rows } = await db.query(\"SELECT id, display_name FROM members WHERE id = $1\", [req.params.id]);\n  if (rows.length === 0) {\n    return res.status(404).json({ error: \"not found\" });\n  }\n  return res.json(rows[0]);\n});\n\nmodule.exports = router;\n",
@@ -46,6 +47,7 @@
     ],
     "dependency_delta": {
       "changes": [],
+      "removed": [],
       "new_global_sources": [],
       "failures": []
     },
@@ -67,8 +69,14 @@
       "complete": true
     },
     "size": {
-      "estimated_tokens": 825,
-      "limit_tokens": 150000
+      "estimated_tokens": 1976,
+      "limit_tokens": 200000,
+      "base_limit_tokens": 200000,
+      "multiplier": 1,
+      "mode": "full",
+      "commands_read": true,
+      "raise": null,
+      "rejected_commands": []
     }
   }
 }

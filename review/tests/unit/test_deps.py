@@ -1424,3 +1424,61 @@ def test_lookup_npm_accepts_a_gzip_response_through_default_fetch():
     resp = _gz_resp(_gz(doc), step=64, url="https://registry.npmjs.org/esbuild")
     info = deps.lookup_npm("esbuild", "0.19.0", lambda url, mb, t: deps.default_fetch(url, mb, t, opener=_Opener(resp)))
     assert info.name == "esbuild"
+
+
+# ---------------------------------------------------------------- lockfile paths and removed rows (P6-6)
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("package-lock.json", True),
+        ("web/yarn.lock", True),
+        ("pnpm-lock.yaml", True),
+        ("poetry.lock", True),
+        ("uv.lock", True),
+        ("requirements.txt", True),
+        ("requirements-dev.txt", True),
+        ("Gemfile.lock", True),
+        ("go.sum", True),
+        ("Cargo.lock", True),
+        ("composer.lock", True),
+        ("Pipfile.lock", True),
+        ("pdm.lock", True),
+        ("npm-shrinkwrap.json", True),
+        ("gradle.lockfile", True),
+        ("mix.lock", True),
+        ("pubspec.lock", True),
+        ("packages.lock.json", True),
+        ("bun.lock", True),
+        ("package.json", False),
+        ("pyproject.toml", False),
+        ("go.mod", False),
+        ("src/uv.lock.py", False),
+        ("bun.lockb", False),
+        (".github/workflows/ci.yml", False),
+    ],
+)
+def test_is_lockfile_path(path, expected):
+    assert deps.is_lockfile_path(path) is expected
+
+
+def _parsed(path: str, *pkgs: tuple[str, str]) -> deps.ParsedDeps:
+    src = deps.official_npm_source()
+    return deps.ParsedDeps(path, "package-lock.json", "3", tuple(deps.Package("npm", n, v, src) for n, v in pkgs))
+
+
+def test_compute_removed_lists_names_that_are_gone():
+    old = _parsed("package-lock.json", ("a", "1.0.0"), ("b", "2.0.0"), ("b", "1.0.0"), ("c", "1.0.0"))
+    new = _parsed("package-lock.json", ("a", "1.1.0"), ("d", "1.0.0"))
+    removed = deps.compute_removed(old, new)
+    # A version change of `a` is a change, not a removed row; `b` keeps its sorted base versions.
+    assert removed == [
+        deps.RemovedPackage("package-lock.json", "npm", "b", ("1.0.0", "2.0.0")),
+        deps.RemovedPackage("package-lock.json", "npm", "c", ("1.0.0",)),
+    ]
+
+
+def test_compute_removed_is_empty_when_nothing_is_gone():
+    old = _parsed("package-lock.json", ("a", "1.0.0"))
+    assert deps.compute_removed(old, _parsed("package-lock.json", ("a", "2.0.0"), ("b", "1.0.0"))) == []

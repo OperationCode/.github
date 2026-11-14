@@ -37,6 +37,7 @@
         "binary": false,
         "size": 146,
         "coverage": "full",
+        "model_view": "full",
         "patch": "@@ -0,0 +1,5 @@\n+#!/usr/bin/env node\n+var accessLevel = \"user\";\n+if (accessLevel != \"user\u202e \u2066// Check if admin\u2069 \u2066\") {\n+    console.log(\"You are an admin.\");\n+}\n",
         "patch_redaction": "blob-context",
         "content": "#!/usr/bin/env node\nvar accessLevel = \"user\";\nif (accessLevel != \"user\u202e \u2066// Check if admin\u2069 \u2066\") {\n    console.log(\"You are an admin.\");\n}\n",
@@ -45,6 +46,7 @@
     ],
     "dependency_delta": {
       "changes": [],
+      "removed": [],
       "new_global_sources": [],
       "failures": []
     },
@@ -90,8 +92,14 @@
       "complete": true
     },
     "size": {
-      "estimated_tokens": 581,
-      "limit_tokens": 150000
+      "estimated_tokens": 1403,
+      "limit_tokens": 200000,
+      "base_limit_tokens": 200000,
+      "multiplier": 1,
+      "mode": "full",
+      "commands_read": true,
+      "raise": null,
+      "rejected_commands": []
     }
   }
 }

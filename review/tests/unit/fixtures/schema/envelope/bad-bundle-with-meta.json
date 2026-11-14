@@ -43,7 +43,14 @@
       "files_collected": 1
     },
     "size": {
-      "estimated_tokens": 200000
+      "estimated_tokens": 12000,
+      "limit_tokens": 200000,
+      "base_limit_tokens": 200000,
+      "multiplier": 1,
+      "mode": "full",
+      "commands_read": true,
+      "raise": null,
+      "rejected_commands": []
     }
   },
   "meta": {

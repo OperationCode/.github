@@ -32,7 +32,13 @@
     },
     "size": {
       "estimated_tokens": 300,
-      "limit_tokens": 150000
+      "limit_tokens": 200000,
+      "base_limit_tokens": 200000,
+      "multiplier": 1,
+      "mode": "full",
+      "commands_read": true,
+      "raise": null,
+      "rejected_commands": []
     }
   }
 }

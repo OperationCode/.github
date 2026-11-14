@@ -294,6 +294,7 @@ class DependencyFacts:
     - `base_failures`: changed supported files whose merge-base side does not
       parse or has an unknown version. That side counts as empty, so every
       head entry is in `changes`. A signal only (ruling R-BASEDEPS).
+    - `removed`: names the parsed base has and the head does not (P6-6).
     """
 
     parsed_paths: frozenset[str] = frozenset()
@@ -302,6 +303,8 @@ class DependencyFacts:
     registry: Mapping[tuple[str, str, str], deps.RegistryInfo] = field(default_factory=dict)
     failures: Sequence[DepFailure] = ()
     base_failures: Sequence[DepFailure] = ()
+    # deps.compute_removed rows: context for Claude only, no check reads them.
+    removed: Sequence[deps.RemovedPackage] = ()
 
 
 @dataclass(frozen=True)

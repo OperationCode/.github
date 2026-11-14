@@ -17,7 +17,17 @@
       "hard_blocks": []
     },
     "coverage": {},
-    "dependency_delta": {}
+    "dependency_delta": {},
+    "size": {
+      "estimated_tokens": 12000,
+      "limit_tokens": 200000,
+      "base_limit_tokens": 200000,
+      "multiplier": 1,
+      "mode": "full",
+      "commands_read": true,
+      "raise": null,
+      "rejected_commands": []
+    }
   },
   "extra": true
 }

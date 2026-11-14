@@ -14,7 +14,8 @@ A case is a directory of `tests/fixtures` with a `source/` directory:
   `tests/unit/fixtures/collect` route-map shape (`{"status", "json"}`).
 
 The builder synthesizes the GitHub responses that `collect.collect()` reads
-(PR, base ref, compare, two recursive trees, blobs with real git blob SHAs)
+(PR, base ref, compare, two recursive trees, blobs with real git blob SHAs,
+an empty comment list)
 and runs the real `collect()` with a fixed clock, run ID and attempt. So the
 hard blocks, signals and redaction in each committed bundle come from the real
 prefilter, and a unit test checks that each committed bundle equals a fresh
@@ -171,6 +172,8 @@ def github_routes(source: CaseSource) -> tuple[dict[str, Any], dict[str, bytes]]
         f"{repo}/compare/{merge_base}...{head_sha}?per_page=1": json.dumps(compare).encode(),
         f"{repo}/git/trees/{merge_base}?recursive=1": json.dumps(_tree(source.base)).encode(),
         f"{repo}/git/trees/{head_sha}?recursive=1": json.dumps(_tree(source.head)).encode(),
+        # No size-limit commands: an empty comment list.
+        f"{repo}/issues/{number}/comments?per_page=100": b"[]",
     }
     for data in (*source.base.values(), *source.head.values()):
         routes[f"{repo}/git/blobs/{prefilter.git_blob_sha(data)}"] = data
