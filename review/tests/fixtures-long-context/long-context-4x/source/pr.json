@@ -1,0 +1,9 @@
+{
+  "number": 15,
+  "title": "Move every service module to the structured logger",
+  "body": "Moves every module, the tests and the service docs from `src/lib/legacyLog.js` to the new pino-based `src/lib/logger.js`. Some calls switch to pino's `(obj, msg)` order. Also tidies the attachment download route while touching its logging.\n",
+  "author_association": "CONTRIBUTOR",
+  "comments": [
+    {"id": 5001, "login": "oc-maintainer", "permission": "write", "body": "/oc-review size-limit 4x"}
+  ]
+}

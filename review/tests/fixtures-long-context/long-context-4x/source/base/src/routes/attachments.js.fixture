@@ -1,0 +1,25 @@
+"use strict";
+
+const path = require("path");
+const express = require("express");
+const { requireLogin } = require("../auth");
+const log = require("../lib/legacyLog");
+
+const router = express.Router();
+const UPLOAD_ROOT = path.resolve(__dirname, "../../uploads");
+
+// Members download the files attached to their own profile.
+router.get("/members/:memberId/attachments", requireLogin, async (req, res) => {
+  if (String(req.user.id) !== req.params.memberId) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const name = path.basename(String(req.query.name || ""));
+  if (!name) {
+    return res.status(400).json({ error: "name is required" });
+  }
+  const file = path.join(UPLOAD_ROOT, req.params.memberId, name);
+  log.info("attachment download", req.params.memberId);
+  return res.sendFile(file);
+});
+
+module.exports = router;

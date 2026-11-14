@@ -1,0 +1,6 @@
+{
+  "findings": [
+    {"category": ["supply-chain", "malicious", "security"], "severity": "medium", "file": "requirements.txt", "verified": true}
+  ],
+  "hard_blocks": []
+}

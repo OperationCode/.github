@@ -1,0 +1,6 @@
+{
+  "number": 14,
+  "title": "Install the base requirements from the shared mirror",
+  "body": "CI and local installs drifted apart on the base set. This points the base include at the shared mirror so every install resolves the same base requirements. No package versions change.\n",
+  "author_association": "CONTRIBUTOR"
+}

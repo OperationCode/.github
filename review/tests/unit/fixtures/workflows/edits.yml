@@ -590,8 +590,8 @@
 # --- eval.yml (spec "Fixture eval credential") ---
 - id: eval-workflow-call
   file: eval.yml
-  old: "on: workflow_dispatch\n"
-  new: "on: [workflow_dispatch, workflow_call]\n"
+  old: "on:\n  workflow_dispatch:\n"
+  new: "on:\n  workflow_call:\n  workflow_dispatch:\n"
   expect: eval-trigger
 - id: eval-pull-requests-write
   file: eval.yml

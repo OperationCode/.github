@@ -1,0 +1,6 @@
+# Shared base set for every OperationCode Python service.
+--require-hashes
+gunicorn==22.0.0 \
+    --hash=sha256:dfc72c61c254853d1db65bb3945b3bb9f47370cc7b3fcd2bf720dc176d642034
+packaging==24.1 \
+    --hash=sha256:f9592206fea640cf75a3092eff70cc49fb39a806db5562f7e343598d92d3f38b
