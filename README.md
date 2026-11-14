@@ -24,3 +24,5 @@ make release-rule-test RULE=<id> SHA=<sha>  # Console-only edit of a scratch rul
 ```
 
 Before and after JSON goes to `release-records/` (git-ignored, no secrets).
+
+<!-- R-self check -->
