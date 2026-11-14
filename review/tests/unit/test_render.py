@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import random
 import re
+import time
 import unicodedata
 
 import pytest
@@ -1920,3 +1921,49 @@ def test_size_shows_only_the_keys_claude_needs():
     section = inner.split("=== size ===\n", 1)[1].split("\n===", 1)[0]
     assert section.split("\n") == ["estimated_tokens: 123", "limit_tokens: 400000", "multiplier: 2", "mode: partial"]
     assert "maintainer-login" not in inner and "outsider-login" not in inner
+
+
+# ---------------------------------------------------------------- mask cost stays linear (final review)
+
+# Loose for CI: the fixed code takes well under a second here; the old code
+# took minutes for the long line and tens of seconds for the collision group.
+MASK_TIME_LIMIT_SECONDS = 5.0
+
+
+def test_url_scan_of_a_long_letter_run_is_linear():
+    head = "# " + "a" * 1_000_000 + "\n"
+    start = time.perf_counter()
+    out = r.redact_patch("@@ -0,0 +1 @@\n+" + head, None, head, lockfile=True)
+    assert time.perf_counter() - start < MASK_TIME_LIMIT_SECONDS
+    assert out == "@@ -0,0 +1 @@\n+" + head
+    # A long scheme-character run before `://` is still a URL start.
+    for line in ("x" * 100_000 + f"://h/?q=sha1:{HEX40}", f"1abc://h/?q=sha1:{HEX40}", f"+git.x-y://h?sha1:{HEX40}"):
+        assert r.mask_hashes(line) == line
+
+
+def test_many_hashes_next_to_many_urls_cost_n_log_n():
+    # Each hash match checks the URL spans by a binary search, not a scan.
+    piece = f"//x sha1:{HEX40} "
+    line = piece * (1_900_000 // len(piece))
+    start = time.perf_counter()
+    out = r.mask_hashes(line)
+    assert time.perf_counter() - start < MASK_TIME_LIMIT_SECONDS
+    # `//x` ends at the space, so every hash after it is outside a URL: masked.
+    assert out == "//x sha1:a1a1a1a1~ " * (1_900_000 // len(piece))
+    # A hash inside a URL among many spans still stays whole.
+    mixed = "//a " * 1000 + f"//h?q=sha1:{HEX40} " + "//b " * 1000 + f"sha1:{HEX40}"
+    assert r.mask_hashes(mixed) == mixed[: -40] + "a1a1a1a1~"
+
+
+def test_m3_with_a_large_collision_group_is_linear():
+    n = 40_000
+    rows = [(i + 1, None, "-") for i in range(n)] + [(None, i + 1, "+") for i in range(n)]
+    shown = ["sha256:deadbeef" + format(i, "056x") for i in range(2 * n)]
+    start = time.perf_counter()
+    out = r._mask_rows(rows, shown)
+    assert time.perf_counter() - start < MASK_TIME_LIMIT_SECONDS
+    # Every row collides with a different row on the other side: all stay raw (M3).
+    assert out == shown
+    # One removed and one added row that are the same raw line stay masked.
+    same = "sha256:deadbeef" + "0" * 56
+    assert r._mask_rows([(1, None, "-"), (None, 1, "+")], [same, same]) == ["sha256:deadbeef~"] * 2
