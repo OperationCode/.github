@@ -566,6 +566,24 @@ def test_rule_test_refuses_the_production_rule():
     assert fake.calls == []
 
 
+def test_release_targets_r1_only_never_r_self():
+    from oc_review import analyze
+    assert R1 == analyze.ANTHROPIC_FEDERATION_RULE_ID
+    assert R1 != analyze.SELF_REVIEW_FEDERATION_RULE_ID
+    fake = Fake()
+    assert release.main(["release", "--sha", SHA_NEW], run=fake) == 0
+    touched = {c[c.index("--federation-rule-id") + 1] for c, _ in fake.calls if "--federation-rule-id" in c}
+    assert touched == {R1}
+
+
+def test_rule_test_refuses_a_rule_bound_to_a_branch_ref_such_as_r_self():
+    fake = Fake()
+    r_self = "fdrl_01SelfReviewRuleIdAbcdef"
+    fake.rules[r_self] = rule(r_self, sha="refs/heads/main")
+    assert release.main(["rule-test", "--rule", r_self, "--sha", SHA_NEW], run=fake) == 2
+    assert fake.writes() == [] and fake.rules[r_self] == rule(r_self, sha="refs/heads/main")
+
+
 # ---------------------------------------------------------------- never in CI
 
 
@@ -573,6 +591,7 @@ def test_no_workflow_runs_the_release_tool():
     for path in (ROOT / ".github" / "workflows").glob("*.y*ml"):
         text = path.read_text(encoding="utf-8")
         assert "release.py" not in text and "make release" not in text and "ant " not in text, path.name
+        assert "self_review_setup" not in text and "make self-review" not in text, path.name
 
 
 def test_default_runner_is_guarded_in_tests():

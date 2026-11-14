@@ -190,6 +190,7 @@ class Run:
     oidc: FakeOidc
     out_dir: Path
     token_files: list
+    factory_kwargs: list = field(default_factory=list)
 
 
 def run_main(tmp_path, *, client=None, bundle=None, digest=None, github=None, oidc=None, env=None,
@@ -219,11 +220,12 @@ def run_main(tmp_path, *, client=None, bundle=None, digest=None, github=None, oi
     client = client or FakeClient()
     github = github or FakeGitHub()
     oidc = oidc or FakeOidc()
-    token_files = []
+    token_files, factory_kwargs = [], []
 
-    def factory(token_file, *, deadline, clock):
+    def factory(token_file, *, deadline, clock, **kw):
         mode = stat.S_IMODE(token_file.stat().st_mode)
         token_files.append((token_file, mode, token_file.read_text()))
+        factory_kwargs.append(kw)
         if factory_exc is not None:
             raise factory_exc
         if real_factory is not None:
@@ -251,7 +253,7 @@ def run_main(tmp_path, *, client=None, bundle=None, digest=None, github=None, oi
         for line in output.read_text().splitlines():
             k, _, v = line.partition("=")
             outputs[k] = v
-    return Run(code, records, raw, outputs, client, github, oidc, out_dir, token_files)
+    return Run(code, records, raw, outputs, client, github, oidc, out_dir, token_files, factory_kwargs)
 
 
 def statuses(run):
@@ -1427,6 +1429,64 @@ def test_default_federation_path_does_not_pass_the_parameter(tmp_path, configure
 
     results = _analyze_direct(tmp_path, factory)
     assert calls == [1] and {r.status for r in results.values()} == {"ok"}
+
+
+# --- the self-review rule R-self (PRs to .github) ------------------------------------
+
+SELF_ENV = {"GITHUB_REPOSITORY_ID": analyze.SELF_REVIEW_REPOSITORY_ID, "GITHUB_EVENT_NAME": "pull_request_target"}
+SELF_RULE = "fdrl_01SelfReviewRuleIdAbcdef"
+
+
+@pytest.mark.parametrize("env, chosen", [
+    (SELF_ENV, True),
+    ({**SELF_ENV, "GITHUB_EVENT_NAME": "workflow_dispatch"}, False),
+    ({**SELF_ENV, "GITHUB_EVENT_NAME": "push"}, False),
+    ({**SELF_ENV, "GITHUB_EVENT_NAME": "pull_request"}, False),
+    ({**SELF_ENV, "GITHUB_EVENT_NAME": "PULL_REQUEST_TARGET"}, False),
+    ({**SELF_ENV, "GITHUB_REPOSITORY_ID": "1432457406"}, False),  # claude-review-test
+    ({**SELF_ENV, "GITHUB_REPOSITORY_ID": " 1432342572"}, False),
+    ({"GITHUB_EVENT_NAME": "pull_request_target"}, False),
+    ({"GITHUB_REPOSITORY_ID": analyze.SELF_REVIEW_REPOSITORY_ID}, False),
+    ({}, False),
+])
+def test_r_self_only_for_pull_request_target_in_dotgithub(env, chosen):
+    ids = analyze.self_review_federation(env)
+    if chosen:
+        assert ids == analyze.FederationIds(analyze.SELF_REVIEW_FEDERATION_RULE_ID, analyze.ANTHROPIC_ORGANIZATION_ID,
+                                            analyze.ANTHROPIC_SERVICE_ACCOUNT_ID)
+    else:
+        assert ids is None
+
+
+def test_r_self_is_its_own_rule_and_r1_is_the_release_rule():
+    assert analyze.SELF_REVIEW_FEDERATION_RULE_ID != analyze.ANTHROPIC_FEDERATION_RULE_ID
+    assert analyze.FEDERATION_RULE_ID_RE.match(analyze.SELF_REVIEW_FEDERATION_RULE_ID)
+
+
+def test_placeholder_r_self_fails_every_pass_and_never_mints(tmp_path, configured, monkeypatch):
+    monkeypatch.setattr(analyze, "SELF_REVIEW_FEDERATION_RULE_ID", "fdrl_000000000000000000000000")
+    run = run_main(tmp_path, env=SELF_ENV)
+    assert_three_records(run)
+    assert set(statuses(run).values()) == {"failed"}
+    assert set(reasons(run).values()) == {analyze.R_FEDERATION_NOT_CONFIGURED}
+    assert run.client.calls == {} and run.oidc.calls == [] and run.token_files == []
+
+
+def test_configured_r_self_reaches_the_client(tmp_path, configured, monkeypatch):
+    monkeypatch.setattr(analyze, "SELF_REVIEW_FEDERATION_RULE_ID", SELF_RULE)
+    run = run_main(tmp_path, env=SELF_ENV)
+    assert set(statuses(run).values()) == {"ok"}
+    assert run.factory_kwargs == [{"federation": analyze.FederationIds(
+        SELF_RULE, CONFIGURED_IDS["ANTHROPIC_ORGANIZATION_ID"], CONFIGURED_IDS["ANTHROPIC_SERVICE_ACCOUNT_ID"])}]
+
+
+@pytest.mark.parametrize("env", [{}, {**SELF_ENV, "GITHUB_EVENT_NAME": "workflow_dispatch"},
+                                 {**SELF_ENV, "GITHUB_REPOSITORY_ID": "107068150"}])
+def test_every_other_run_keeps_r1(tmp_path, configured, monkeypatch, env):
+    monkeypatch.setattr(analyze, "SELF_REVIEW_FEDERATION_RULE_ID", SELF_RULE)
+    run = run_main(tmp_path, env=env)
+    assert set(statuses(run).values()) == {"ok"}
+    assert run.factory_kwargs == [{}]  # no `federation`: the module constants (R1)
 
 
 def test_default_client_factory_uses_the_federation_parameter(tmp_path, configured):
