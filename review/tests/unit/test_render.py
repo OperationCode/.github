@@ -1659,6 +1659,23 @@ def test_mask_hashes_masks_hash_values(line, masked):
         f"-r https://x.example/sha256-{SRI256}/evil/path",
         f"node_modules/sha1-{SRI1}",
         f"  resolved: https://r.example/pkg/-/sha512-{SRI512}.tgz",
+        # URL query values and fragments: data, not hashes (review T2, finding 1)
+        "-r https://example.org/?q=sha384-" + "A" * 64,
+        f"resolved: https://host/?ref=sha1:{HEX40}",
+        f'  "resolved": "https://host/x.tgz?h=sha512-{SRI512}",',
+        f"git+https://host/r.git#sha256={HEX64}",
+        f"  url: https://host/a,sha1:{HEX40}",
+        # JSON-escaped slashes, quotes inside a URL, file:, data: and `//` starts (fix round 2)
+        f'      "resolved": "https:\\/\\/h\\/?q=sha1:{HEX40}",',
+        f'      "resolved": "https:/\\/h/?q=sha1:{HEX40}",',
+        f"      \"resolved\": \"https://h/?a='&b=sha1:{HEX40}\",",
+        f'-r https://h/?a="&b=sha1:{HEX40}',
+        f'-r https://h/?a="&b=sha256-{SRI256}',
+        f"pkg @ //h/x?q=sha1:{HEX40}",
+        f"pkg @ file:../x?q=sha1:{HEX40}",
+        f"pkg @ FILE:///x?q=sha1:{HEX40}",
+        f"x data:text/plain,sha1:{HEX40}",
+        f'{{"resolved":"https://h/a.tgz","integrity":"sha512-{SRI512}"}}',
         # an npm or PyPI name that looks like an SRI body: no upper-case, `+`, `/` or `=`
         "sha384-" + "ab12" * 16,
         '  "sha384-' + "ab12" * 16 + '": "1.0.0",',
@@ -1692,6 +1709,26 @@ def test_mask_hashes_never_masks_a_bare_git_sha_in_any_form():
     for sha in (HEX40, "0123456789abcdef0123456789abcdef01234567"):
         for line in (sha, f" {sha} ", f'"{sha}"', f"version: {sha}", f"  {sha}  # pinned"):
             assert r.mask_hashes(line) == line
+
+
+def test_url_ends_at_a_space_or_a_tab_and_a_hash_after_it_is_masked():
+    assert r.mask_hashes(f'{{url = "https://h/x.whl", hash = "sha256:{HEX64}"}}') == '{url = "https://h/x.whl", hash = "sha256:b2b2b2b2~"}'
+    assert r.mask_hashes(f"{{tarball: https://h/a.tgz, integrity: sha512-{SRI512}}}") == "{tarball: https://h/a.tgz, integrity: sha512-Zz09Zz09~}"
+    # uv.lock: the span ends at the space after the closing quote.
+    uv = f'sdist = {{ url = "https://files.pythonhosted.org/p/x-1.0.tar.gz", hash = "sha256:{HEX64}", size = 1 }}'
+    assert r.mask_hashes(uv) == uv.replace(HEX64, "b2b2b2b2~")
+    assert r.mask_hashes(f"pkg @ https://h/x.whl\t--hash=sha256:{HEX64}") == "pkg @ https://h/x.whl\t--hash=sha256:b2b2b2b2~"
+    # `//` inside a path is not a URL start.
+    assert r.mask_hashes(f"a/b//c sha1:{HEX40}") == "a/b//c sha1:a1a1a1a1~"
+
+
+def test_added_url_line_with_query_data_shows_in_full():
+    # No removed line to collide with (M3 does not apply): the URL itself must stay whole.
+    url = "-r https://example.org/?q=sha384-" + "AbCd" * 16
+    base = "requests==2.31.0\n"
+    head = url + "\n" + base
+    masked = r.redact_patch(_lock_patch(base, head), base, head, lockfile=True)
+    assert f"+{url}\n" in masked and "~" not in masked
 
 
 def _lock_patch(base: str, head: str) -> str:
@@ -1807,6 +1844,15 @@ def test_lockfile_patch_needs_its_redaction_mark():
         f"x h1:{GO_H1}\u2028y",
         f"  checksum: 10c0/{HEX128}\r",
         f"x h1:{GO_H1}\rmore",
+        f"https://h/\u200b=sha1:{HEX40}",
+        f"https://h/\x0b=sha1:{HEX40}",
+        f"https://h/\u2028 sha1:{HEX40}",
+        f"https://h/untrusted_pr?=sha1:{HEX40} sha1:{HEX40}",
+        f'"resolved": "https:\\/\\/h\\/?q=sha1:{HEX40}\u200b", sha1:{HEX40}',
+        f"https://h/?a='\u202e&b=sha1:{HEX40}\tsha1:{HEX40}",
+        f"\u200b//h/?q=sha1:{HEX40} //h/\x0b=sha1:{HEX40}",
+        f"file:\u2028=sha1:{HEX40} data:x\u200b,sha1:{HEX40}",
+        f"ht\u200btps://h/?q=sha1:{HEX40}",
     ],
 )
 def test_mask_commutes_with_model_lines(line):

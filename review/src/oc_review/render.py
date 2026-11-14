@@ -977,6 +977,15 @@ _PREFIXED_HASH = re.compile(
     + r"(?P<body>[A-Za-z0-9+/]{27}=|[A-Za-z0-9+/]{43}=|[A-Za-z0-9+/]{64}|[A-Za-z0-9+/]{86}==|[0-9a-f]{40,128})"
     + _MASK_RIGHT
 )
+# A URL, from its start to a space or a tab. Nothing inside it is masked: a
+# query value can be data, not a hash. A start is `<scheme>://` (each slash
+# may be JSON-escaped as `\/`), `file:` or `data:`, or `//` at a token start.
+# A quote does not end it (a query value can hold one), so inline JSON with no
+# spaces stays unmasked: the safe direction. The span starts and ends only on
+# characters that `model_lines` keeps, so the mask still commutes with it.
+_URL_SPAN = re.compile(
+    r"(?:[A-Za-z][A-Za-z0-9+.\-]*:\\?/\\?/|(?<![A-Za-z0-9+.\-])(?i:file|data):|(?<![^ \t\"'=,(\[{])//)[^ \t]*"
+)
 # Exact body per prefix: SRI base64 with its padding, lower-case hex, Go h1.
 _HASH_BODY = {
     "sha1-": re.compile(r"[A-Za-z0-9+/]{27}="),
@@ -1006,10 +1015,12 @@ def _cut(value: str) -> str:
     return value[:MASK_KEEP_CHARS] + MASK_MARK
 
 
-def _mask_prefixed(m: re.Match[str]) -> str:
+def _mask_prefixed(m: re.Match[str], urls: list[tuple[int, int]]) -> str:
     head, body = m.group("head"), m.group("body")
     rule = _HASH_BODY[head if head in _HASH_BODY else head[:-1]]
     if not rule.fullmatch(body) or (head.endswith("-") and not _NOT_A_NAME.search(body)):
+        return m.group()
+    if any(start < m.end() and m.start() < end for start, end in urls):
         return m.group()
     return head + _cut(body)
 
@@ -1020,11 +1031,13 @@ def mask_hashes(line: str) -> str:
     only an unambiguous hash: when in doubt, do not mask. A bare hex token
     is masked only as the whole value of a `MASK_HASH_KEYS` key, so a git
     commit ID (under `reference`, `commit`, `rev`, or in a URL) stays whole.
+    Nothing inside a URL (`_URL_SPAN`, up to a space or a tab) is masked.
     """
     keyed = _KEYED_HEX.fullmatch(line)
     if keyed is not None:
         return keyed.group("pre") + _cut(keyed.group("hex")) + keyed.group("post")
-    return _PREFIXED_HASH.sub(_mask_prefixed, line)
+    urls = [m.span() for m in _URL_SPAN.finditer(line)]
+    return _PREFIXED_HASH.sub(lambda m: _mask_prefixed(m, urls), line)
 
 
 def _mask_rows(rows: list[_Row], shown: list[str]) -> list[str]:
